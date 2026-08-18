@@ -3,8 +3,11 @@
 
 #include <stdint.h> // int32_t
 
+// Which of the six motion axes a stepper responds to.  A/B/C are the
+// rotations about X/Y/Z - see the comment on 'struct coord' in trapq.h.
 enum {
     AF_X = 1 << 0, AF_Y = 1 << 1, AF_Z = 1 << 2,
+    AF_A = 1 << 3, AF_B = 1 << 4, AF_C = 1 << 5,
 };
 
 struct stepper_kinematics;
@@ -33,9 +36,11 @@ void itersolve_set_trapq(struct stepper_kinematics *sk, struct trapq *tq
                          , double step_dist);
 struct trapq *itersolve_get_trapq(struct stepper_kinematics *sk);
 double itersolve_calc_position_from_coord(struct stepper_kinematics *sk
-                                          , double x, double y, double z);
+                                          , double x, double y, double z
+                                          , double a, double b, double c);
 void itersolve_set_position(struct stepper_kinematics *sk
-                            , double x, double y, double z);
+                            , double x, double y, double z
+                            , double a, double b, double c);
 double itersolve_get_commanded_pos(struct stepper_kinematics *sk);
 double itersolve_get_gen_steps_pre_active(struct stepper_kinematics *sk);
 double itersolve_get_gen_steps_post_active(struct stepper_kinematics *sk);

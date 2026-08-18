@@ -115,6 +115,17 @@ class GCodeMove:
     def reset_last_position(self):
         if self.is_printer_ready:
             self.last_position = self.position_with_transform()
+    def _get_axis_names(self):
+        # The g-code letter for each toolhead position index, or None
+        # where a position has no letter.  Positions are not contiguous:
+        # an undeclared rotational axis still occupies its slot, so the
+        # list must keep that gap for the letters to line up with the
+        # position vector.
+        names = [None] * len(self.base_position)
+        for axis, pos in self.axis_map.items():
+            if pos < len(names):
+                names[pos] = axis
+        return names
     def _update_extra_axes(self):
         toolhead = self.printer.lookup_object('toolhead')
         axis_map = {'X':0, 'Y': 1, 'Z': 2, 'E': 3}
@@ -128,7 +139,13 @@ class GCodeMove:
                 continue
             axis_map[gcode_id] = index
         self.axis_map = axis_map
-        self.base_position[4:] = [0.] * (len(extra_axes) - 4)
+        num_axes = len(extra_axes)
+        self.base_position[4:] = [0.] * (num_axes - 4)
+        self.homing_position[4:] = [0.] * (num_axes - 4)
+        if len(self.last_position) < num_axes:
+            self.last_position += [0.] * (num_axes - len(self.last_position))
+        else:
+            del self.last_position[num_axes:]
         self.reset_last_position()
     # G-Code movement commands
     def cmd_G1(self, gcmd):
@@ -180,18 +197,24 @@ class GCodeMove:
         self.absolute_coord = False
     def cmd_G92(self, gcmd):
         # Set position
-        offsets = [ gcmd.get_float(a, None) for a in 'XYZE' ]
-        for i, offset in enumerate(offsets):
-            if offset is not None:
-                if i == 3:
-                    offset *= self.extrude_factor
-                self.base_position[i] = self.last_position[i] - offset
-        if offsets == [None, None, None, None]:
-            self.base_position[:4] = self.last_position[:4]
+        params = gcmd.get_command_parameters()
+        found = False
+        for axis, pos in self.axis_map.items():
+            if axis not in params:
+                continue
+            found = True
+            offset = gcmd.get_float(axis)
+            if pos == 3:
+                offset *= self.extrude_factor
+            self.base_position[pos] = self.last_position[pos] - offset
+        if not found:
+            self.base_position[:] = list(self.last_position)
     def cmd_M114(self, gcmd):
         # Get Current Position
         p = self._get_gcode_position()
-        gcmd.respond_raw("X:%.3f Y:%.3f Z:%.3f E:%.3f" % tuple(p[:4]))
+        gcmd.respond_raw(" ".join(["%s:%.3f" % (a, v) for a, v
+                                   in zip(self._get_axis_names(), p)
+                                   if a is not None]))
     def cmd_M220(self, gcmd):
         # Set speed factor override percentage
         value = gcmd.get_float('S', 100., above=0.) / (60. * 100.)
@@ -206,8 +229,10 @@ class GCodeMove:
         self.extrude_factor = new_extrude_factor
     cmd_SET_GCODE_OFFSET_help = "Set a virtual offset to g-code positions"
     def cmd_SET_GCODE_OFFSET(self, gcmd):
-        move_delta = [0., 0., 0., 0.]
-        for pos, axis in enumerate('XYZE'):
+        move_delta = [0.] * len(self.base_position)
+        for pos, axis in enumerate(self._get_axis_names()):
+            if axis is None:
+                continue
             offset = gcmd.get_float(axis, None)
             if offset is None:
                 offset = gcmd.get_float(axis + '_ADJUST', None)
@@ -245,8 +270,14 @@ class GCodeMove:
         # Restore state
         self.absolute_coord = state['absolute_coord']
         self.absolute_extrude = state['absolute_extrude']
-        self.base_position[:4] = state['base_position'][:4]
-        self.homing_position = list(state['homing_position'])
+        num_axes = len(self.base_position)
+        copy_axes = min(num_axes, len(state['base_position']))
+        self.base_position[:copy_axes] = state['base_position'][:copy_axes]
+        # The axis count can differ from when the state was saved (extra
+        # axes may have been registered since); keep the lists in step
+        homing_position = list(state['homing_position'])[:num_axes]
+        homing_position += [0.] * (num_axes - len(homing_position))
+        self.homing_position = homing_position
         self.speed = state['speed']
         self.speed_factor = state['speed_factor']
         self.extrude_factor = state['extrude_factor']
@@ -257,6 +288,10 @@ class GCodeMove:
         if gcmd.get_int('MOVE', 0):
             speed = gcmd.get_float('MOVE_SPEED', self.speed, above=0.)
             self.last_position[:3] = state['last_position'][:3]
+            # Restore any additional axes (rotational A/B/C axes)
+            saved = state['last_position']
+            for pos in range(4, min(len(self.last_position), len(saved))):
+                self.last_position[pos] = saved[pos]
             self.move_with_transform(self.last_position, speed)
     cmd_GET_POSITION_help = (
         "Return information on the current location of the toolhead")
@@ -270,14 +305,25 @@ class GCodeMove:
                             for s in steppers])
         cinfo = [(s.get_name(), s.get_commanded_position()) for s in steppers]
         stepper_pos = " ".join(["%s:%.6f" % (a, v) for a, v in cinfo])
-        kinfo = zip("XYZ", kin.calc_position(dict(cinfo)))
+        calc_pos = list(kin.calc_position(dict(cinfo)))
+        rtcp = self.printer.lookup_object('rtcp', None)
+        if rtcp is not None and len(calc_pos) >= 3:
+            # calc_position() is in machine coordinates; report the tool
+            # tip position that g-code works in
+            mpos = list(toolhead.get_position())
+            mpos[:3] = calc_pos[:3]
+            calc_pos[:3] = rtcp.machine_to_tip(mpos)[:3]
+        kinfo = zip("XYZ", calc_pos)
         kin_pos = " ".join(["%s:%.6f" % (a, v) for a, v in kinfo])
+        anames = self._get_axis_names()
         toolhead_pos = " ".join(["%s:%.6f" % (a, v) for a, v in zip(
-            "XYZE", toolhead.get_position()[:4])])
+            anames, toolhead.get_position()) if a is not None])
         gcode_pos = " ".join(["%s:%.6f"  % (a, v)
-                              for a, v in zip("XYZE", self.last_position)])
+                              for a, v in zip(anames, self.last_position)
+                              if a is not None])
         base_pos = " ".join(["%s:%.6f"  % (a, v)
-                             for a, v in zip("XYZE", self.base_position)])
+                             for a, v in zip(anames, self.base_position)
+                             if a is not None])
         homing_pos = " ".join(["%s:%.6f"  % (a, v)
                                for a, v in zip("XYZ", self.homing_position)])
         gcmd.respond_info("mcu: %s\n"

@@ -1,0 +1,47 @@
+# Tests for a coupled core r-theta stage
+DICTIONARY atmega2560.dict
+CONFIG multi_axis_rtheta.cfg
+
+# Home everything, including the coupled C axis
+G28 X Y Z
+G28 C
+
+# Pure radial moves - both r-theta motors turn together
+G1 X10 Y10 Z1 F3000
+G1 X50 F3000
+G1 X20 F3000
+
+# Pure rotation - the same two motors turn in opposition
+G1 C45 F1800
+G1 C180 F1800
+G1 C0 F1800
+
+# Combined radial + rotational motion in a single move
+G1 X50 C90 F3000
+G1 X20 C45 F3000
+G1 X40 Y40 C270 F3000
+
+# Rotation with extrusion
+G1 X30 Y30 E1 C300 F3000
+G1 X35 Y35 E2 C330 F3000
+
+# Relative moves on the coupled axis
+G91
+G1 C10
+G1 C-10
+G90
+
+# Redefine the rotational origin
+G92 C0
+G1 C10 F1800
+G1 C0 F1800
+
+# Position queries include the coupled axis
+GET_POSITION
+M114
+
+# Re-home the coupled axis and confirm it still moves
+G28 C
+G1 C15 F1800
+
+M84

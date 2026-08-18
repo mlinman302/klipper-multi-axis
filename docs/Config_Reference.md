@@ -85,7 +85,7 @@ The printer section controls high level printer settings.
 kinematics:
 #   The type of printer in use. This option may be one of: cartesian,
 #   corexy, corexz, hybrid_corexy, hybrid_corexz, generic_cartesian,
-#   rotary_delta, delta, deltesian, polar, winch, or none.
+#   rotary_delta, delta, deltesian, polar, corertheta, winch, or none.
 #   This parameter must be specified.
 max_velocity:
 #   Maximum velocity (in mm/s) of the toolhead (relative to the
@@ -590,6 +590,61 @@ gear_ratio:
 
 # The stepper_z section is used to describe the stepper controlling
 # the Z axis.
+[stepper_z]
+```
+
+### Core R-Theta Kinematics
+
+A polar (rotating bed) printer whose arm carriage also carries a tool
+that rotates about the Y axis - the `B` axis of
+[Multi_Axis.md](Multi_Axis.md).  Two motors act on the X gantry through
+a differential: driving them in the same direction rotates B, driving
+them in opposition moves the arm radially.  A leadscrew raises the
+gantry.
+
+Only parameters specific to core r-theta printers are described here -
+see [common kinematic settings](#common-kinematic-settings) for
+available parameters.
+
+CORE R-THETA KINEMATICS ARE A WORK IN PROGRESS.  As with polar
+kinematics, moves around the 0, 0 position are known to not work
+properly.
+
+```
+[printer]
+kinematics: corertheta
+additional_axes: b
+#   The B axis is driven by the kinematics, so it must be declared here
+#   and must not have a [stepper_b] section of its own.
+#b_coupling_ratio: 1.0
+#   The travel of a gantry motor (in the units of [stepper_x]) produced
+#   by one degree of B rotation. The default is 1.0, which makes the
+#   differential a plain CoreXY-style sum.
+max_z_velocity:
+max_z_accel:
+#max_angular_velocity: 0
+#   These behave as they do for polar kinematics (see above).
+
+# The stepper_c section is used to describe the stepper controlling the
+# rotating bed. As on a polar printer its angle is derived from the
+# commanded X/Y position and is not itself a g-code axis.
+[stepper_c]
+gear_ratio:
+#   A gear_ratio must be specified and rotation_distance may not be
+#   specified - see [stepper_bed] under polar kinematics above.
+
+# The stepper_x section describes the first gantry motor. It carries the
+# endstop and position_min/position_max of the X axis (the arm radius).
+[stepper_x]
+
+# The stepper_tilt section describes the second gantry motor. It carries
+# the endstop and position_min/position_max of the B axis, in degrees.
+# Its rotation_distance is in gantry travel, as for stepper_x, since a
+# gantry motor position is a mix of the B rotation and the arm radius.
+[stepper_tilt]
+
+# The stepper_z section is used to describe the leadscrew stepper
+# controlling the gantry height.
 [stepper_z]
 ```
 
@@ -2440,6 +2495,133 @@ at 1 (for example, "stepper_z1", "stepper_z2", etc.).
 #   stepper will home until the endstop is triggered. Otherwise, the
 #   stepper will home until the endstop on the primary stepper for the
 #   axis is triggered.
+```
+
+### [rtcp]
+
+Rotational Tool Center Point compensation for a head that tilts about the
+B axis. With RTCP enabled, `G0`/`G1` command where the *tool tip* should
+be, and the X and Z carriages move to hold the tip in place as the head
+tilts. Requires `b` in the `additional_axes` option of `[printer]`.
+
+At `B=0` machine coordinates equal the commanded tip position, so homing,
+bed mesh and Z offsets keep their usual meaning. Note that the carriages
+travel beyond the commanded tip position when tilted - with a 40mm pivot
+at 45 degrees, X swings 28.3mm and Z dips 11.7mm - so the rails must be
+able to reach it.
+
+See [Multi_Axis.md](Multi_Axis.md) and
+[multi_axis_rtcp.cfg](../test/klippy/multi_axis_rtcp.cfg).
+
+```
+[rtcp]
+pivot_length:
+#   Distance (in mm) from the tool tip to the B rotation pivot, measured
+#   with the head at B=0. This parameter must be provided.
+#pivot_x_offset: 0.0
+#   X offset (in mm) from the tool tip to the pivot at B=0, for a head
+#   whose tip is not directly below the pivot. The default is 0.
+#enable: True
+#   Whether compensation is active at startup. It can be toggled at
+#   runtime with SET_RTCP. The default is True.
+```
+
+The `SET_RTCP [ENABLE=0|1] [PIVOT_LENGTH=<mm>] [PIVOT_X_OFFSET=<mm>]`
+command toggles or retunes the compensation.
+
+### Coupled rotational axes ([carriage] on a/b/c)
+
+With `kinematics: generic_cartesian`, a carriage may be placed on a
+rotational axis (`axis: a`, `axis: b` or `axis: c`) and referenced by a
+stepper's `carriages:` expression alongside a linear carriage. This is
+how a drive whose motors mix linear and rotational motion is described -
+for example a core r-theta stage:
+
+```
+[carriage carriage_c]
+axis: c
+position_endstop: 0
+position_min: 0
+position_max: 360
+endstop_pin: ^PD2
+
+[stepper rtheta_1]
+carriages: 0.5*carriage_x + 0.5*carriage_c
+...
+[stepper rtheta_2]
+carriages: 0.5*carriage_x - 0.5*carriage_c
+...
+```
+
+Carriages on `x`, `y` and `z` remain required; `a`/`b`/`c` carriages are
+optional. See [Multi_Axis.md](Multi_Axis.md) and
+[multi_axis_rtheta.cfg](../test/klippy/multi_axis_rtheta.cfg).
+
+### [stepper_a], [stepper_b], [stepper_c]
+
+Additional rotational axes. `A` rotates about X, `B` about Y and `C`
+about Z; all positions are in degrees. An axis is enabled by listing its
+letter in the `additional_axes` option of the `[printer]` section. Each
+declared letter must then be driven either by a matching
+`[stepper_a]`/`[stepper_b]`/`[stepper_c]` section (one motor per axis),
+or - for a *coupled* drive where several motors together move the axis,
+such as a core r-theta stage - by a carriage of the same letter in
+`[generic_cartesian]`. Rotational axes are commanded with the `A`/`B`/`C`
+words of `G0`/`G1`, and are homed with `G28 A` (a bare `G28` homes X/Y/Z
+only).
+
+See [Multi_Axis.md](Multi_Axis.md) for the design and the current
+limitations, and
+[sample-multi-axis.cfg](../config/sample-multi-axis.cfg) for an example
+configuration.
+
+```
+[printer]
+#additional_axes:
+#   A combination of the letters "a", "b" and "c" naming the extra
+#   rotational axes to enable. The letters may be separated by commas,
+#   whitespace, or nothing at all. The default is to enable none. Each
+#   letter needs either a [stepper_<letter>] section (one motor drives
+#   the axis) or a carriage on that axis in the printer kinematics (the
+#   axis is driven by a coupled set of motors).
+
+[stepper_a]
+#step_pin:
+#dir_pin:
+#enable_pin:
+#microsteps:
+#rotation_distance:
+#gear_ratio:
+#   See the "stepper" section for the definition of the above
+#   parameters. For a rotational axis, rotation_distance is the number
+#   of degrees of axis travel per motor rotation.
+#endstop_pin:
+#position_endstop:
+#position_min:
+#position_max:
+#homing_speed:
+#second_homing_speed:
+#homing_retract_dist:
+#homing_retract_speed:
+#homing_positive_dir:
+#   See the "stepper" section for the definition of the above
+#   parameters. If an endstop_pin is given then the axis can be homed
+#   with "G28 A" (or B/C) and position_max becomes required. Without an
+#   endstop_pin the axis is considered homed at 0 on startup, and
+#   position_min/position_max are optional soft limits.
+#homing_accel:
+#   Acceleration (in deg/s^2) to use for homing moves of this axis. The
+#   default is axis_max_accel if it is set, otherwise 1000.
+#axis_max_velocity:
+#axis_max_accel:
+#   Maximum velocity (in deg/s) and acceleration (in deg/s^2) of this
+#   axis. Both are unset by default, in which case rotation has no
+#   influence on the toolhead speed planning at all. If set, a move that
+#   would exceed the limit has its overall speed reduced.
+#instantaneous_corner_velocity:
+#   If set, the maximum instantaneous velocity change (in deg/s) of this
+#   axis between two moves. Unset by default, meaning the axis places no
+#   limit on junction speeds.
 ```
 
 ### [extruder1]

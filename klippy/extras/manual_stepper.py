@@ -67,7 +67,8 @@ class ManualStepper:
             dist, speed, accel)
         self.trapq_append(self.trapq, movetime,
                           accel_t, cruise_t, accel_t,
-                          cp, 0., 0., axis_r, 0., 0.,
+                          cp, 0., 0., 0., 0., 0.,
+                          axis_r, 0., 0., 0., 0., 0.,
                           0., cruise_v, accel)
         self.commanded_pos = movepos
         return movetime + accel_t + cruise_t + accel_t
@@ -173,8 +174,8 @@ class ManualStepper:
         cruise_v = move.cruise_v * axis_r
         self.trapq_append(self.trapq, print_time,
                           move.accel_t, move.cruise_t, move.decel_t,
-                          start_pos, 0., 0.,
-                          1., 0., 0.,
+                          start_pos, 0., 0., 0., 0., 0.,
+                          1., 0., 0., 0., 0., 0.,
                           start_v, cruise_v, accel)
         self.commanded_pos = move.end_pos[ea_index]
     def check_move(self, move, ea_index):

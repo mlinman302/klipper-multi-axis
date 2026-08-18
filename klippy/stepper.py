@@ -11,6 +11,29 @@ class error(Exception):
 
 
 ######################################################################
+# Kinematic coordinate space
+######################################################################
+
+# The C motion queue works in a six dimensional space: three linear axes
+# and three rotational axes (see 'struct coord' in chelper/trapq.h).
+KIN_AXES = 6
+
+# The toolhead position vector keeps the extruder at index 3 for
+# compatibility, so the six kinematic axes are not contiguous:
+#     [x, y, z, e, a, b, c, ...additional gcode axes]
+KIN_AXIS_INDEXES = (0, 1, 2, 4, 5, 6)
+
+# Gather the six kinematic coordinates out of a position vector in the
+# toolhead layout above.  Missing trailing entries read as zero, so the
+# short vectors used by single-dimension callers (manual_stepper and the
+# extruder pass [pos, 0., 0.]) gather correctly too.  Because this always
+# gathers rather than padding, every caller can keep passing the toolhead
+# position vector unchanged.
+def kin_coords(pos):
+    return [pos[i] if i < len(pos) else 0. for i in KIN_AXIS_INDEXES]
+
+
+######################################################################
 # Steppers
 ######################################################################
 
@@ -152,14 +175,16 @@ class MCU_stepper:
         ffi_lib.stepcompress_set_invert_sdir(self._stepqueue, invert_dir)
         self._mcu.get_printer().send_event("stepper:set_dir_inverted", self)
     def calc_position_from_coord(self, coord):
+        c = kin_coords(coord)
         ffi_main, ffi_lib = chelper.get_ffi()
         return ffi_lib.itersolve_calc_position_from_coord(
-            self._stepper_kinematics, coord[0], coord[1], coord[2])
+            self._stepper_kinematics, c[0], c[1], c[2], c[3], c[4], c[5])
     def set_position(self, coord):
+        c = kin_coords(coord)
         mcu_pos = self.get_mcu_position()
         sk = self._stepper_kinematics
         ffi_main, ffi_lib = chelper.get_ffi()
-        ffi_lib.itersolve_set_position(sk, coord[0], coord[1], coord[2])
+        ffi_lib.itersolve_set_position(sk, c[0], c[1], c[2], c[3], c[4], c[5])
         self._set_mcu_position(mcu_pos)
     def get_commanded_position(self):
         ffi_main, ffi_lib = chelper.get_ffi()

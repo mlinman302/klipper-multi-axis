@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math
+import stepper
 
 HOMING_START_DELAY = 0.001
 ENDSTOP_SAMPLE_TIME = .000015
@@ -21,6 +22,12 @@ def multi_complete(printer, completions):
         reactor.register_callback(
             lambda e, c=c: cp.complete(1) if c.wait() else 0)
     return cp
+
+# Distance covered by a move across the six kinematic axes.  Rotational
+# components must be included, otherwise homing a rotational axis (whose
+# linear components are all zero) yields a zero-length move.
+def calc_kin_move_d(axes_d):
+    return math.sqrt(sum([d*d for d in stepper.kin_coords(axes_d)]))
 
 # Tracking of stepper positions during a homing/probing move
 class StepperPosition:
@@ -55,7 +62,7 @@ class HomingMove:
     def _calc_endstop_rate(self, mcu_endstop, movepos, speed):
         startpos = self.toolhead.get_position()
         axes_d = [mp - sp for mp, sp in zip(movepos, startpos)]
-        move_d = math.sqrt(sum([d*d for d in axes_d[:3]]))
+        move_d = calc_kin_move_d(axes_d)
         move_t = move_d / speed
         max_steps = max([(abs(s.calc_position_from_coord(startpos)
                               - s.calc_position_from_coord(movepos))
@@ -64,16 +71,54 @@ class HomingMove:
         if max_steps <= 0.:
             return .001
         return move_t / max_steps
+    def _get_rotary_axes(self):
+        get = getattr(self.toolhead, 'get_rotary_axes', None)
+        if get is None:
+            return []
+        return get()
     def calc_toolhead_pos(self, kin_spos, offsets):
         kin_spos = dict(kin_spos)
         kin = self.toolhead.get_kinematics()
-        for stepper in kin.get_steppers():
-            sname = stepper.get_name()
-            kin_spos[sname] += offsets.get(sname, 0) * stepper.get_step_dist()
+        for s in kin.get_steppers():
+            sname = s.get_name()
+            kin_spos[sname] += offsets.get(sname, 0) * s.get_step_dist()
         thpos = self.toolhead.get_position()
         cpos = kin.calc_position(kin_spos)
-        return [cp if cp is not None else tp
-                for cp, tp in zip(cpos, thpos[:3])] + thpos[3:]
+        # calc_position() returns kinematic-axis order (x, y, z[, a, b, c]);
+        # map it onto the toolhead position layout, which interleaves the
+        # extruder at index 3.  Kinematics that solve only x/y/z return a
+        # short list and simply leave the rest of the vector alone.
+        res = list(thpos)
+        for kin_index, pos_index in enumerate(stepper.KIN_AXIS_INDEXES):
+            if kin_index >= len(cpos):
+                break
+            if cpos[kin_index] is not None and pos_index < len(res):
+                res[pos_index] = cpos[kin_index]
+        # Uncoupled rotational axes are not part of the kinematics class'
+        # stepper list, so resolve them from their own rail.  A coupled
+        # drive (eg, [generic_cartesian] or [corertheta]) shares its motors
+        # with the kinematics, where a motor position is a mix of several
+        # axes; calc_position() above already solved those, so skip them
+        # rather than mistake a motor position for an axis position.
+        kin_stepper_names = {s.get_name() for s in kin.get_steppers()}
+        for pos_index, ra in self._get_rotary_axes():
+            ra_steppers = ra.get_steppers()
+            if any(s.get_name() in kin_stepper_names for s in ra_steppers):
+                continue
+            for s in ra_steppers:
+                sname = s.get_name()
+                if sname in kin_spos:
+                    res[pos_index] = (kin_spos[sname]
+                                      + offsets.get(sname, 0)
+                                      * s.get_step_dist())
+                    break
+        # calc_position() works in machine (carriage) coordinates.  With
+        # RTCP active those differ from the tool tip coordinates that
+        # g-code uses, so convert back before reporting.
+        rtcp = self.printer.lookup_object('rtcp', None)
+        if rtcp is not None:
+            res = rtcp.machine_to_tip(res)
+        return res
     def homing_move(self, movepos, speed, probe_pos=False,
                     triggered=True, check_triggered=True):
         # Notify start of homing/probing move
@@ -81,8 +126,11 @@ class HomingMove:
         # Note start location
         self.toolhead.flush_step_generation()
         kin = self.toolhead.get_kinematics()
+        all_steppers = list(kin.get_steppers())
+        for pos_index, ra in self._get_rotary_axes():
+            all_steppers.extend(ra.get_steppers())
         kin_spos = {s.get_name(): s.get_commanded_position()
-                    for s in kin.get_steppers()}
+                    for s in all_steppers}
         self.stepper_positions = [ StepperPosition(s, name)
                                    for es, name in self.endstops
                                    for s in es.get_steppers() ]
@@ -140,7 +188,7 @@ class HomingMove:
             if any(over_steps.values()):
                 self.toolhead.set_position(movepos)
                 halt_kin_spos = {s.get_name(): s.get_commanded_position()
-                                 for s in kin.get_steppers()}
+                                 for s in all_steppers}
                 haltpos = self.calc_toolhead_pos(halt_kin_spos, over_steps)
             self.toolhead.set_position(haltpos)
         # Signal homing/probing move complete
@@ -195,7 +243,9 @@ class Homing:
         startpos = self._fill_coord(forcepos)
         homepos = self._fill_coord(movepos)
         axes_d = [hp - sp for hp, sp in zip(homepos, startpos)]
-        move_d = math.sqrt(sum([d*d for d in axes_d[:3]]))
+        move_d = calc_kin_move_d(axes_d)
+        if not move_d:
+            return homepos
         retract_r = min(1., homing_info.retract_dist / move_d)
         retractpos = [hp - ad * retract_r
                       for hp, ad in zip(homepos, axes_d)]
@@ -334,19 +384,36 @@ class PrinterHoming:
             raise self.printer.command_error(
                 "Probe triggered prior to movement")
         return epos
+    def _get_requested_extra_axes(self, gcmd):
+        # Find any additional axes (eg, rotational A/B/C axes) named in
+        # the command that are able to home themselves
+        toolhead = self.printer.lookup_object('toolhead')
+        res = []
+        for ea in toolhead.get_extra_axes():
+            if ea is None or not hasattr(ea, 'home'):
+                continue
+            gcode_id = ea.get_axis_gcode_id()
+            if gcode_id and gcmd.get(gcode_id, None) is not None:
+                res.append(ea)
+        return res
     def cmd_G28(self, gcmd):
         # Move to origin
         axes = []
         for pos, axis in enumerate('XYZ'):
             if gcmd.get(axis, None) is not None:
                 axes.append(pos)
-        if not axes:
+        extra_axes = self._get_requested_extra_axes(gcmd)
+        if not axes and not extra_axes:
+            # A bare "G28" homes the cartesian axes only
             axes = [0, 1, 2]
-        homing_state = Homing(self.printer)
-        homing_state.set_axes(axes)
-        kin = self.printer.lookup_object('toolhead').get_kinematics()
         try:
-            kin.home(homing_state)
+            if axes:
+                homing_state = Homing(self.printer)
+                homing_state.set_axes(axes)
+                toolhead = self.printer.lookup_object('toolhead')
+                toolhead.get_kinematics().home(homing_state)
+            for ea in extra_axes:
+                ea.home()
         except self.printer.command_error:
             if self.printer.is_shutdown():
                 raise self.printer.command_error(

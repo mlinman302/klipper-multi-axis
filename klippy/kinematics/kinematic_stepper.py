@@ -7,10 +7,16 @@
 import logging, re
 import stepper, chelper
 
+# Axis names in kinematic order - three linear axes followed by the three
+# rotational axes.  A stepper may take a coefficient on any of them, which
+# is what lets one motor be driven by a mix of linear and rotational
+# motion (eg, a core r-theta belt).
+AXIS_NAMES = ['x', 'y', 'z', 'a', 'b', 'c']
+
 def parse_carriages_string(carriages_str, printer_carriages, parse_error):
     nxt = 0
     pat = re.compile('[+-]')
-    coeffs = [0.] * 3
+    coeffs = [0.] * len(AXIS_NAMES)
     ref_carriages = []
     while nxt < len(carriages_str):
         match = pat.search(carriages_str, nxt+1)
@@ -37,7 +43,8 @@ def parse_carriages_string(carriages_str, printer_carriages, parse_error):
         j = carriage.get_axis()
         if coeffs[j]:
             raise parse_error("Axis '%s' was referenced multiple times by "
-                              "carriages in '%s'" % ("xyz"[j], carriages_str))
+                              "carriages in '%s'"
+                              % (AXIS_NAMES[j], carriages_str))
         coeffs[j] = coeff
         ref_carriages.append(carriage)
         nxt = end
@@ -54,8 +61,7 @@ class KinematicStepper:
                     "'%s' must provide a valid 'carriages' configuration" %
                     self.stepper.get_name())
         self.stepper.setup_itersolve(
-                'generic_cartesian_stepper_alloc',
-                self.kin_coeffs[0], self.kin_coeffs[1], self.kin_coeffs[2])
+                'generic_cartesian_stepper_alloc', *self.kin_coeffs)
         self.stepper_sk = self.stepper.get_stepper_kinematics()
         # Add stepper to the carriages it references
         for sc in self.carriages:
@@ -77,7 +83,7 @@ class KinematicStepper:
         self.kin_coeffs = kin_coeffs
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.generic_cartesian_stepper_set_coeffs(
-                self.stepper_sk, kin_coeffs[0], kin_coeffs[1], kin_coeffs[2])
+                self.stepper_sk, *kin_coeffs)
     def update_carriages(self, carriages_str, printer_carriages, report_error):
         kin_coeffs, carriages = parse_carriages_string(
                 carriages_str, printer_carriages,

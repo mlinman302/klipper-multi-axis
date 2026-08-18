@@ -4,7 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
-import chelper
+import chelper, stepper
 from . import bulk_sensor
 
 # Extract stepper queue_step messages
@@ -104,9 +104,12 @@ class DumpTrapQ:
         out = ["Dumping trapq '%s' %d moves:" % (self.name, len(data))]
         for i, m in enumerate(data):
             out.append("move %d: pt=%.6f mt=%.6f sv=%.6f a=%.6f"
-                       " sp=(%.6f,%.6f,%.6f) ar=(%.6f,%.6f,%.6f)"
+                       " sp=(%.6f,%.6f,%.6f,%.6f,%.6f,%.6f)"
+                       " ar=(%.6f,%.6f,%.6f,%.6f,%.6f,%.6f)"
                        % (i, m.print_time, m.move_t, m.start_v, m.accel,
-                          m.start_x, m.start_y, m.start_z, m.x_r, m.y_r, m.z_r))
+                          m.start_x, m.start_y, m.start_z,
+                          m.start_a, m.start_b, m.start_c,
+                          m.x_r, m.y_r, m.z_r, m.a_r, m.b_r, m.c_r))
         logging.info('\n'.join(out))
     def get_trapq_position(self, print_time):
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -117,15 +120,20 @@ class DumpTrapQ:
         move = data[0]
         move_time = max(0., min(move.move_t, print_time - move.print_time))
         dist = (move.start_v + .5 * move.accel * move_time) * move_time;
-        pos = (move.start_x + move.x_r * dist, move.start_y + move.y_r * dist,
-               move.start_z + move.z_r * dist)
+        # All six kinematic components, in kinematic axis order
+        pos = tuple(start + ratio * dist for start, ratio in (
+            (move.start_x, move.x_r), (move.start_y, move.y_r),
+            (move.start_z, move.z_r), (move.start_a, move.a_r),
+            (move.start_b, move.b_r), (move.start_c, move.c_r)))
         velocity = move.start_v + move.accel * move_time
         return pos, velocity
     def _process_batch(self, eventtime):
         qtime = self.last_batch_msg[0] + min(self.last_batch_msg[1], 0.100)
         data, cdata = self.extract_trapq(qtime, NEVER_TIME)
         d = [(m.print_time, m.move_t, m.start_v, m.accel,
-              (m.start_x, m.start_y, m.start_z), (m.x_r, m.y_r, m.z_r))
+              (m.start_x, m.start_y, m.start_z,
+               m.start_a, m.start_b, m.start_c),
+              (m.x_r, m.y_r, m.z_r, m.a_r, m.b_r, m.c_r))
              for m in data]
         if d:
             start_drip_time = self.motion_queuing.check_drip_timing()
@@ -242,7 +250,11 @@ class PrinterMotionReport:
         print_time = mcu.estimated_print_time(eventtime)
         pos, velocity = self.dtrapqs['toolhead'].get_trapq_position(print_time)
         if pos is not None:
-            live_pos[:3] = pos[:3]
+            # The rotational axes ride in the toolhead queue too, so map
+            # the kinematic components onto the toolhead position layout
+            for kin_index, pos_index in enumerate(stepper.KIN_AXIS_INDEXES):
+                if pos_index < len(live_pos):
+                    live_pos[pos_index] = pos[kin_index]
             xyzvelocity = velocity
         # Calculate requested position of extra axes
         for ea_index, ea in enumerate(extra_axes):

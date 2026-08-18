@@ -147,7 +147,8 @@ class RotaryDeltaCalibration:
                                 self.ffi_lib.free)
                     for a, ua, la in zip(angles, upper_arms, lower_arms)]
         self.abs_endstops = [
-            self.ffi_lib.itersolve_calc_position_from_coord(sk, 0., 0., es)
+            self.ffi_lib.itersolve_calc_position_from_coord(
+                sk, 0., 0., es, 0., 0., 0.)
             for sk, es in zip(self.sks, endstops)]
     def coordinate_descent_params(self, is_extended):
         # Determine adjustment parameters (for use with coordinate_descent)
@@ -197,8 +198,9 @@ class RotaryDeltaCalibration:
         return self.actuator_to_cartesian(spos)
     def calc_stable_position(self, coord):
         # Return a stable_position from a cartesian coordinate
+        c = stepper.kin_coords(coord)
         pos = [ self.ffi_lib.itersolve_calc_position_from_coord(
-            sk, coord[0], coord[1], coord[2])
+            sk, c[0], c[1], c[2], c[3], c[4], c[5])
                 for sk in self.sks ]
         return [(ep - sp) / sd
                 for sd, ep, sp in zip(self.stepdists, self.abs_endstops, pos)]

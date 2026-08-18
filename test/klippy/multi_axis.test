@@ -1,0 +1,68 @@
+# Tests for additional rotational axes (A/B/C)
+DICTIONARY atmega2560.dict
+CONFIG multi_axis.cfg
+
+# The C axis has no endstop, so it may move before homing
+G1 C45 F1800
+G1 C0 F1800
+
+# Home the cartesian axes and the A axis
+G28
+G28 A
+
+# Combined linear + rotational moves
+G1 X20 Y20 Z1 F3000
+G1 X50 Y20 A45 F3000
+G1 X50 Y50 A45 C90 F3000
+G1 X20 Y50 A90 C180 F3000
+
+# Rotation-only moves (no linear component)
+G1 A0 F1800
+G1 C0 F1800
+G1 A30 C30 F1800
+
+# Rotation combined with extrusion
+G1 X30 Y30 E1 A60 F3000
+G1 X40 Y40 E2 A75 C45 F3000
+
+# Relative coordinates apply to the rotational axes too
+G91
+G1 A5 C5
+G1 A-5 C-5
+G90
+
+# Redefine the rotational origin
+G92 A0 C0
+G1 A10 C10 F1800
+G92 A0
+G1 A0 F1800
+
+# Position query commands include the rotational axes
+GET_POSITION
+M114
+
+# G-code offsets on a rotational axis
+SET_GCODE_OFFSET A=2
+G1 A0 F1800
+SET_GCODE_OFFSET A_ADJUST=-2
+G1 A0 F1800
+
+# Save/restore of g-code state
+SAVE_GCODE_STATE NAME=rot
+G1 X60 Y60 A20 C20 F3000
+RESTORE_GCODE_STATE NAME=rot MOVE=1
+
+# Direct axis manipulation
+SET_ROTARY_AXIS AXIS=C SET_POSITION=0
+SET_ROTARY_AXIS AXIS=C ENABLE=1
+SET_ROTARY_AXIS AXIS=A
+
+# Re-home the A axis and verify it still moves
+G28 A
+G1 A15 F1800
+
+# Home everything again in one command
+G28 X Y Z A
+
+# Motors off
+M84

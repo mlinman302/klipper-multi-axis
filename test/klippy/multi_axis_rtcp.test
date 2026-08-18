@@ -1,0 +1,54 @@
+# Tests for RTCP compensation on a B axis tilting head
+DICTIONARY atmega2560.dict
+CONFIG multi_axis_rtcp.cfg
+
+# Home everything
+G28 X Y Z
+G28 B
+
+G1 X50 Y50 Z20 F3000
+
+# Tilt in place.  The tip is commanded to stay put, so the X and Z
+# carriages must move to compensate.
+G1 B15 F600
+G1 B30 F600
+G1 B45 F600
+G1 B0 F600
+G1 B-45 F600
+G1 B0 F600
+
+# Tilt while moving the tip
+G1 X80 B30 F3000
+G1 X50 Z40 B-30 F3000
+G1 X60 Y60 Z30 B0 F3000
+
+# Tilted printing moves
+G1 B20 F600
+G1 X70 Y70 E1 F1500
+G1 X80 Y70 E2 F1500
+G1 X80 Y80 E3 F1500
+G1 B0 F600
+
+# Position reporting is in the tool tip frame
+G1 X50 Y50 Z20 B25 F3000
+GET_POSITION
+M114
+
+# Turning RTCP off leaves the machine where it is and stops compensating
+SET_RTCP ENABLE=0
+G1 B0 F600
+G1 X55 F3000
+SET_RTCP ENABLE=1
+G1 X50 F3000
+
+# Retune the pivot length at runtime
+SET_RTCP PIVOT_LENGTH=42.5
+G1 B10 F600
+SET_RTCP PIVOT_LENGTH=40.0
+G1 B0 F600
+
+# Re-home with RTCP active
+G28 X Y Z
+G28 B
+
+M84

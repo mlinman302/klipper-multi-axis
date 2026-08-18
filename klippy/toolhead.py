@@ -4,11 +4,22 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math, logging, importlib
-import mcu, chelper, kinematics.extruder
+import mcu, chelper, stepper
+import kinematics.extruder, kinematics.rotary_axis
 
 # Common suffixes: _d is distance (in mm), _v is velocity (in
 #   mm/second), _v2 is velocity squared (mm^2/s^2), _t is time (in
 #   seconds), _r is ratio (scalar between 0.0 and 1.0)
+
+# The toolhead position vector is
+#     [x, y, z, e, a, b, c, ...additional gcode axes]
+# The extruder stays at index 3 so that the many modules indexing it there
+# keep working; a/b/c are the rotational axes (rotations about x/y/z) and
+# always occupy indexes 4-6 whether or not they are configured.  See
+# docs/Multi_Axis.md.
+ROTARY_POS = (4, 5, 6)
+ROTARY_LETTERS = "abc"
+BASE_POS_LEN = 7
 
 # Class to track each move request
 class Move:
@@ -24,7 +35,7 @@ class Move:
         self.axes_d = axes_d = [ep - sp for sp, ep in zip(start_pos, end_pos)]
         self.move_d = move_d = math.sqrt(sum([d*d for d in axes_d[:3]]))
         if move_d < .000000001:
-            # Extrude only move
+            # No linear motion - an extrude only and/or rotation only move
             self.end_pos = ((start_pos[0], start_pos[1], start_pos[2])
                             + self.end_pos[3:])
             axes_d[0] = axes_d[1] = axes_d[2] = 0.
@@ -37,6 +48,12 @@ class Move:
             self.is_kinematic_move = False
         else:
             inv_move_d = 1. / move_d
+        # The rotational axes travel in the same motion queue as the linear
+        # axes, so the move must reach the trapq whenever *any* of the six
+        # kinematic axes moves - not just when x/y/z do.  (Rotation still
+        # does not take part in the velocity/accel planning above.)
+        self.needs_trapq = self.is_kinematic_move or any(
+            [axes_d[i] for i in ROTARY_POS if i < len(axes_d)])
         self.axes_r = [d * inv_move_d for d in axes_d]
         self.min_move_t = move_d / velocity
         # Junction speeds are tracked in velocity squared.  The
@@ -204,7 +221,8 @@ class ToolHead:
         self.mcu = self.printer.lookup_object('mcu')
         self.lookahead = LookAheadQueue()
         self.lookahead.set_flush_time(BUFFER_TIME_HIGH)
-        self.commanded_pos = [0., 0., 0., 0.]
+        # [x, y, z, e, a, b, c] - see ROTARY_POS above
+        self.commanded_pos = [0.] * BASE_POS_LEN
         # Velocity and acceleration control
         self.max_velocity = config.getfloat('max_velocity', above=0.)
         self.max_accel = config.getfloat('max_accel', above=0.)
@@ -214,6 +232,9 @@ class ToolHead:
             'square_corner_velocity', 5., minval=0.)
         self.junction_deviation = self.mcr_pseudo_accel = 0.
         self._calc_junction_deviation()
+        # Extra per-move checks registered by modules (eg, RTCP, which
+        # needs to validate the machine position the tip position maps to)
+        self.move_checks = []
         # Input stall detection
         self.check_stall_time = 0.
         self.print_stall = 0
@@ -236,7 +257,13 @@ class ToolHead:
         gcode = self.printer.lookup_object('gcode')
         self.Coord = gcode.Coord
         extruder = kinematics.extruder.DummyExtruder(self.printer)
-        self.extra_axes = [extruder]
+        # extra_axes[i] corresponds to position index i+3.  The three
+        # rotational slots always exist so that the a/b/c position indexes
+        # are fixed; they hold inert placeholders until [printer]
+        # additional_axes declares them.
+        self.extra_axes = [extruder] + [
+            kinematics.rotary_axis.DummyRotaryAxis(self.printer, letter)
+            for letter in ROTARY_LETTERS]
         self.extra_axes_status = {}
         self._build_extra_axes_status()
         kin_name = config.get('kinematics')
@@ -280,12 +307,13 @@ class ToolHead:
         next_move_time = self.print_time
         with self.reactor.assert_no_pause():
             for move in moves:
-                if move.is_kinematic_move:
+                if move.needs_trapq:
+                    sp, ar = move.start_pos, move.axes_r
                     self.trapq_append(
                         self.trapq, next_move_time,
                         move.accel_t, move.cruise_t, move.decel_t,
-                        move.start_pos[0], move.start_pos[1], move.start_pos[2],
-                        move.axes_r[0], move.axes_r[1], move.axes_r[2],
+                        sp[0], sp[1], sp[2], sp[4], sp[5], sp[6],
+                        ar[0], ar[1], ar[2], ar[4], ar[5], ar[6],
                         move.start_v, move.cruise_v, move.accel)
                 for e_index, ea in enumerate(self.extra_axes):
                     if move.axes_d[e_index + 3]:
@@ -383,9 +411,13 @@ class ToolHead:
     def set_position(self, newpos, homing_axes=""):
         self.flush_step_generation()
         ffi_main, ffi_lib = chelper.get_ffi()
+        kc = stepper.kin_coords(newpos)
         ffi_lib.trapq_set_position(self.trapq, self.print_time,
-                                   newpos[0], newpos[1], newpos[2])
+                                   kc[0], kc[1], kc[2], kc[3], kc[4], kc[5])
         self.commanded_pos[:3] = newpos[:3]
+        for i in ROTARY_POS:
+            if i < len(newpos):
+                self.commanded_pos[i] = newpos[i]
         self.kin.set_position(newpos, homing_axes)
         self.printer.send_event("toolhead:set_position")
     def limit_next_junction_speed(self, speed):
@@ -398,6 +430,11 @@ class ToolHead:
             return
         if move.is_kinematic_move:
             self.kin.check_move(move)
+        if move.needs_trapq:
+            # Rotation alone can move the machine (RTCP), so these run for
+            # any move that reaches the motion queue
+            for check in self.move_checks:
+                check(move)
         for e_index, ea in enumerate(self.extra_axes):
             if move.axes_d[e_index + 3]:
                 ea.check_move(move, e_index + 3)
@@ -438,6 +475,17 @@ class ToolHead:
         self._build_extra_axes_status()
     def get_extruder(self):
         return self.extra_axes[0]
+    def set_rotary_axis(self, ra):
+        # Install a configured rotational axis into its fixed slot.  Unlike
+        # add_extra_axis() this replaces a placeholder rather than
+        # appending, so the a/b/c position indexes never move.
+        self._flush_lookahead()
+        index = ROTARY_LETTERS.index(ra.get_axis_letter())
+        self.extra_axes[1 + index] = ra
+        self._build_extra_axes_status()
+        self.printer.send_event("toolhead:update_extra_axes")
+    def get_rotary_axis(self, letter):
+        return self.extra_axes[1 + ROTARY_LETTERS.index(letter)]
     def add_extra_axis(self, ea, axis_pos):
         self._flush_lookahead()
         self.extra_axes.append(ea)
@@ -455,6 +503,11 @@ class ToolHead:
         self.printer.send_event("toolhead:update_extra_axes")
     def get_extra_axes(self):
         return [None, None, None] + self.extra_axes
+    def get_rotary_axes(self):
+        # Configured rotational axes as (position_index, axis) pairs.
+        # Placeholders for undeclared letters are omitted.
+        return [(i, self.extra_axes[i - 3]) for i in ROTARY_POS
+                if self.extra_axes[i - 3].get_axis_gcode_id() is not None]
     # Homing "drip move" handling
     def _drip_load_trapq(self, submit_move):
         # Queue move into trapezoid motion queue (trapq)
@@ -465,18 +518,19 @@ class ToolHead:
         self._calc_print_time()
         start_time = end_time = self.print_time
         for move in moves:
+            sp, ar = move.start_pos, move.axes_r
             self.trapq_append(
                 self.trapq, end_time,
                 move.accel_t, move.cruise_t, move.decel_t,
-                move.start_pos[0], move.start_pos[1], move.start_pos[2],
-                move.axes_r[0], move.axes_r[1], move.axes_r[2],
+                sp[0], sp[1], sp[2], sp[4], sp[5], sp[6],
+                ar[0], ar[1], ar[2], ar[4], ar[5], ar[6],
                 move.start_v, move.cruise_v, move.accel)
             end_time = end_time + move.accel_t + move.cruise_t + move.decel_t
         self.lookahead.reset()
         return start_time, end_time
     def drip_move(self, newpos, speed, drip_completion):
         # Create and verify move is valid
-        newpos = newpos[:3] + self.commanded_pos[3:]
+        newpos = list(newpos[:3]) + self.commanded_pos[3:]
         move = Move(self, self.commanded_pos, newpos, speed)
         if move.move_d:
             self.kin.check_move(move)
@@ -521,6 +575,11 @@ class ToolHead:
         self.lookahead.reset()
     def get_kinematics(self):
         return self.kin
+    def register_move_check(self, callback):
+        # Called with each move that reaches the motion queue, after the
+        # kinematics' own check_move().  Should raise command_error to
+        # reject the move.
+        self.move_checks.append(callback)
     def get_trapq(self):
         return self.trapq
     def register_lookahead_callback(self, callback):
@@ -612,3 +671,7 @@ def add_printer_objects(config):
                "manual_probe", "tuning_tower", "garbage_collection"]
     for module_name in modules:
         printer.load_object(config, module_name)
+    # Load any additional rotational axes ([printer] additional_axes).
+    # Done after the modules above so that gcode_move is available to
+    # pick up the new g-code axis words.
+    kinematics.rotary_axis.add_printer_objects(config)

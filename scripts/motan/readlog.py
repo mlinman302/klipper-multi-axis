@@ -69,18 +69,22 @@ class HandleTrapQ:
             'label': '%s acceleration' % (trapq_name,),
             'units': 'Acceleration\n(mm/s^2)', 'func': self._pull_accel
         }
-        for axis, name in enumerate("xyz"):
+        # Linear axes are in mm, the rotational a/b/c axes in degrees
+        for axis, name in enumerate("xyzabc"):
+            unit = 'mm' if axis < 3 else 'deg'
             ptypes['%s' % (name,)] = {
                 'label': '%s %s position' % (trapq_name, name), 'axis': axis,
-                'units': 'Position\n(mm)', 'func': self._pull_axis_position
+                'units': 'Position\n(%s)' % (unit,),
+                'func': self._pull_axis_position
             }
             ptypes['%s_velocity' % (name,)] = {
                 'label': '%s %s velocity' % (trapq_name, name), 'axis': axis,
-                'units': 'Velocity\n(mm/s)', 'func': self._pull_axis_velocity
+                'units': 'Velocity\n(%s/s)' % (unit,),
+                'func': self._pull_axis_velocity
             }
             ptypes['%s_accel' % (name,)] = {
                 'label': '%s %s acceleration' % (trapq_name, name),
-                'axis': axis, 'units': 'Acceleration\n(mm/s^2)',
+                'axis': axis, 'units': 'Acceleration\n(%s/s^2)' % (unit,),
                 'func': self._pull_axis_accel
             }
         pinfo = ptypes.get(datasel)

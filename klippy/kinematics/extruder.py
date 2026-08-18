@@ -249,8 +249,8 @@ class PrinterExtruder:
         # Queue movement (x is extruder movement, y is pressure advance flag)
         self.trapq_append(self.trapq, print_time,
                           move.accel_t, move.cruise_t, move.decel_t,
-                          move.start_pos[ea_index], 0., 0.,
-                          1., can_pressure_advance, 0.,
+                          move.start_pos[ea_index], 0., 0., 0., 0., 0.,
+                          1., can_pressure_advance, 0., 0., 0., 0.,
                           start_v, cruise_v, accel)
         self.last_position = move.end_pos[ea_index]
     def find_past_position(self, print_time):

@@ -9,7 +9,15 @@ import gcode, mathutil, stepper
 from . import idex_modes
 from . import kinematic_stepper as ks
 
-VALID_AXES = ['x', 'y', 'z']
+# A carriage may be attached to any of the six kinematic axes.  Only the
+# three linear ones are required - a machine must define carriages for
+# x/y/z, while a/b/c carriages are optional and appear only on machines
+# with rotational axes.  Mixing a linear and a rotational carriage in one
+# stepper's 'carriages:' expression is how a coupled drive such as a core
+# r-theta stage is described.
+VALID_AXES = ['x', 'y', 'z', 'a', 'b', 'c']
+LINEAR_AXES = ['x', 'y', 'z']
+NUM_LINEAR = len(LINEAR_AXES)
 
 class MainCarriage:
     def __init__(self, config):
@@ -19,7 +27,7 @@ class MainCarriage:
             self.axis_name = config.getchoice('axis', VALID_AXES, carriage_name)
         else:
             self.axis_name = config.getchoice('axis', VALID_AXES)
-        self.axis = ord(self.axis_name) - ord('x')
+        self.axis = VALID_AXES.index(self.axis_name)
         self.dual_carriage = None
     def get_name(self):
         return self.rail.get_name(short=True)
@@ -60,7 +68,7 @@ class DualCarriage:
         self.primary_carriage_name = config.get('primary_carriage', None)
         if self.primary_carriage_name is None:
             self.axis_name = config.getchoice('axis', VALID_AXES)
-            self.axis = ord(self.axis_name) - ord('x')
+            self.axis = VALID_AXES.index(self.axis_name)
             self.safe_dist = None
         else:
             self.axis_name = config.getchoice('axis', VALID_AXES + [None], None)
@@ -82,7 +90,7 @@ class DualCarriage:
                                     % (self.primary_carriage.get_name(),
                                        self.primary_carriage.axis_name,
                                        self.get_name(), axis_name))
-        self.axis = ord(axis_name) - ord('x')
+        self.axis = VALID_AXES.index(axis_name)
         if self.primary_carriage.get_dual_carriage():
             raise self.config_error(
                     "Multiple dual carriages ('%s', '%s') for carriage '%s'" %
@@ -181,7 +189,7 @@ class GenericCartesianKinematics:
                 raise config.error(
                         "Axis '%s' is set for multiple primary carriages (%s)"
                         % (axis_name, ', '.join(dups)))
-            elif not dups:
+            elif not dups and axis_name in LINEAR_AXES:
                 raise config.error(
                         "No carriage defined for axis '%s'" % axis_name)
         dc_carriages = []
@@ -230,6 +238,17 @@ class GenericCartesianKinematics:
     def _load_steppers(self, config, carriages):
         return [ks.KinematicStepper(c, carriages)
                 for c in config.get_prefix_sections('stepper ')]
+    def get_axis_rail(self, axis_name):
+        # Primary carriage rail driving a kinematic axis letter, or None.
+        # Used by a coupled rotational axis (eg, core r-theta) to find its
+        # range and endstop, since it has no stepper of its own.
+        if axis_name not in VALID_AXES:
+            return None
+        axis = VALID_AXES.index(axis_name)
+        for c in self.primary_carriages:
+            if c.get_axis() == axis:
+                return c.get_rail()
+        return None
     def get_steppers(self):
         return [s.get_stepper() for s in self.kin_steppers]
     def _get_kinematics_coeffs(self):
@@ -281,7 +300,9 @@ class GenericCartesianKinematics:
         for s in self.kin_steppers:
             s.set_position(newpos)
         for axis_name in homing_axes:
-            axis = "xyz".index(axis_name)
+            if axis_name not in LINEAR_AXES:
+                continue
+            axis = LINEAR_AXES.index(axis_name)
             for c in self.carriages.values():
                 if c.get_axis() == axis and c.is_active():
                     self.limits[axis] = c.get_rail().get_range()
@@ -291,23 +312,29 @@ class GenericCartesianKinematics:
             if axis_name in clear_axes:
                 self.limits[axis] = (1.0, -1.0)
     def home_axis(self, homing_state, axis, rail):
+        # 'axis' is a kinematic axis index; homing works in toolhead
+        # position indexes, which differ once rotational axes exist
+        pos_index = stepper.KIN_AXIS_INDEXES[axis]
+        toolhead = self.printer.lookup_object('toolhead')
+        num_pos = len(toolhead.get_position())
         # Determine movement
         position_min, position_max = rail.get_range()
         hi = rail.get_homing_info()
-        homepos = [None, None, None, None]
-        homepos[axis] = hi.position_endstop
+        homepos = [None] * num_pos
+        homepos[pos_index] = hi.position_endstop
         forcepos = list(homepos)
         if hi.positive_dir:
-            forcepos[axis] -= 1.5 * (hi.position_endstop - position_min)
+            forcepos[pos_index] -= 1.5 * (hi.position_endstop - position_min)
         else:
-            forcepos[axis] += 1.5 * (position_max - hi.position_endstop)
+            forcepos[pos_index] += 1.5 * (position_max - hi.position_endstop)
         # Perform homing
         homing_state.home_rails([rail], forcepos, homepos)
     def home(self, homing_state):
         self._check_kinematics(self.printer.command_error)
         primary_carriages = {c.get_axis(): c for c in self.primary_carriages}
         # Each axis is homed independently and in order
-        for axis in homing_state.get_axes():
+        for pos_index in homing_state.get_axes():
+            axis = stepper.KIN_AXIS_INDEXES.index(pos_index)
             if self.dc_module is not None and axis in self.dc_module.get_axes():
                 self.dc_module.home(homing_state, axis)
             else:
