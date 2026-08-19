@@ -529,10 +529,19 @@ class ToolHead:
         self.lookahead.reset()
         return start_time, end_time
     def drip_move(self, newpos, speed, drip_completion):
-        # Create and verify move is valid
-        newpos = list(newpos[:3]) + self.commanded_pos[3:]
-        move = Move(self, self.commanded_pos, newpos, speed)
-        if move.move_d:
+        # Create and verify move is valid.  Only the kinematic axes may
+        # travel during a drip move - the extruder and any additional
+        # g-code axes are pinned to their current position.  The
+        # rotational a/b/c axes are kinematic axes (they home exactly
+        # like x/y/z), so they must be carried over from newpos;
+        # dropping them made a rotation-only homing move zero length,
+        # which generated no steps at all.
+        dripmove = list(self.commanded_pos)
+        for i in stepper.KIN_AXIS_INDEXES:
+            if i < len(newpos):
+                dripmove[i] = newpos[i]
+        move = Move(self, self.commanded_pos, dripmove, speed)
+        if move.is_kinematic_move:
             self.kin.check_move(move)
         # Make sure stepper movement doesn't start before nominal start time
         kin_flush_delay = self.motion_queuing.get_kin_flush_delay()
