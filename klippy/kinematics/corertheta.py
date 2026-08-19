@@ -1,6 +1,6 @@
 # Code for handling the kinematics of core r-theta polar robots
 #
-# Copyright (C) 2025  Klipper multi-axis contributors
+# Copyright (C) 2026  Klipper multi-axis contributors
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
@@ -19,7 +19,7 @@
 #
 # The two gantry motors are coupled through a differential: driving them
 # in the same direction produces B rotation alone, driving them in
-# opposition produces radial X motion alone.  This is the CoreXY idiom
+# opposition produces linear X motion alone.  This is the CoreXY idiom
 # applied to one linear and one rotational coordinate, which works only
 # because both coordinates travel in the single six-axis motion queue -
 # see docs/Multi_Axis.md.
@@ -158,11 +158,17 @@ class CoreRThetaKinematics:
             self._home_axis(homing_state, 2, self.rail_z)
     def check_move(self, move):
         end_pos = move.end_pos
-        xy2 = end_pos[0]**2 + end_pos[1]**2
-        if xy2 > self.limit_xy2:
-            if self.limit_xy2 < 0.:
-                raise move.move_error("Must home axis first")
-            raise move.move_error()
+        # Only range check the radius on moves that actually change x or
+        # y.  Without this guard a z-only or b-only move (including the
+        # homing moves for those axes) is rejected while x/y are still
+        # unhomed, which makes it impossible to home anything before x.
+        # cartesian.py applies the same axes_d guard in _check_endstops.
+        if move.axes_d[0] or move.axes_d[1]:
+            xy2 = end_pos[0]**2 + end_pos[1]**2
+            if xy2 > self.limit_xy2:
+                if self.limit_xy2 < 0.:
+                    raise move.move_error("Must home axis first")
+                raise move.move_error()
         if move.axes_d[2]:
             if end_pos[2] < self.limit_z[0] or end_pos[2] > self.limit_z[1]:
                 if self.limit_z[0] > self.limit_z[1]:

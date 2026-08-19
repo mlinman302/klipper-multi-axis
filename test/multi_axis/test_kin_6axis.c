@@ -256,9 +256,33 @@ test_corertheta(void)
     } else {
         printf("ok   B-only move drives the gantry motors\n");
     }
+    // Centre singularity.  The polar angle is indeterminate at r=0, and
+    // near it an arbitrarily small x/y change swings atan2 by up to pi.
+    // Sweeping out through the centre used to jump the bed angle straight
+    // from pi to 0 - an instantaneous half turn that overruns the step
+    // compressor ("Internal error in stepcompress" on the bed queue).
+    // The bed must hold its previous angle inside the hold radius.
+    double thru[KIN_AXES] = {-1., 0., 0., 0., 0., 0.};
+    double d_thru[KIN_AXES] = {2., 0., 0., 0., 0., 0.};
+    struct trapq *tq_o = queue_move(t0, move_t, thru, d_thru);
+    bed->commanded_pos = M_PI;
+    check("centre: bed holds previous angle",
+          sample(tq_o, bed, t0 + move_t / 2.), M_PI, 1e-9);
+    bed->commanded_pos = -M_PI / 2.;
+    check("centre: holds whatever the previous angle was",
+          sample(tq_o, bed, t0 + move_t / 2.), -M_PI / 2., 1e-9);
+    // Outside the hold radius the angle tracks atan2 again
+    bed->commanded_pos = 0.;
+    check("outside hold radius: tracks atan2",
+          sample(tq_o, bed, t0 + move_t), 0., 1e-9);
+    // The gantry motors are unaffected by the hold - radius is |x|
+    check("centre: motor+ still tracks radius",
+          sample(tq_o, mp, t0 + move_t), 1., 1e-9);
+
     trapq_free(tq_x);
     trapq_free(tq_b);
     trapq_free(tq_y);
+    trapq_free(tq_o);
 }
 
 static void

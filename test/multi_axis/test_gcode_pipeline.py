@@ -562,5 +562,68 @@ class TestMultipleMoves(unittest.TestCase):
         self.assertAlmostEqual(t_plain, t_rot, places=9)
 
 
+
+######################################################################
+# corertheta check_move
+######################################################################
+
+class _CheckMoveError(Exception):
+    pass
+
+
+class _FakeMove:
+    def __init__(self, axes_d, end_pos, move_d=1.):
+        self.axes_d = axes_d
+        self.end_pos = end_pos
+        self.start_pos = [0.] * len(end_pos)
+        self.move_d = move_d
+        self.max_cruise_v2 = 100.
+        self.limited = None
+    def move_error(self, msg="Move out of range"):
+        return _CheckMoveError(msg)
+    def limit_speed(self, v, a):
+        self.limited = (v, a)
+
+
+class TestCoreRThetaCheckMove(unittest.TestCase):
+    # check_move must range check each axis only on moves that actually
+    # touch it.  Two regressions live here: rejecting z/b-only moves while
+    # x/y are unhomed (which made it impossible to home anything before x),
+    # and reading end_pos on a path where it had not been assigned.
+    def _kin(self, limit_xy2=-1., limit_z=(0., 250.)):
+        from kinematics import corertheta
+        kin = object.__new__(corertheta.CoreRThetaKinematics)
+        kin.limit_xy2 = limit_xy2
+        kin.limit_z = limit_z
+        kin.v_rad_max = 0.
+        kin.max_velocity = kin.max_accel = 300.
+        kin.max_z_velocity = 5.
+        kin.max_z_accel = 100.
+        return kin
+    def test_z_only_move_allowed_while_xy_unhomed(self):
+        kin = self._kin()
+        m = _FakeMove([0., 0., 5.], [0., 0., 10.], move_d=5.)
+        kin.check_move(m)          # must not raise (NameError regression)
+        self.assertIsNotNone(m.limited)
+    def test_b_only_move_allowed_while_xy_unhomed(self):
+        kin = self._kin()
+        m = _FakeMove([0., 0., 0.], [0., 0., 0.])
+        kin.check_move(m)          # must not raise
+    def test_xy_move_rejected_while_unhomed(self):
+        kin = self._kin()
+        m = _FakeMove([10., 0., 0.], [10., 0., 0.], move_d=10.)
+        with self.assertRaises(_CheckMoveError):
+            kin.check_move(m)
+    def test_z_move_rejected_while_z_unhomed(self):
+        kin = self._kin(limit_xy2=40000., limit_z=(1., -1.))
+        m = _FakeMove([0., 0., 5.], [0., 0., 10.], move_d=5.)
+        with self.assertRaises(_CheckMoveError):
+            kin.check_move(m)
+    def test_xy_move_allowed_within_radius(self):
+        kin = self._kin(limit_xy2=40000.)
+        m = _FakeMove([10., 0., 0.], [10., 0., 0.], move_d=10.)
+        kin.check_move(m)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

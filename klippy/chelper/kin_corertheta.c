@@ -35,13 +35,24 @@ struct corertheta_stepper {
     double b_ratio;
 };
 
+// Below this radius (in mm) the polar angle is not meaningfully defined:
+// an arbitrarily small change in x/y swings atan2 by up to pi, and at
+// exactly x==y==0 it is degenerate.  Bed rotation also has no effect on
+// the tool position there, so holding the last angle is both safe and
+// physically faithful.
+#define BED_MIN_RADIUS 0.010
+
 // Bed rotation - the polar angle of the commanded cartesian position
 static double
 corertheta_stepper_bed_calc_position(struct stepper_kinematics *sk
                                      , struct move *m, double move_time)
 {
     struct coord c = move_get_coord(m, move_time);
-    // XXX - handle x==y==0
+    if (c.x*c.x + c.y*c.y < BED_MIN_RADIUS * BED_MIN_RADIUS)
+        // At the centre the angle is indeterminate - hold the previous
+        // one rather than let atan2 flip, which would command the bed to
+        // make an instantaneous half turn and overrun the step compressor
+        return sk->commanded_pos;
     double angle = atan2(c.y, c.x);
     if (angle - sk->commanded_pos > M_PI)
         angle -= 2. * M_PI;
