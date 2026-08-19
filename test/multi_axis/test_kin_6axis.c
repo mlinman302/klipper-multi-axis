@@ -20,6 +20,7 @@
 #include <time.h>
 #include "itersolve.h"
 #include "list.h"
+#include "stepcompress.h"
 #include "trapq.h"
 
 extern struct stepper_kinematics *rotary_axis_stepper_alloc(char axis);
@@ -198,6 +199,9 @@ test_core_r_theta(void)
     trapq_free(tq_xc);
 }
 
+// Mirrors BED_MIN_RADIUS in kin_corertheta.c
+#define BED_HOLD_R 0.010
+
 static void
 test_corertheta(void)
 {
@@ -257,20 +261,40 @@ test_corertheta(void)
         printf("ok   B-only move drives the gantry motors\n");
     }
     // Centre singularity.  The polar angle is indeterminate at r=0, and
-    // near it an arbitrarily small x/y change swings atan2 by up to pi.
-    // Sweeping out through the centre used to jump the bed angle straight
-    // from pi to 0 - an instantaneous half turn that overruns the step
-    // compressor ("Internal error in stepcompress" on the bed queue).
-    // The bed must hold its previous angle inside the hold radius.
+    // near it an arbitrarily small x/y change swings atan2 by up to pi,
+    // which would command the bed to make an instantaneous half turn and
+    // overrun the step compressor ("Internal error in stepcompress" on the
+    // bed queue).  Inside the dead radius the angle is therefore taken
+    // from the direction of travel, so that it already agrees with atan2
+    // where the path leaves the zone and nothing turns at the boundary.
+    //
+    // Crucially it stays a pure function of the move - it must NOT hold
+    // sk->commanded_pos.  itersolve_set_position() runs this callback over
+    // a zeroed move, so a stateful hold made "set the position to the
+    // centre" a no-op.  That is exactly what G28 X does when
+    // stepper_x's position_min is 0, and the stale angle then tore through
+    // the step compressor as soon as the homing move left the dead zone.
+    //
+    // The sweep below runs x from -1 to +1, so a fraction f of move_t sits
+    // at x = 2f - 1.
     double thru[KIN_AXES] = {-1., 0., 0., 0., 0., 0.};
     double d_thru[KIN_AXES] = {2., 0., 0., 0., 0., 0.};
     struct trapq *tq_o = queue_move(t0, move_t, thru, d_thru);
+    double t_before = t0 + move_t * (1. - 2. * BED_HOLD_R) / 2.; // x=-2*hold
+    double t_in = t0 + move_t * (1. - BED_HOLD_R / 2.) / 2.;     // x=-hold/2
+    double t_out = t0 + move_t * (1. + BED_HOLD_R / 2.) / 2.;    // x=+hold/2
     bed->commanded_pos = M_PI;
-    check("centre: bed holds previous angle",
-          sample(tq_o, bed, t0 + move_t / 2.), M_PI, 1e-9);
+    check("outside the zone: tracks atan2",
+          sample(tq_o, bed, t_before), M_PI, 1e-9);
+    check("centre: inbound half keeps the entry angle",
+          sample(tq_o, bed, t_in), M_PI, 1e-9);
+    bed->commanded_pos = 0.;
+    check("centre: outbound half sits at the exit angle",
+          sample(tq_o, bed, t_out), 0., 1e-9);
+    // ...and the held angle does not depend on where the bed happens to be
     bed->commanded_pos = -M_PI / 2.;
-    check("centre: holds whatever the previous angle was",
-          sample(tq_o, bed, t0 + move_t / 2.), -M_PI / 2., 1e-9);
+    check("centre: hold ignores the previous angle",
+          sample(tq_o, bed, t_out), 0., 1e-9);
     // Outside the hold radius the angle tracks atan2 again
     bed->commanded_pos = 0.;
     check("outside hold radius: tracks atan2",
@@ -278,6 +302,14 @@ test_corertheta(void)
     // The gantry motors are unaffected by the hold - radius is |x|
     check("centre: motor+ still tracks radius",
           sample(tq_o, mp, t0 + move_t), 1., 1e-9);
+    // Regression: setting the position at the centre must reset the bed
+    // angle rather than leave the previous one in place
+    itersolve_set_position(bed, cos(2.) * 100., sin(2.) * 100.,
+                           0., 0., 0., 0.);
+    check("set_position away from the centre", bed->commanded_pos, 2., 1e-9);
+    itersolve_set_position(bed, 0., 0., 0., 0., 0., 0.);
+    check("set_position at the centre is not a stale hold",
+          bed->commanded_pos, 0., 1e-9);
 
     trapq_free(tq_x);
     trapq_free(tq_b);
@@ -355,6 +387,60 @@ benchmark(void)
     printf("     %ld calc_position calls in %.3fs (%.1f ns/call), acc=%.1f\n",
            N, secs, secs * 1e9 / N, acc);
     trapq_free(tq);
+}
+
+// End to end regression for the reported "G28 X causes a stepcompress
+// error" on a corertheta machine.  Everything above checks the kinematic
+// function itself; this drives the real step generator and the real step
+// compressor over the move that homing actually issues, because that is
+// where the fault surfaced - the bed had to cover a whole stale angle in
+// the microseconds it took the radius to cross the dead zone, which the
+// compressor rejects with "Invalid sequence" (an interval of zero ticks).
+static void
+test_corertheta_home_x_step_generation(void)
+{
+    printf("\n-- corertheta: G28 X drives the step compressor --\n");
+    const double mcu_freq = 16000000.;
+    // 200 full steps, 16 microsteps, 4:1 bed reduction
+    const double bed_step_dist = 2. * M_PI / (200. * 16. * 4.);
+
+    struct list_head msg_queue;
+    list_init(&msg_queue);
+    struct stepcompress *sc = stepcompress_alloc(&msg_queue);
+    stepcompress_fill(sc, 1, (uint32_t)(0.000025 * mcu_freq), 1, 2);
+    stepcompress_set_time(sc, 0., mcu_freq);
+
+    struct stepper_kinematics *bed = corertheta_stepper_alloc('c', 1.);
+    struct trapq *tq = trapq_alloc();
+    itersolve_set_trapq(bed, tq, bed_step_dist);
+
+    // An earlier print move left the bed at 2 rad, then G28 X forced the
+    // toolhead to (position_min, 0) - the centre, for a position_min of 0
+    itersolve_set_position(bed, cos(2.) * 100., sin(2.) * 100.,
+                           0., 0., 0., 0.);
+    itersolve_set_position(bed, 0., 0., 0., 0., 0., 0.);
+    check("G28 X: forcepos clears the stale bed angle",
+          itersolve_get_commanded_pos(bed), 0., 1e-9);
+
+    // The homing drip move: radius 0 -> 200mm along y == 0 at 50mm/s
+    double t0 = 0.1, move_t = 200. / 50.;
+    double start[KIN_AXES] = {0., 0., 0., 0., 0., 0.};
+    double delta[KIN_AXES] = {200., 0., 0., 0., 0., 0.};
+    struct trapq *tq_h = queue_move(t0, move_t, start, delta);
+    itersolve_set_trapq(bed, tq_h, bed_step_dist);
+
+    check("G28 X: itersolve_generate_steps",
+          itersolve_generate_steps(bed, sc, t0 + move_t), 0., 0.);
+    check("G28 X: stepcompress_flush",
+          stepcompress_flush(sc, (uint64_t)((t0 + move_t + 1.) * mcu_freq)),
+          0., 0.);
+    // Homing straight out along +X leaves the bed where it started
+    check("G28 X: bed angle after the homing move",
+          itersolve_get_commanded_pos(bed), 0., 1e-9);
+
+    stepcompress_free(sc);
+    trapq_free(tq);
+    trapq_free(tq_h);
 }
 
 // RTCP: the head tilts about B, and the linear carriages must move to
@@ -450,6 +536,7 @@ main(void)
     test_rotary_shares_time_base();
     test_core_r_theta();
     test_corertheta();
+    test_corertheta_home_x_step_generation();
     test_existing_kinematics_unchanged();
     test_set_position_and_active_axis();
     test_rtcp();
