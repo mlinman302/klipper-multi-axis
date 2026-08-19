@@ -635,6 +635,11 @@ gear_ratio:
 
 # The stepper_x section describes the first gantry motor. It carries the
 # endstop and position_min/position_max of the X axis (the arm radius).
+# A negative position_min is allowed - it denotes the far side of the bed,
+# reached by turning the bed rather than by driving the arm through the
+# middle - but position_endstop must not be negative. Homing X always
+# sweeps from a radius of zero, since a homing sweep across the centre
+# would be a half turn of the bed at the instant the sign of x flips.
 [stepper_x]
 
 # The stepper_tilt section describes the second gantry motor. It carries

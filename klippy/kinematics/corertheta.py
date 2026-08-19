@@ -65,8 +65,8 @@ class CoreRThetaKinematics:
             rail_b.get_endstops()[0][0].add_stepper(s)
         stepper_bed.setup_itersolve('corertheta_stepper_alloc', b'c',
                                     self.b_ratio)
-        rail_x.setup_itersolve('corertheta_stepper_alloc', b'+', self.b_ratio)
-        rail_b.setup_itersolve('corertheta_stepper_alloc', b'-', self.b_ratio)
+        rail_x.setup_itersolve('corertheta_stepper_alloc', b'-', self.b_ratio)
+        rail_b.setup_itersolve('corertheta_stepper_alloc', b'+', self.b_ratio)
         rail_z.setup_itersolve('cartesian_stepper_alloc', b'z')
         self.rail_x, self.rail_b, self.rail_z = rail_x, rail_b, rail_z
         self.stepper_bed = stepper_bed
@@ -137,6 +137,27 @@ class CoreRThetaKinematics:
             forcepos[axis] -= hi.position_endstop - position_min
         else:
             forcepos[axis] += position_max - hi.position_endstop
+        if axis == 0:
+            # X is the arm radius and the homing sweep runs along y == 0 at
+            # a fixed bed angle, so it must not cross the centre.  In polar
+            # coordinates a straight line through x == 0 is a half turn of
+            # the bed, commanded in the instant the sign of x flips, and it
+            # promptly overruns the step compressor ("Internal error in
+            # stepcompress" on the stepper_c queue).  Crossing the centre
+            # also drives the arm the wrong way first, because the radius
+            # the gantry motors follow is |x| - a position_min of -30 backs
+            # the arm 30mm away from the endstop before it turns around.
+            #
+            # A negative position_min is still a legal print coordinate: it
+            # is the far side of the bed, reached by turning the bed rather
+            # than by driving the arm through the middle.  Only the homing
+            # sweep has to stay on one side, and sweeping from a radius of
+            # zero still covers the arm's whole radial travel.
+            if hi.position_endstop < 0.:
+                raise self.printer.config_error(
+                    "corertheta position_endstop for stepper_x is the arm"
+                    " radius at the endstop and cannot be negative")
+            forcepos[axis] = max(forcepos[axis], 0.)
         # Perform homing
         homing_state.home_rails([rail], forcepos, homepos)
     def home(self, homing_state):

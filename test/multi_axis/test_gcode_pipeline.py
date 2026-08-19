@@ -625,5 +625,99 @@ class TestCoreRThetaCheckMove(unittest.TestCase):
         kin.check_move(m)
 
 
+######################################################################
+# corertheta X homing sweep
+######################################################################
+
+class _FakeHomingInfo:
+    def __init__(self, position_endstop, positive_dir=True):
+        self.position_endstop = position_endstop
+        self.positive_dir = positive_dir
+        self.speed = 40.
+        self.retract_dist = 0.
+        self.retract_speed = 40.
+        self.second_homing_speed = 20.
+
+
+class _FakeRail:
+    def __init__(self, rng, hi):
+        self._range = rng
+        self._hi = hi
+    def get_range(self):
+        return self._range
+    def get_homing_info(self):
+        return self._hi
+
+
+class _FakeToolhead:
+    def get_position(self):
+        return [0.] * 7
+
+
+class _FakeHomingState:
+    def __init__(self):
+        self.calls = []
+    def home_rails(self, rails, forcepos, homepos):
+        self.calls.append((rails, forcepos, homepos))
+
+
+class _FakePrinter:
+    class config_error(Exception):
+        pass
+    def lookup_object(self, name):
+        assert name == 'toolhead'
+        return _FakeToolhead()
+
+
+class TestCoreRThetaHomeX(unittest.TestCase):
+    # X is the arm radius, so the homing sweep has to stay on one side of
+    # the centre.  Sweeping through x == 0 is a half turn of the bed in
+    # polar coordinates, commanded the instant the sign of x flips, which
+    # shuts klippy down with "Internal error in stepcompress" on the
+    # stepper_c queue - and it runs the arm inward before it turns around,
+    # since the radius the gantry motors follow is |x|.
+    def _kin(self):
+        from kinematics import corertheta
+        kin = object.__new__(corertheta.CoreRThetaKinematics)
+        kin.printer = _FakePrinter()
+        return kin
+    def _forcepos(self, rng, position_endstop, positive_dir=True):
+        kin = self._kin()
+        hs = _FakeHomingState()
+        rail = _FakeRail(rng, _FakeHomingInfo(position_endstop, positive_dir))
+        kin._home_axis(hs, 0, rail)
+        rails, forcepos, homepos = hs.calls[0]
+        return forcepos, homepos
+    def test_negative_position_min_does_not_cross_the_centre(self):
+        # The reported machine: position_min -30, endstop/max 200.  The
+        # sweep used to start at x = -30 and blow up 30mm in, as the
+        # commanded x crossed zero.
+        forcepos, homepos = self._forcepos((-30., 200.), 200.)
+        self.assertEqual(forcepos[0], 0.)
+        self.assertEqual(forcepos[1], 0.)
+        self.assertEqual(homepos[0], 200.)
+        self.assertEqual(homepos[1], 0.)
+    def test_non_negative_position_min_is_untouched(self):
+        forcepos, homepos = self._forcepos((20., 200.), 200.)
+        self.assertEqual(forcepos[0], 20.)
+        self.assertEqual(homepos[0], 200.)
+    def test_position_min_of_zero_is_untouched(self):
+        forcepos, homepos = self._forcepos((0., 200.), 200.)
+        self.assertEqual(forcepos[0], 0.)
+    def test_homing_toward_the_centre_also_stays_positive(self):
+        # Endstop at the inner end: the sweep runs position_max -> endstop
+        forcepos, homepos = self._forcepos((-30., 200.), 5.,
+                                           positive_dir=False)
+        self.assertGreaterEqual(forcepos[0], 0.)
+        self.assertEqual(homepos[0], 5.)
+    def test_negative_position_endstop_is_a_config_error(self):
+        with self.assertRaises(_FakePrinter.config_error):
+            self._forcepos((-30., 200.), -10.)
+    def test_y_is_pinned_to_zero_for_the_whole_sweep(self):
+        # The bed angle is atan2(y, x); a non-zero y would turn the bed
+        forcepos, homepos = self._forcepos((-30., 200.), 200.)
+        self.assertEqual(forcepos[1], homepos[1])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
