@@ -190,6 +190,12 @@ class BaseRotaryAxis:
         homing_state.set_axes([pos_index])
         homing_state.home_rails([self.rail], forcepos, homepos)
         self.is_homed = True
+
+        ### move to vertical position after homing rotary axis
+        curpos = toolhead.get_position()
+        curpos[pos_index] = 0.
+        toolhead.move(curpos, self.rail.homing_speed)
+
         self.commanded_pos = toolhead.get_position()[pos_index]
 
     ######################################################################
