@@ -719,5 +719,64 @@ class TestCoreRThetaHomeX(unittest.TestCase):
         self.assertEqual(forcepos[1], homepos[1])
 
 
+######################################################################
+# corertheta calc_position
+######################################################################
+
+class _NamedRail:
+    def __init__(self, name):
+        self.name = name
+    def get_name(self):
+        return self.name
+
+
+class TestCoreRThetaCalcPosition(unittest.TestCase):
+    # calc_position has to invert the same formulas kin_corertheta.c
+    # applies: stepper_x runs the '-' solver and stepper_tilt the '+' one.
+    # When the two were swapped in setup_itersolve() without updating this
+    # inverse, the radius came back negated - so the first thing that
+    # recomputed the toolhead position from the steppers (homing Z, after
+    # X was already homed) flipped the sign of X.
+    B_RATIO = 2.5
+    def _kin(self):
+        from kinematics import corertheta
+        kin = object.__new__(corertheta.CoreRThetaKinematics)
+        kin.stepper_bed = _NamedRail('stepper_c')
+        kin.rail_x = _NamedRail('stepper_x')
+        kin.rail_b = _NamedRail('stepper_tilt')
+        kin.rail_z = _NamedRail('stepper_z')
+        kin.b_ratio = self.B_RATIO
+        return kin
+    def _stepper_positions(self, x, y, z, b):
+        # The forward kinematics of kin_corertheta.c
+        radius = math.sqrt(x*x + y*y)
+        return {'stepper_c': math.atan2(y, x),
+                'stepper_x': self.B_RATIO * b - radius,
+                'stepper_tilt': self.B_RATIO * b + radius,
+                'stepper_z': z}
+    def _check(self, x, y, z, b):
+        kin = self._kin()
+        pos = kin.calc_position(self._stepper_positions(x, y, z, b))
+        self.assertAlmostEqual(pos[0], x, places=9)
+        self.assertAlmostEqual(pos[1], y, places=9)
+        self.assertAlmostEqual(pos[2], z, places=9)
+        self.assertAlmostEqual(pos[4], b, places=9)
+    def test_round_trip_on_the_x_axis(self):
+        # The position right after homing X: bed angle zero, arm out
+        self._check(200., 0., 12.5, 0.)
+    def test_round_trip_off_axis(self):
+        self._check(-30., 45., 100., -17.)
+    def test_round_trip_with_b_rotation(self):
+        self._check(120., 0., 0., 30.)
+    def test_x_keeps_its_sign_when_z_is_homed_after_x(self):
+        # G28 X leaves the toolhead at (200, 0); homing Z afterwards runs
+        # calc_position over the unchanged gantry steppers, and must not
+        # come back with x = -200.
+        kin = self._kin()
+        sp = self._stepper_positions(200., 0., 0., 0.)
+        sp['stepper_z'] = 10.       # only z moved
+        self.assertGreater(kin.calc_position(sp)[0], 0.)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

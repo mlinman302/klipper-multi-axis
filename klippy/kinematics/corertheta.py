@@ -99,8 +99,11 @@ class CoreRThetaKinematics:
         return None
     def calc_position(self, stepper_positions):
         bed_angle = stepper_positions[self.stepper_bed.get_name()]
-        p_plus = stepper_positions[self.rail_x.get_name()]
-        p_minus = stepper_positions[self.rail_b.get_name()]
+        # stepper_x runs the '-' solver (b*ratio - radius) and
+        # stepper_tilt the '+' one (b*ratio + radius) - see the
+        # setup_itersolve() calls above
+        p_minus = stepper_positions[self.rail_x.get_name()]
+        p_plus = stepper_positions[self.rail_b.get_name()]
         z_pos = stepper_positions[self.rail_z.get_name()]
         radius = .5 * (p_plus - p_minus)
         b_pos = .5 * (p_plus + p_minus) / self.b_ratio
