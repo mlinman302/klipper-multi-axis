@@ -597,10 +597,21 @@ gear_ratio:
 
 A polar (rotating bed) printer whose arm carriage also carries a tool
 that rotates about the Y axis - the `B` axis of
-[Multi_Axis.md](Multi_Axis.md).  Two motors act on the X gantry through
+[Multi_Axis.md](Multi_Axis.md).  Two motors act on the gantry through
 a differential: driving them in the same direction rotates B, driving
-them in opposition moves the arm radially.  A leadscrew raises the
-gantry.
+them in opposition moves the arm radially along the `R` rail.  A
+leadscrew raises the gantry.
+
+`R` is the radius of the toolhead in the XY plane, measured from the
+centre of the bed - the coordinate the arm rail actually travels in,
+which is why it is `[stepper_r]` rather than `[stepper_x]`.  As with
+polar kinematics the g-code words stay cartesian: an `X`/`Y` position is
+resolved into a bed angle and an arm radius, so `R` is a machine
+coordinate rather than a g-code axis.  Homing the arm sweeps at a bed
+angle of zero, where `R` and `X` coincide, so it is requested as `G28 X`
+- see [example-corertheta.cfg](../config/example-corertheta.cfg) for the
+`HOME_R` macro that wraps this up along with the rest of the homing
+sequence.
 
 Only parameters specific to core r-theta printers are described here -
 see [common kinematic settings](#common-kinematic-settings) for
@@ -617,14 +628,14 @@ additional_axes: b
 #   The B axis is driven by the kinematics, so it must be declared here
 #   and must not have a [stepper_b] section of its own.
 #b_coupling_ratio: 1.0
-#   The travel of a gantry motor (in the units of [stepper_x]) produced
+#   The travel of a gantry motor (in the units of [stepper_r]) produced
 #   by one degree of B rotation. The default is 1.0, which makes the
 #   differential a plain CoreXY-style sum.
 #invert_b_direction: False
-#   Set this to True if the B axis rotates the wrong way while X already
+#   Set this to True if the B axis rotates the wrong way while R already
 #   moves in the correct direction. The differential only fixes the two
 #   axis directions relative to each other: inverting the dir_pin of both
-#   gantry motors negates X and B together, so nothing in [stepper_x] or
+#   gantry motors negates R and B together, so nothing in [stepper_r] or
 #   [stepper_tilt] can invert B on its own. The default is False.
 max_z_velocity:
 max_z_accel:
@@ -639,18 +650,19 @@ gear_ratio:
 #   A gear_ratio must be specified and rotation_distance may not be
 #   specified - see [stepper_bed] under polar kinematics above.
 
-# The stepper_x section describes the first gantry motor. It carries the
-# endstop and position_min/position_max of the X axis (the arm radius).
-# A negative position_min is allowed - it denotes the far side of the bed,
-# reached by turning the bed rather than by driving the arm through the
-# middle - but position_endstop must not be negative. Homing X always
-# sweeps from a radius of zero, since a homing sweep across the centre
-# would be a half turn of the bed at the instant the sign of x flips.
-[stepper_x]
+# The stepper_r section describes the first gantry motor. It carries the
+# endstop and position_min/position_max of the R axis - the arm radius in
+# mm from the centre of the bed. A negative position_min is allowed - it
+# denotes the far side of the bed, reached by turning the bed rather than
+# by driving the arm through the middle - but position_endstop must not be
+# negative. Homing R always sweeps from a radius of zero, since a homing
+# sweep across the centre would be a half turn of the bed at the instant
+# the sign of the radius flips.
+[stepper_r]
 
 # The stepper_tilt section describes the second gantry motor. It carries
 # the endstop and position_min/position_max of the B axis, in degrees.
-# Its rotation_distance is in gantry travel, as for stepper_x, since a
+# Its rotation_distance is in gantry travel, as for stepper_r, since a
 # gantry motor position is a mix of the B rotation and the arm radius.
 [stepper_tilt]
 

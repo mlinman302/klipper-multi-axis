@@ -10,9 +10,11 @@
 //   * A bed motor turns the build plate.  As on a traditional polar
 //     printer this angle is not a commanded axis - it is derived from the
 //     cartesian x/y position, together with the arm radius.
-//   * Two motors act on the x gantry through a differential.  Turning
+//   * Two motors act on the gantry through a differential.  Turning
 //     both the same way rotates the tool about y (the B axis); turning
-//     them in opposition moves the arm radially (the X axis).
+//     them in opposition moves the arm radially (the R axis - the
+//     radius of the toolhead in the xy plane from the centre of the
+//     bed, driven by [stepper_r]).
 //   * A leadscrew motor raises the gantry (the Z axis).
 //
 // The differential is the CoreXY idiom applied to one linear and one
@@ -41,7 +43,9 @@ struct corertheta_stepper {
 // the tool position there.
 #define BED_MIN_RADIUS 0.010
 
-// Bed rotation - the polar angle of the commanded cartesian position
+// Bed rotation - the polar angle of the commanded cartesian position.
+// The radius that goes with it is what the two gantry solvers below
+// compute as sqrt(x*x + y*y) - the R coordinate of the arm.
 static double
 corertheta_stepper_bed_calc_position(struct stepper_kinematics *sk
                                      , struct move *m, double move_time)
@@ -62,7 +66,7 @@ corertheta_stepper_bed_calc_position(struct stepper_kinematics *sk
         // This has to stay a pure function of (move, move_time).
         // itersolve_set_position() runs this same callback over a zeroed
         // move, so returning sk->commanded_pos here would make setting the
-        // position at the centre a no-op: G28 X forces the toolhead to
+        // position at the centre a no-op: the R home forces the toolhead to
         // (position_min, 0), and with a position_min of zero that left the
         // bed holding the angle of the last print move and then whipped it
         // round as soon as the homing move carried the radius out of the
@@ -90,7 +94,7 @@ corertheta_stepper_bed_post_fixup(struct stepper_kinematics *sk)
         sk->commanded_pos -= 2 * M_PI;
 }
 
-// First gantry motor: B rotation plus arm radius
+// First gantry motor: B rotation plus the arm radius R
 static double
 corertheta_stepper_plus_calc_position(struct stepper_kinematics *sk
                                       , struct move *m, double move_time)
@@ -101,7 +105,7 @@ corertheta_stepper_plus_calc_position(struct stepper_kinematics *sk
     return cs->b_ratio * c.b + sqrt(c.x*c.x + c.y*c.y);
 }
 
-// Second gantry motor: B rotation minus arm radius
+// Second gantry motor: B rotation minus the arm radius R
 static double
 corertheta_stepper_minus_calc_position(struct stepper_kinematics *sk
                                        , struct move *m, double move_time)

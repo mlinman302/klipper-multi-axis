@@ -11,15 +11,25 @@
 #   [stepper_c]     the rotating bed.  As on any polar printer its angle
 #                   is derived from the commanded cartesian x/y and is
 #                   not itself a g-code axis.
-#   [stepper_x]     first gantry motor.  Carries the X (arm radius)
-#                   endstop and position_min/position_max.
+#   [stepper_r]     first gantry motor.  Carries the R endstop and
+#                   position_min/position_max.  R is the radius of the
+#                   toolhead in the xy plane, measured from the centre
+#                   of the bed - the coordinate the arm actually travels
+#                   in, which is why the rail is named for the radius
+#                   rather than for x.
 #   [stepper_tilt]  second gantry motor.  Carries the B (tool rotation)
 #                   endstop and position_min/position_max, in degrees.
 #   [stepper_z]     leadscrew raising the gantry.
 #
+# As on polar.py the g-code words stay cartesian: x/y are resolved into
+# a bed angle and an arm radius, and R is a machine coordinate rather
+# than a g-code axis.  With the bed at angle zero a move along +R is a
+# move along +X, which is how R homes - see the HOME_R macro of
+# config/example-corertheta.cfg.
+#
 # The two gantry motors are coupled through a differential: driving them
 # in the same direction produces B rotation alone, driving them in
-# opposition produces linear X motion alone.  This is the CoreXY idiom
+# opposition produces radial (R) motion alone.  This is the CoreXY idiom
 # applied to one linear and one rotational coordinate, which works only
 # because both coordinates travel in the single six-axis motion queue -
 # see docs/Multi_Axis.md.
@@ -46,18 +56,26 @@ class CoreRThetaKinematics:
                 " 'additional_axes' option of the [printer] config section")
         if config.has_section('stepper_b'):
             raise config.error(
-                "The corertheta B axis is driven by [stepper_x] and"
+                "The corertheta B axis is driven by [stepper_r] and"
                 " [stepper_tilt] together - remove the [stepper_b] section")
-        # Belt travel (in [stepper_x] units) per degree of B rotation.  The
+        if (config.has_section('stepper_x')
+            and not config.has_section('stepper_r')):
+            # The radial rail used to be [stepper_x]
+            raise config.error(
+                "The corertheta radial rail is now [stepper_r] - rename the"
+                " [stepper_x] section.  Its position_endstop, position_min"
+                " and position_max are the arm radius in mm, measured from"
+                " the centre of the bed")
+        # Belt travel (in [stepper_r] units) per degree of B rotation.  The
         # default of 1. makes the differential a plain CoreXY-style sum.
         self.b_ratio = config.getfloat('b_coupling_ratio', 1., above=0.)
         # Which way the gantry motors have to turn for a positive B.  The
         # differential fixes the two axis directions relative to each
         # other, not absolutely: swapping the '+' and '-' solvers below
-        # negates X alone, and inverting both motors' dir_pin negates X
+        # negates R alone, and inverting both motors' dir_pin negates R
         # and B together, so no combination of the two can invert B by
         # itself.  This option is the missing degree of freedom - set it
-        # if B rotates the wrong way while X is already correct.
+        # if B rotates the wrong way while R is already correct.
         if config.getboolean('invert_b_direction', False):
             self.b_coeff = -self.b_ratio
         else:
@@ -65,23 +83,23 @@ class CoreRThetaKinematics:
         # Setup axis steppers
         stepper_bed = stepper.PrinterStepper(config.getsection('stepper_c'),
                                              units_in_radians=True)
-        rail_x = stepper.LookupMultiRail(config.getsection('stepper_x'))
+        rail_r = stepper.LookupMultiRail(config.getsection('stepper_r'))
         rail_b = stepper.LookupMultiRail(config.getsection('stepper_tilt'))
         rail_z = stepper.LookupMultiRail(config.getsection('stepper_z'))
-        # Either gantry motor moves both X and B, so each axis' endstop
+        # Either gantry motor moves both R and B, so each axis' endstop
         # has to watch both of them
         for s in rail_b.get_steppers():
-            rail_x.get_endstops()[0][0].add_stepper(s)
-        for s in rail_x.get_steppers():
+            rail_r.get_endstops()[0][0].add_stepper(s)
+        for s in rail_r.get_steppers():
             rail_b.get_endstops()[0][0].add_stepper(s)
         stepper_bed.setup_itersolve('corertheta_stepper_alloc', b'c',
                                     self.b_coeff)
-        rail_x.setup_itersolve('corertheta_stepper_alloc', b'-', self.b_coeff)
+        rail_r.setup_itersolve('corertheta_stepper_alloc', b'-', self.b_coeff)
         rail_b.setup_itersolve('corertheta_stepper_alloc', b'+', self.b_coeff)
         rail_z.setup_itersolve('cartesian_stepper_alloc', b'z')
-        self.rail_x, self.rail_b, self.rail_z = rail_x, rail_b, rail_z
+        self.rail_r, self.rail_b, self.rail_z = rail_r, rail_b, rail_z
         self.stepper_bed = stepper_bed
-        self.steppers = [stepper_bed] + [s for r in [rail_x, rail_b, rail_z]
+        self.steppers = [stepper_bed] + [s for r in [rail_r, rail_b, rail_z]
                                          for s in r.get_steppers()]
         for s in self.steppers:
             s.set_trapq(toolhead.get_trapq())
@@ -96,24 +114,28 @@ class CoreRThetaKinematics:
             'max_angular_velocity', above=0., default=0)
         self.limit_z = (1.0, -1.0)
         self.limit_xy2 = -1.
-        max_xy = rail_x.get_range()[1]
+        max_r = rail_r.get_range()[1]
         min_z, max_z = rail_z.get_range()
-        self.axes_min = toolhead.Coord((-max_xy, -max_xy, min_z))
-        self.axes_max = toolhead.Coord((max_xy, max_xy, max_z))
+        self.axes_min = toolhead.Coord((-max_r, -max_r, min_z))
+        self.axes_max = toolhead.Coord((max_r, max_r, max_z))
     def get_steppers(self):
         return list(self.steppers)
     def get_axis_rail(self, axis_name):
         # Called by rotary_axis.CoupledRotaryAxis to find the range and
-        # endstop of the B axis, which has no stepper of its own
+        # endstop of the B axis, which has no stepper of its own.  'r' is
+        # answered too, so a macro or a diagnostic can reach the radial
+        # rail by the name the machine uses for it.
         if axis_name == 'b':
             return self.rail_b
+        if axis_name == 'r':
+            return self.rail_r
         return None
     def calc_position(self, stepper_positions):
         bed_angle = stepper_positions[self.stepper_bed.get_name()]
-        # stepper_x runs the '-' solver (b*ratio - radius) and
+        # stepper_r runs the '-' solver (b*ratio - radius) and
         # stepper_tilt the '+' one (b*ratio + radius) - see the
         # setup_itersolve() calls above
-        p_minus = stepper_positions[self.rail_x.get_name()]
+        p_minus = stepper_positions[self.rail_r.get_name()]
         p_plus = stepper_positions[self.rail_b.get_name()]
         z_pos = stepper_positions[self.rail_z.get_name()]
         radius = .5 * (p_plus - p_minus)
@@ -128,7 +150,7 @@ class CoreRThetaKinematics:
         if "z" in homing_axes:
             self.limit_z = self.rail_z.get_range()
         if "x" in homing_axes and "y" in homing_axes:
-            self.limit_xy2 = self.rail_x.get_range()[1]**2
+            self.limit_xy2 = self.rail_r.get_range()[1]**2
     def clear_homing_state(self, clear_axes):
         if "x" in clear_axes or "y" in clear_axes:
             # X and Y cannot be cleared separately
@@ -144,7 +166,8 @@ class CoreRThetaKinematics:
         homepos = [None] * num_pos
         homepos[axis] = hi.position_endstop
         if axis == 0:
-            # The arm homes along +X, which fixes the bed angle at zero
+            # The arm homes along +R, and the sweep runs at a bed
+            # angle of zero - where R and the cartesian x coincide
             homepos[1] = 0.
         forcepos = list(homepos)
         if hi.positive_dir:
@@ -152,7 +175,7 @@ class CoreRThetaKinematics:
         else:
             forcepos[axis] += position_max - hi.position_endstop
         if axis == 0:
-            # X is the arm radius and the homing sweep runs along y == 0 at
+            # R is the arm radius and the homing sweep runs along y == 0 at
             # a fixed bed angle, so it must not cross the centre.  In polar
             # coordinates a straight line through x == 0 is a half turn of
             # the bed, commanded in the instant the sign of x flips, and it
@@ -169,26 +192,28 @@ class CoreRThetaKinematics:
             # zero still covers the arm's whole radial travel.
             if hi.position_endstop < 0.:
                 raise self.printer.config_error(
-                    "corertheta position_endstop for stepper_x is the arm"
+                    "corertheta position_endstop for stepper_r is the arm"
                     " radius at the endstop and cannot be negative")
             forcepos[axis] = max(forcepos[axis], 0.)
         # Perform homing
         homing_state.home_rails([rail], forcepos, homepos)
     def home(self, homing_state):
-        # Always home XY together.  B is homed by its rotary axis object,
-        # which drives rail_b through homing_state directly.
+        # Homing R always homes the x and y slots together: the sweep
+        # fixes the bed angle at zero, so it resolves both.  B is homed by
+        # its rotary axis object, which drives rail_b through
+        # homing_state directly.
         homing_axes = homing_state.get_axes()
-        home_xy = 0 in homing_axes or 1 in homing_axes
+        home_r = 0 in homing_axes or 1 in homing_axes
         home_z = 2 in homing_axes
         updated_axes = []
-        if home_xy:
+        if home_r:
             updated_axes = [0, 1]
         if home_z:
             updated_axes.append(2)
         homing_state.set_axes(updated_axes)
         # Do actual homing
-        if home_xy:
-            self._home_axis(homing_state, 0, self.rail_x)
+        if home_r:
+            self._home_axis(homing_state, 0, self.rail_r)
         if home_z:
             self._home_axis(homing_state, 2, self.rail_z)
     def check_move(self, move):
@@ -196,7 +221,7 @@ class CoreRThetaKinematics:
         # Only range check the radius on moves that actually change x or
         # y.  Without this guard a z-only or b-only move (including the
         # homing moves for those axes) is rejected while x/y are still
-        # unhomed, which makes it impossible to home anything before x.
+        # unhomed, which makes it impossible to home anything before R.
         # cartesian.py applies the same axes_d guard in _check_endstops.
         if move.axes_d[0] or move.axes_d[1]:
             xy2 = end_pos[0]**2 + end_pos[1]**2

@@ -271,8 +271,8 @@ test_corertheta(void)
     // Crucially it stays a pure function of the move - it must NOT hold
     // sk->commanded_pos.  itersolve_set_position() runs this callback over
     // a zeroed move, so a stateful hold made "set the position to the
-    // centre" a no-op.  That is exactly what G28 X does when
-    // stepper_x's position_min is 0, and the stale angle then tore through
+    // centre" a no-op.  That is exactly what homing R does when
+    // stepper_r's position_min is 0, and the stale angle then tore through
     // the step compressor as soon as the homing move left the dead zone.
     //
     // The sweep below runs x from -1 to +1, so a fraction f of move_t sits
@@ -390,14 +390,16 @@ benchmark(void)
 }
 
 // End to end regression for the reported "G28 X causes a stepcompress
-// error" on a corertheta machine.  Everything above checks the kinematic
+// error" on a corertheta machine.  G28 X is the R home - the radial
+// rail is [stepper_r], but the g-code words stay cartesian, so the
+// HOME_R macro issues G28 X.  Everything above checks the kinematic
 // function itself; this drives the real step generator and the real step
 // compressor over the move that homing actually issues, because that is
 // where the fault surfaced - the bed had to cover a whole stale angle in
 // the microseconds it took the radius to cross the dead zone, which the
 // compressor rejects with "Invalid sequence" (an interval of zero ticks).
 static void
-test_corertheta_home_x_step_generation(void)
+test_corertheta_home_r_step_generation(void)
 {
     printf("\n-- corertheta: G28 X drives the step compressor --\n");
     const double mcu_freq = 16000000.;
@@ -536,7 +538,7 @@ main(void)
     test_rotary_shares_time_base();
     test_core_r_theta();
     test_corertheta();
-    test_corertheta_home_x_step_generation();
+    test_corertheta_home_r_step_generation();
     test_existing_kinematics_unchanged();
     test_set_position_and_active_axis();
     test_rtcp();

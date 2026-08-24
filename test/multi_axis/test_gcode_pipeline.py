@@ -588,7 +588,7 @@ class _FakeMove:
 class TestCoreRThetaCheckMove(unittest.TestCase):
     # check_move must range check each axis only on moves that actually
     # touch it.  Two regressions live here: rejecting z/b-only moves while
-    # x/y are unhomed (which made it impossible to home anything before x),
+    # x/y are unhomed (which made it impossible to home anything before R),
     # and reading end_pos on a path where it had not been assigned.
     def _kin(self, limit_xy2=-1., limit_z=(0., 250.)):
         from kinematics import corertheta
@@ -626,7 +626,7 @@ class TestCoreRThetaCheckMove(unittest.TestCase):
 
 
 ######################################################################
-# corertheta X homing sweep
+# corertheta R homing sweep
 ######################################################################
 
 class _FakeHomingInfo:
@@ -669,9 +669,9 @@ class _FakePrinter:
         return _FakeToolhead()
 
 
-class TestCoreRThetaHomeX(unittest.TestCase):
-    # X is the arm radius, so the homing sweep has to stay on one side of
-    # the centre.  Sweeping through x == 0 is a half turn of the bed in
+class TestCoreRThetaHomeR(unittest.TestCase):
+    # R is the arm radius, so the homing sweep has to stay on one side of
+    # the centre.  Sweeping through r == 0 is a half turn of the bed in
     # polar coordinates, commanded the instant the sign of x flips, which
     # shuts klippy down with "Internal error in stepcompress" on the
     # stepper_c queue - and it runs the arm inward before it turns around,
@@ -732,17 +732,17 @@ class _NamedRail:
 
 class TestCoreRThetaCalcPosition(unittest.TestCase):
     # calc_position has to invert the same formulas kin_corertheta.c
-    # applies: stepper_x runs the '-' solver and stepper_tilt the '+' one.
+    # applies: stepper_r runs the '-' solver and stepper_tilt the '+' one.
     # When the two were swapped in setup_itersolve() without updating this
     # inverse, the radius came back negated - so the first thing that
     # recomputed the toolhead position from the steppers (homing Z, after
-    # X was already homed) flipped the sign of X.
+    # R was already homed) flipped the sign of X.
     B_RATIO = 2.5
     def _kin(self, b_coeff=None):
         from kinematics import corertheta
         kin = object.__new__(corertheta.CoreRThetaKinematics)
         kin.stepper_bed = _NamedRail('stepper_c')
-        kin.rail_x = _NamedRail('stepper_x')
+        kin.rail_r = _NamedRail('stepper_r')
         kin.rail_b = _NamedRail('stepper_tilt')
         kin.rail_z = _NamedRail('stepper_z')
         kin.b_ratio = self.B_RATIO
@@ -754,7 +754,7 @@ class TestCoreRThetaCalcPosition(unittest.TestCase):
             b_coeff = self.B_RATIO
         radius = math.sqrt(x*x + y*y)
         return {'stepper_c': math.atan2(y, x),
-                'stepper_x': b_coeff * b - radius,
+                'stepper_r': b_coeff * b - radius,
                 'stepper_tilt': b_coeff * b + radius,
                 'stepper_z': z}
     def _check(self, x, y, z, b):
@@ -764,8 +764,8 @@ class TestCoreRThetaCalcPosition(unittest.TestCase):
         self.assertAlmostEqual(pos[1], y, places=9)
         self.assertAlmostEqual(pos[2], z, places=9)
         self.assertAlmostEqual(pos[4], b, places=9)
-    def test_round_trip_on_the_x_axis(self):
-        # The position right after homing X: bed angle zero, arm out
+    def test_round_trip_on_the_r_axis(self):
+        # The position right after homing R: bed angle zero, arm out
         self._check(200., 0., 12.5, 0.)
     def test_round_trip_off_axis(self):
         self._check(-30., 45., 100., -17.)
@@ -787,8 +787,8 @@ class TestCoreRThetaCalcPosition(unittest.TestCase):
         kin = self._kin(b_coeff=-self.B_RATIO)
         sp = self._stepper_positions(200., 0., 0., 0.)
         self.assertAlmostEqual(kin.calc_position(sp)[0], 200., places=9)
-    def test_x_keeps_its_sign_when_z_is_homed_after_x(self):
-        # G28 X leaves the toolhead at (200, 0); homing Z afterwards runs
+    def test_x_keeps_its_sign_when_z_is_homed_after_r(self):
+        # Homing R leaves the toolhead at (200, 0); homing Z afterwards runs
         # calc_position over the unchanged gantry steppers, and must not
         # come back with x = -200.
         kin = self._kin()
