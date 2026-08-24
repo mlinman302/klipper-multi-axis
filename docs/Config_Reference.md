@@ -620,6 +620,12 @@ additional_axes: b
 #   The travel of a gantry motor (in the units of [stepper_x]) produced
 #   by one degree of B rotation. The default is 1.0, which makes the
 #   differential a plain CoreXY-style sum.
+#invert_b_direction: False
+#   Set this to True if the B axis rotates the wrong way while X already
+#   moves in the correct direction. The differential only fixes the two
+#   axis directions relative to each other: inverting the dir_pin of both
+#   gantry motors negates X and B together, so nothing in [stepper_x] or
+#   [stepper_tilt] can invert B on its own. The default is False.
 max_z_velocity:
 max_z_accel:
 #max_angular_velocity: 0

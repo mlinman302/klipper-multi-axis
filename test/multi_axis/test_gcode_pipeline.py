@@ -738,7 +738,7 @@ class TestCoreRThetaCalcPosition(unittest.TestCase):
     # recomputed the toolhead position from the steppers (homing Z, after
     # X was already homed) flipped the sign of X.
     B_RATIO = 2.5
-    def _kin(self):
+    def _kin(self, b_coeff=None):
         from kinematics import corertheta
         kin = object.__new__(corertheta.CoreRThetaKinematics)
         kin.stepper_bed = _NamedRail('stepper_c')
@@ -746,13 +746,16 @@ class TestCoreRThetaCalcPosition(unittest.TestCase):
         kin.rail_b = _NamedRail('stepper_tilt')
         kin.rail_z = _NamedRail('stepper_z')
         kin.b_ratio = self.B_RATIO
+        kin.b_coeff = self.B_RATIO if b_coeff is None else b_coeff
         return kin
-    def _stepper_positions(self, x, y, z, b):
+    def _stepper_positions(self, x, y, z, b, b_coeff=None):
         # The forward kinematics of kin_corertheta.c
+        if b_coeff is None:
+            b_coeff = self.B_RATIO
         radius = math.sqrt(x*x + y*y)
         return {'stepper_c': math.atan2(y, x),
-                'stepper_x': self.B_RATIO * b - radius,
-                'stepper_tilt': self.B_RATIO * b + radius,
+                'stepper_x': b_coeff * b - radius,
+                'stepper_tilt': b_coeff * b + radius,
                 'stepper_z': z}
     def _check(self, x, y, z, b):
         kin = self._kin()
@@ -768,6 +771,22 @@ class TestCoreRThetaCalcPosition(unittest.TestCase):
         self._check(-30., 45., 100., -17.)
     def test_round_trip_with_b_rotation(self):
         self._check(120., 0., 0., 30.)
+    def test_inverted_b_round_trips_through_the_signed_coefficient(self):
+        # invert_b_direction negates the b term of both gantry solvers;
+        # calc_position has to divide by the same signed coefficient, or
+        # B would read back inverted while X stayed correct.
+        coeff = -self.B_RATIO
+        kin = self._kin(b_coeff=coeff)
+        sp = self._stepper_positions(120., 0., 0., 30., b_coeff=coeff)
+        pos = kin.calc_position(sp)
+        self.assertAlmostEqual(pos[0], 120., places=9)
+        self.assertAlmostEqual(pos[4], 30., places=9)
+    def test_inverting_b_leaves_x_alone(self):
+        # The whole point of the option: it is the one degree of freedom
+        # the dir_pins and the '+'/'-' solver assignment cannot express
+        kin = self._kin(b_coeff=-self.B_RATIO)
+        sp = self._stepper_positions(200., 0., 0., 0.)
+        self.assertAlmostEqual(kin.calc_position(sp)[0], 200., places=9)
     def test_x_keeps_its_sign_when_z_is_homed_after_x(self):
         # G28 X leaves the toolhead at (200, 0); homing Z afterwards runs
         # calc_position over the unchanged gantry steppers, and must not

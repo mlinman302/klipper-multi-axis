@@ -51,6 +51,17 @@ class CoreRThetaKinematics:
         # Belt travel (in [stepper_x] units) per degree of B rotation.  The
         # default of 1. makes the differential a plain CoreXY-style sum.
         self.b_ratio = config.getfloat('b_coupling_ratio', 1., above=0.)
+        # Which way the gantry motors have to turn for a positive B.  The
+        # differential fixes the two axis directions relative to each
+        # other, not absolutely: swapping the '+' and '-' solvers below
+        # negates X alone, and inverting both motors' dir_pin negates X
+        # and B together, so no combination of the two can invert B by
+        # itself.  This option is the missing degree of freedom - set it
+        # if B rotates the wrong way while X is already correct.
+        if config.getboolean('invert_b_direction', False):
+            self.b_coeff = -self.b_ratio
+        else:
+            self.b_coeff = self.b_ratio
         # Setup axis steppers
         stepper_bed = stepper.PrinterStepper(config.getsection('stepper_c'),
                                              units_in_radians=True)
@@ -64,9 +75,9 @@ class CoreRThetaKinematics:
         for s in rail_x.get_steppers():
             rail_b.get_endstops()[0][0].add_stepper(s)
         stepper_bed.setup_itersolve('corertheta_stepper_alloc', b'c',
-                                    self.b_ratio)
-        rail_x.setup_itersolve('corertheta_stepper_alloc', b'-', self.b_ratio)
-        rail_b.setup_itersolve('corertheta_stepper_alloc', b'+', self.b_ratio)
+                                    self.b_coeff)
+        rail_x.setup_itersolve('corertheta_stepper_alloc', b'-', self.b_coeff)
+        rail_b.setup_itersolve('corertheta_stepper_alloc', b'+', self.b_coeff)
         rail_z.setup_itersolve('cartesian_stepper_alloc', b'z')
         self.rail_x, self.rail_b, self.rail_z = rail_x, rail_b, rail_z
         self.stepper_bed = stepper_bed
@@ -106,7 +117,7 @@ class CoreRThetaKinematics:
         p_plus = stepper_positions[self.rail_b.get_name()]
         z_pos = stepper_positions[self.rail_z.get_name()]
         radius = .5 * (p_plus - p_minus)
-        b_pos = .5 * (p_plus + p_minus) / self.b_ratio
+        b_pos = .5 * (p_plus + p_minus) / self.b_coeff
         # Kinematic axis order is x, y, z, a, b, c.  The bed angle is not
         # a commanded axis, so leave the a and c slots alone.
         return [math.cos(bed_angle) * radius, math.sin(bed_angle) * radius,
