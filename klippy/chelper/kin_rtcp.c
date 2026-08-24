@@ -54,6 +54,10 @@ rtcp_calc_position(struct stepper_kinematics *sk, struct move *m
 {
     struct rtcp_stepper *rs = container_of(sk, struct rtcp_stepper, sk);
     struct coord pos = move_get_coord(m, move_time);
+    // The wrapped solver may resolve its position relative to where it
+    // already is (the corertheta bed unwraps atan2 that way), so it has
+    // to see this stepper's commanded position, not a stale zero
+    rs->orig_sk->commanded_pos = sk->commanded_pos;
     double b = pos.b * DEG_TO_RAD;
     double sin_b = sin(b), cos_b_1 = cos(b) - 1.;
     rs->m.start_pos.x = pos.x + rs->pivot_x * cos_b_1 + rs->pivot_z * sin_b;
@@ -65,6 +69,20 @@ rtcp_calc_position(struct stepper_kinematics *sk, struct move *m
     rs->m.start_pos.b = pos.b;
     rs->m.start_pos.c = pos.c;
     return rs->orig_sk->calc_position_cb(rs->orig_sk, &rs->m, DUMMY_T);
+}
+
+// Forward post_cb (and the commanded_pos it works on) to the wrapped
+// solver - kin_shaper.c does the same for the same reason.  A solver
+// that keeps state in commanded_pos (eg, the corertheta bed angle, whose
+// atan2 result has to be unwrapped against where the bed already is)
+// otherwise never sees its own position advance.
+static void
+rtcp_commanded_pos_post_fixup(struct stepper_kinematics *sk)
+{
+    struct rtcp_stepper *rs = container_of(sk, struct rtcp_stepper, sk);
+    rs->orig_sk->commanded_pos = sk->commanded_pos;
+    rs->orig_sk->post_cb(rs->orig_sk);
+    sk->commanded_pos = rs->orig_sk->commanded_pos;
 }
 
 // Recompute which axes this stepper responds to.  The important part is
@@ -88,6 +106,9 @@ rtcp_set_sk(struct stepper_kinematics *sk, struct stepper_kinematics *orig_sk)
         return -1;
     rs->sk.calc_position_cb = rtcp_calc_position;
     rs->orig_sk = orig_sk;
+    rs->sk.commanded_pos = orig_sk->commanded_pos;
+    if (orig_sk->post_cb)
+        rs->sk.post_cb = rtcp_commanded_pos_post_fixup;
     rs->sk.gen_steps_pre_active = orig_sk->gen_steps_pre_active;
     rs->sk.gen_steps_post_active = orig_sk->gen_steps_post_active;
     rtcp_update_active_flags(rs);

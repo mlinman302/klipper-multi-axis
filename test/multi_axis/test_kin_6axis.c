@@ -532,6 +532,93 @@ test_rtcp(void)
     trapq_free(tqxb);
 }
 
+// Regression for "Internal error in stepcompress" on the stepper_c queue
+// part way into a print of a full circle centred on the bed.
+//
+// The bed solver derives its angle from atan2, which jumps by 2*pi as the
+// path crosses the -X axis, so it unwraps the result against
+// sk->commanded_pos.  [rtcp] wraps every kinematic stepper, including the
+// bed, and itersolve only ever advances the *wrapper's* commanded_pos -
+// so unless the wrapper forwards that position (and post_cb) inward, the
+// bed solver compares against a stale zero, the unwrap can never fire,
+// and the branch cut asks for half a bed revolution in one step interval.
+//
+// The points below are the real toolpath, lifted from the trapq dump of
+// a shutdown, and the geometry is the machine's: a 65.6mm pivot 21.94mm
+// off the tip, a 16000 step bed, 20mm/s.
+static void
+test_corertheta_rtcp_branch_cut(void)
+{
+    printf("\n-- corertheta: bed crosses theta = +-pi under [rtcp] --\n");
+    const double mcu_freq = 120000000.;
+    // 200 full steps, 16 microsteps, 80:16 gear reduction
+    const double bed_step_dist = 2. * M_PI / 16000.;
+    const double vel = 20.;
+    // x, y, z, b - a spiral crossing the -X axis at (-22.99, 0)
+    static const double pts[][4] = {
+        {-22.242,  5.701, 11.599, 1.319}, {-22.403,  4.999, 11.638, 1.338},
+        {-22.551,  4.294, 11.676, 1.358}, {-22.679,  3.586, 11.716, 1.377},
+        {-22.786,  2.873, 11.755, 1.397}, {-22.874,  2.158, 11.795, 1.416},
+        {-22.921,  1.439, 11.836, 1.435}, {-22.956,  0.720, 11.878, 1.455},
+        {-22.990, -0.000, 11.919, 1.474}, {-22.961, -0.720, 11.962, 1.494},
+        {-22.931, -1.440, 12.005, 1.513}, {-22.893, -2.159, 12.048, 1.532},
+        {-22.809, -2.875, 12.093, 1.552}, {-22.696, -3.586, 12.138, 1.571},
+        {-22.576, -4.296, 12.183, 1.591},
+    };
+    const int npts = (int)(sizeof(pts) / sizeof(pts[0]));
+
+    struct list_head msg_queue;
+    list_init(&msg_queue);
+    struct stepcompress *sc = stepcompress_alloc(&msg_queue);
+    stepcompress_fill(sc, (uint32_t)(0.000002 * mcu_freq),
+                      (uint32_t)(0.000025 * mcu_freq), 1, 2);
+    stepcompress_set_time(sc, 0., mcu_freq);
+
+    struct stepper_kinematics *raw = corertheta_stepper_alloc('c', .25);
+    struct stepper_kinematics *bed = rtcp_alloc();
+    check("branch cut: rtcp_set_sk on the bed", rtcp_set_sk(bed, raw), 0, 0.);
+    rtcp_set_pivot(bed, 21.94, 65.6);
+
+    struct trapq *tq = trapq_alloc();
+    itersolve_set_trapq(bed, tq, bed_step_dist);
+    itersolve_set_position(bed, pts[0][0], pts[0][1], pts[0][2],
+                           0., pts[0][3], 0.);
+    double start_angle = itersolve_get_commanded_pos(bed);
+
+    double t = 0.1;
+    for (int i = 1; i < npts; i++) {
+        double dx = pts[i][0] - pts[i-1][0], dy = pts[i][1] - pts[i-1][1];
+        double dz = pts[i][2] - pts[i-1][2], db = pts[i][3] - pts[i-1][3];
+        double d = sqrt(dx*dx + dy*dy + dz*dz), mt = d / vel;
+        trapq_append(tq, t, 0., mt, 0.,
+                     pts[i-1][0], pts[i-1][1], pts[i-1][2],
+                     0., pts[i-1][3], 0.,
+                     dx/d, dy/d, dz/d, 0., db/d, 0., vel, vel, 0.);
+        t += mt;
+    }
+
+    check("branch cut: itersolve_generate_steps",
+          itersolve_generate_steps(bed, sc, t), 0., 0.);
+    check("branch cut: stepcompress_flush",
+          stepcompress_flush(sc, (uint64_t)((t + 1.) * mcu_freq)), 0., 0.);
+    // The wrapper must have kept the inner solver's position in step with
+    // its own - that is the whole reason the unwrap can work
+    check("branch cut: wrapped solver tracks the wrapper",
+          itersolve_get_commanded_pos(raw),
+          itersolve_get_commanded_pos(bed), 1e-12);
+    // The bed turns the short way through pi, not the long way back
+    // around.  atan2 of the rtcp-corrected endpoints puts the sweep at
+    // 0.472308 rad; the tolerance is one bed half step (0.000196).
+    double end_angle = itersolve_get_commanded_pos(bed);
+    double swept = end_angle - start_angle;
+    if (swept < -M_PI)
+        swept += 2. * M_PI;
+    check("branch cut: bed sweep across the cut", swept, 0.472308, 0.0004);
+
+    stepcompress_free(sc);
+    trapq_free(tq);
+}
+
 int
 main(void)
 {
@@ -539,6 +626,7 @@ main(void)
     test_core_r_theta();
     test_corertheta();
     test_corertheta_home_r_step_generation();
+    test_corertheta_rtcp_branch_cut();
     test_existing_kinematics_unchanged();
     test_set_position_and_active_axis();
     test_rtcp();
