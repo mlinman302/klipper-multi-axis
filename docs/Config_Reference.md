@@ -2578,13 +2578,20 @@ printer. `RTCP_PROBE_INFO` reports the exact clearance needed.
 [rtcp_probe]
 probe_b_offset:
 #   Angle (in degrees) from the nozzle direction to the probe direction
-#   around the B pivot, measured in the direction of increasing B. A
-#   positive value places the probe inboard of the nozzle - at a smaller
-#   arm radius - while it is probing. This parameter must be provided.
+#   around the B pivot, measured in the direction of increasing B. Equal
+#   to the nozzle-down B angle minus probe_b_position. This parameter
+#   must be provided.
 #probe_b_position:
 #   The B angle (in degrees) at which the probe points straight down. The
 #   default is derived from the [rtcp] pivot offsets and probe_b_offset;
 #   set it to the measured angle if the derived one is wrong.
+#invert_b_direction: False
+#   Which side of the pivot the probe sits on while it faces the bed.
+#   The two angles above cannot express this - it depends on the physical
+#   direction of B, and the [rtcp] pivot offsets are not a reliable guide
+#   to it on a machine whose B zero comes from an endstop. True mirrors
+#   the radial offset, leaving both angles and the z offset untouched.
+#   The default is False.
 #bed_radius:
 #   Largest bed radius (in mm) the mesh will ask for. When set, klippy
 #   checks at startup that the arm can put the probe over the whole bed.

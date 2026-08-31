@@ -52,6 +52,15 @@ class RTCPProbe:
         # is +/- 45.  A positive value puts the probe *inboard* of the
         # nozzle (at a smaller arm radius) when it points at the bed.
         self.probe_b_offset = config.getfloat('probe_b_offset')
+        # Which way round the pivot a positive B turns the head.  The two
+        # angles above fix where the nozzle and the probe point, but not
+        # which side of the pivot each is on while it points there - that
+        # depends on the physical B direction, and the [rtcp] pivot
+        # offsets are not a reliable guide to it on a machine whose B zero
+        # is set by an endstop.  Flip this if the probe ends up on the
+        # wrong side of the nozzle; it mirrors the radial offset and
+        # leaves both angles, and the z offset, untouched.
+        self.invert_b = config.getboolean('invert_b_direction', False)
         # The B angle at which the probe points straight down.  If it is
         # not given it is derived from the [rtcp] pivot offsets, which fix
         # the B angle at which the *nozzle* points straight down.
@@ -125,9 +134,12 @@ class RTCPProbe:
             raise config_error("[%s] probe z_offset of %.3f is larger than the"
                                " %.3f mm pivot radius"
                                % (self.name, z_offset, self.tool_radius))
-        # Derive the probing B angle if it was not configured.  The nozzle
-        # points straight down at B = -nozzle_angle; the probe is
-        # probe_b_offset further round.
+        # Derive the probing B angle if it was not configured.  The tip
+        # hangs straight below the pivot - the printing orientation - at
+        # B = -nozzle_angle, and the probe is probe_b_offset further
+        # round.  This is only as good as the [rtcp] offsets: they have to
+        # be expressed in the same B frame the endstop sets, which is
+        # easiest to arrange by making the printing orientation B=0.
         nozzle_angle = math.degrees(math.atan2(px, pz))
         if self.probe_b_position is None:
             self.probe_b_position = -nozzle_angle - self.probe_b_offset
@@ -156,8 +168,10 @@ class RTCPProbe:
             if reach_min > 0. or reach_max < self.bed_radius:
                 raise config_error(
                     "[%s] with the probe %.2f mm %sboard of the nozzle it can"
-                    " only reach bed radii %.2f..%.2f, not 0..%.2f.  Check the"
-                    " sign of probe_b_offset"
+                    " only reach bed radii %.2f..%.2f, not 0..%.2f.  If the"
+                    " probe is really on the other side of the nozzle, flip"
+                    " invert_b_direction - that keeps probe_b_position and"
+                    " probe_b_offset as they are"
                     % (self.name, abs(off_r),
                        "out" if off_r > 0. else "in",
                        reach_min, reach_max, self.bed_radius))
@@ -173,7 +187,10 @@ class RTCPProbe:
         psi = math.radians(b_angle - self.probe_b_position)
         theta = psi - math.radians(self.probe_b_offset)
         lp, lt = self.probe_radius, self.tool_radius
-        return (lt * math.sin(theta) - lp * math.sin(psi),
+        # Mirroring the head about the z axis negates the radial component
+        # and leaves the z one alone
+        radial_sign = -1. if self.invert_b else 1.
+        return (radial_sign * (lt * math.sin(theta) - lp * math.sin(psi)),
                 lt * math.cos(theta) - lp * math.cos(psi))
 
     def _current_b(self):
@@ -257,6 +274,9 @@ class RTCPProbe:
         off_r, off_z = self.get_offsets(b_angle)
         return {'probe_b_position': self.probe_b_position,
                 'probe_b_offset': self.probe_b_offset,
+                'nozzle_b_position': (self.probe_b_position
+                                      + self.probe_b_offset),
+                'invert_b_direction': self.invert_b,
                 'pivot_radius': self.tool_radius,
                 'probe_radius': self.probe_radius,
                 'radial_offset': off_r,
@@ -326,14 +346,17 @@ class RTCPProbe:
         pd_r, pd_z = self.get_offsets(self.probe_b_position)
         gcmd.respond_info(
             "rtcp_probe: pivot radius %.4f, probe radius %.4f\n"
-            "probe_b_offset %.3f, probe faces the bed at B=%.3f%s\n"
+            "probe faces the bed at B=%.3f%s, the nozzle at B=%.3f\n"
             "at B=%.3f the probe is %.4f radial, %.4f z from the nozzle\n"
-            "while probing it is %.4f radial, %.4f z from the nozzle, so the"
-            " nozzle sits at z=%.4f when the probe triggers on a flat bed"
-            % (self.tool_radius, self.probe_radius, self.probe_b_offset,
+            "while probing it is %.4f %sboard of the nozzle and %.4f below"
+            " it, so the nozzle sits at z=%.4f when the probe triggers on a"
+            " flat bed"
+            % (self.tool_radius, self.probe_radius,
                self.probe_b_position,
                "" if self.cfg_probe_b_position is not None else " (derived)",
-               b_angle, off_r, off_z, pd_r, pd_z, -pd_z))
+               self.probe_b_position + self.probe_b_offset,
+               b_angle, off_r, off_z,
+               abs(pd_r), "out" if pd_r > 0. else "in", abs(pd_z), -pd_z))
 
 
 def load_config(config):

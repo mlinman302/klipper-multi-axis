@@ -144,6 +144,8 @@ class FakeConfig:
         if option in self.values:
             return bool(self.values[option])
         return default
+    def has_value(self, option):
+        return option in self.values
 
 class FakeGCmd:
     def __init__(self, params=None):
@@ -162,16 +164,23 @@ class FakeGCmd:
         self.responses.append(msg)
 
 
-# The reference machine: config/example-corertheta.cfg
-PIVOT_X, PIVOT_Z = 21.94, 65.6
+# The reference machine: config/example-corertheta.cfg.  The two angles
+# are measured on the machine, not derived - the nozzle faces the bed at
+# B=0 and the probe at B=45, so the probe trails the nozzle by 45 deg in
+# the +B direction.  invert_b_direction says the probe ends up inboard of
+# the nozzle, which is what lets the arm reach the middle of the bed.
+PIVOT_X, PIVOT_Z = 0., 69.1717
 Z_OFFSET = -0.1
-PROBE_B_OFFSET = 45.
-PROBE_B_POSITION = -26.5
+PROBE_B_OFFSET = -45.
+PROBE_B_POSITION = 45.
+NOZZLE_B_POSITION = PROBE_B_POSITION + PROBE_B_OFFSET
+INVERT_B = True
 TOOL_RADIUS = math.hypot(PIVOT_X, PIVOT_Z)
 
 
 def build(config_values=None, pivot=(PIVOT_X, PIVOT_Z), z_offset=Z_OFFSET,
-          b_range=(-48., 100.), r_range=(0., 149.21), connect=True):
+          b_range=(-45., 100.), r_range=(0., 149.21), connect=True,
+          bed_radius=50.):
     printer = FakePrinter()
     printer.add_object('rtcp', FakeRTCP(pivot[0], pivot[1]))
     printer.add_object('probe', FakeProbe(z_offset))
@@ -179,7 +188,8 @@ def build(config_values=None, pivot=(PIVOT_X, PIVOT_Z), z_offset=Z_OFFSET,
     printer.add_object('toolhead', FakeToolhead(kin))
     values = {'probe_b_offset': PROBE_B_OFFSET,
               'probe_b_position': PROBE_B_POSITION,
-              'bed_radius': 50.}
+              'invert_b_direction': INVERT_B,
+              'bed_radius': bed_radius}
     if config_values is not None:
         values.update(config_values)
     values = {k: v for k, v in values.items() if v is not None}
@@ -199,6 +209,12 @@ def build(config_values=None, pivot=(PIVOT_X, PIVOT_Z), z_offset=Z_OFFSET,
 class TestGeometry(unittest.TestCase):
     def setUp(self):
         self.printer, self.rp = build()
+    def test_probe_clears_the_nozzle_at_the_b_endstop(self):
+        # B homes at -45.  The probe must be above the nozzle there, or
+        # homing B would drive it into the bed - it only drops below the
+        # nozzle as B approaches the probing angle.
+        self.assertGreater(self.rp.get_offsets(-45.)[1], 0.)
+        self.assertLess(self.rp.get_offsets(PROBE_B_POSITION)[1], 0.)
     def test_radii(self):
         # The probe rides a circle concentric with the nozzle's, shorter
         # by the probe z_offset
@@ -209,7 +225,8 @@ class TestGeometry(unittest.TestCase):
         # The probe is straight below the pivot there, so its offset from
         # the pivot is purely vertical
         off_r, off_z = self.rp.get_offsets(self.rp.probe_b_position)
-        expect_r = -TOOL_RADIUS * math.sin(math.radians(PROBE_B_OFFSET))
+        sign = -1. if INVERT_B else 1.
+        expect_r = sign * -TOOL_RADIUS * math.sin(math.radians(PROBE_B_OFFSET))
         expect_z = (TOOL_RADIUS * math.cos(math.radians(PROBE_B_OFFSET))
                     - (TOOL_RADIUS + Z_OFFSET))
         self.assertAlmostEqual(off_r, expect_r, places=9)
@@ -221,9 +238,31 @@ class TestGeometry(unittest.TestCase):
     def test_nozzle_faces_the_bed_a_probe_b_offset_away(self):
         # Turning B by probe_b_offset swaps which of the two faces down,
         # so there the nozzle is the lower of the pair
-        b_tool = self.rp.probe_b_position + PROBE_B_OFFSET
-        off_z = self.rp.get_offsets(b_tool)[1]
+        off_z = self.rp.get_offsets(NOZZLE_B_POSITION)[1]
         self.assertGreater(off_z, 0.)
+    def test_the_measured_angles_are_kept_as_given(self):
+        # invert_b_direction must not disturb either angle - it only says
+        # which side of the pivot each of the pair is on
+        self.assertAlmostEqual(self.rp.probe_b_position, 45., places=9)
+        status = self.rp.get_status()
+        self.assertAlmostEqual(status['nozzle_b_position'], 0., places=9)
+        for b, expect_down in [(45., 'probe'), (0., 'nozzle')]:
+            off_r, off_z = self.rp.get_offsets(b)
+            # Whichever faces the bed is the lower of the two
+            if expect_down == 'probe':
+                self.assertLess(off_z, 0.)
+            else:
+                self.assertGreater(off_z, 0.)
+    def test_invert_b_mirrors_only_the_radial_offset(self):
+        # No bed_radius: the un-mirrored geometry cannot reach the bed
+        # centre, which is the subject of its own test below
+        _, plain = build({'invert_b_direction': False,
+                          'bed_radius': None})
+        for b in (-45., 0., 30., 45., 100.):
+            a_r, a_z = self.rp.get_offsets(b)
+            b_r, b_z = plain.get_offsets(b)
+            self.assertAlmostEqual(a_r, -b_r, places=9)
+            self.assertAlmostEqual(a_z, b_z, places=9)
     def test_z_endstop_is_where_the_nozzle_sits_at_a_trigger(self):
         off_z = self.rp.get_offsets(self.rp.probe_b_position)[1]
         self.assertAlmostEqual(self.rp.get_z_endstop_position(), -off_z,
@@ -238,11 +277,19 @@ class TestGeometry(unittest.TestCase):
         self.assertGreater(limit, 0.)
     def test_derived_probe_b_position(self):
         # Left out of the config it follows from the pivot offsets: the
-        # nozzle faces the bed at -atan2(pivot_x, pivot_z)
-        _, rp = build({'probe_b_position': None}, pivot=(-PIVOT_X, PIVOT_Z))
-        nozzle_b = math.degrees(math.atan2(PIVOT_X, PIVOT_Z))
+        # tip hangs straight below the pivot at -atan2(pivot_x, pivot_z)
+        _, rp = build({'probe_b_position': None}, pivot=(-20., 60.),
+                      bed_radius=None)
+        nozzle_b = -math.degrees(math.atan2(-20., 60.))
         self.assertAlmostEqual(rp.probe_b_position,
                                nozzle_b - PROBE_B_OFFSET, places=9)
+    def test_the_pivot_agrees_with_the_measured_probing_angle(self):
+        # With the pivot expressed in a B frame whose zero is the printing
+        # orientation, the derived probing angle must come out as the one
+        # measured on the machine - they are the same statement
+        _, rp = build({'probe_b_position': None})
+        self.assertAlmostEqual(rp.probe_b_position, PROBE_B_POSITION,
+                               places=9)
 
 
 class TestTransform(unittest.TestCase):
@@ -299,17 +346,18 @@ class TestTransform(unittest.TestCase):
 
 class TestChecks(unittest.TestCase):
     def test_probing_b_outside_the_axis_range_is_rejected(self):
-        # This is what a sign error in probe_b_offset looks like
+        # This is what a wrong probe_b_position looks like
         with self.assertRaises(ConfigError) as cm:
-            build({'probe_b_position': None})
+            build({'probe_b_position': 120.})
         self.assertIn("outside the", str(cm.exception))
     def test_a_probe_outboard_of_the_nozzle_cannot_reach_the_centre(self):
         # The arm radius cannot go negative, so the middle of the bed is
-        # out of reach however far the arm is driven back
+        # out of reach however far the arm is driven back.  This is what
+        # the measured angles give with invert_b_direction the wrong way.
         with self.assertRaises(ConfigError) as cm:
-            build({'probe_b_offset': -PROBE_B_OFFSET,
-                   'probe_b_position': 26.5})
+            build({'invert_b_direction': False})
         self.assertIn("only reach bed radii", str(cm.exception))
+        self.assertIn("invert_b_direction", str(cm.exception))
     def test_probing_with_the_wrong_b_is_rejected(self):
         _, rp = build()
         rp.toolhead.position[rtcp_probe_mod.B_POS_INDEX] = \
