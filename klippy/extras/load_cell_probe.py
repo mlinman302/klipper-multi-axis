@@ -704,6 +704,9 @@ class LoadCellPrinterProbe:
     def get_offsets(self, gcmd=None):
         return self._probe_offsets.get_offsets(gcmd)
 
+    def get_b_offset(self):
+        return self._probe_offsets.get_b_offset()
+
     def start_probe_session(self, gcmd):
         return self._probe_session.start_probe_session(gcmd)
 

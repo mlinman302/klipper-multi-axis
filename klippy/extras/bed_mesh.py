@@ -352,10 +352,10 @@ class BedMeshCalibrate:
         probe = self.printer.lookup_object('probe', None)
         if probe is not None:
             x_offset, y_offset = probe.get_offsets()[:2]
-        # A machine whose probe is not at a fixed offset from the nozzle
-        # works out the tool position itself - see probe.py.  Its offsets
-        # depend on the head's orientation, so they are only worth
-        # printing once the head is turned to face the bed with the probe.
+        # A machine that applies the probe offsets in a frame of its own
+        # works out the tool position itself - see probe.py.  On a
+        # tilting head that frame only holds once the head is turned to
+        # face the bed with the probe, so wait until it is.
         probe_transform = self.printer.lookup_object('probe_transform', None)
         if probe_transform is not None:
             if not probe_transform.get_status().get('oriented'):
