@@ -39,6 +39,7 @@ from . import manual_probe
 
 # Index of the B coordinate within a toolhead position vector
 B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
+RTCP_AXIS_GCODE_ID = 'B'
 
 
 class RTCPProbe:
@@ -74,6 +75,7 @@ class RTCPProbe:
         # Resolved at connect time
         self.rtcp = None
         self.toolhead = None
+        self.b_axis = None
         self.tool_radius = 0.
         self.probe_radius = 0.
         self.printer.register_event_handler("klippy:connect", self._connect)
@@ -97,6 +99,19 @@ class RTCPProbe:
         if pprobe is None:
             raise config_error("[%s] requires a probe (eg [bltouch])"
                                % (self.name,))
+        # B is a rotary axis object, not one of the kinematics' linear
+        # axes: it does NOT appear in toolhead.get_status()['homed_axes'],
+        # which only ever reports x/y/z.  Its homed flag lives on the axis
+        # itself, so keep hold of it.
+        for extra_axis in self.toolhead.get_extra_axes():
+            get_id = getattr(extra_axis, 'get_axis_gcode_id', None)
+            if get_id is not None and get_id() == RTCP_AXIS_GCODE_ID:
+                self.b_axis = extra_axis
+                break
+        else:
+            raise config_error(
+                "[%s] requires a B axis - add 'b' to the 'additional_axes'"
+                " option of the [printer] section" % (self.name,))
         # Radius of the nozzle tip about the B pivot, and of the probe
         # point, which rides the same circle shortened by z_offset
         px, pz = self.rtcp.pivot_x, self.rtcp.pivot_z
@@ -170,6 +185,9 @@ class RTCPProbe:
                 "[%s] needs RTCP compensation enabled - the probe offsets are"
                 " measured from the nozzle tip" % (self.name,))
         return self.get_offsets(self._current_b())
+
+    def _b_is_homed(self):
+        return bool(self.b_axis.get_status().get('homed'))
 
     def _check_b_angle(self):
         if not self.check_b_angle:
@@ -277,8 +295,7 @@ class RTCPProbe:
             b_angle = gcmd.get_float('B')
         else:
             raise gcmd.error("MODE must be PROBE, TOOL or B")
-        curtime = self.printer.get_reactor().monotonic()
-        if 'b' not in self.toolhead.get_status(curtime)['homed_axes']:
+        if not self._b_is_homed():
             raise gcmd.error("Must home B before orienting the probe")
         self._move_b(b_angle, gcmd)
         gcmd.respond_info("rtcp_probe: B moved to %.3f" % (b_angle,))

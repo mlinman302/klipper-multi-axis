@@ -49,12 +49,34 @@ class FakeKinematics:
     def get_axis_rail(self, axis_name):
         return self.rails.get(axis_name)
 
+class FakeRotaryAxis:
+    # B is a rotary axis object, not one of the kinematics' linear axes:
+    # its homed flag lives here, never in toolhead homed_axes
+    def __init__(self, gcode_id='B', is_homed=True):
+        self.gcode_id, self.is_homed = gcode_id, is_homed
+    def get_axis_gcode_id(self):
+        return self.gcode_id
+    def get_status(self, eventtime=None):
+        return {'position': 0., 'homed': self.is_homed,
+                'gcode_axis': self.gcode_id}
+
+class FakeExtruder:
+    # Sits at index 0 of get_extra_axes() and has no gcode axis id
+    def get_name(self):
+        return 'extruder'
+
 class FakeToolhead:
     def __init__(self, kin):
         self.kin = kin
         self.position = [0.] * 7
         self.moves = []
-        self.homed = "xyzb"
+        # Deliberately NOT including 'b' - the real corertheta kinematics
+        # only ever reports x/y/z here
+        self.homed = "xyz"
+        self.b_axis = FakeRotaryAxis()
+        self.extra_axes = [FakeExtruder(), None, self.b_axis]
+    def get_extra_axes(self):
+        return list(self.extra_axes)
     def get_kinematics(self):
         return self.kin
     def get_position(self):
@@ -334,6 +356,19 @@ class TestCommands(unittest.TestCase):
         res = self.rp.create_probe_result([pos[0], pos[1], 0.])
         self.assertAlmostEqual(res.bed_x, 40., places=9)
         self.assertAlmostEqual(res.bed_y, 0., places=9)
+    def test_orient_needs_b_homed(self):
+        # B's homed flag is on the rotary axis object - it never shows up
+        # in toolhead homed_axes, so reading it from there always failed
+        self.rp.b_axis.is_homed = False
+        with self.assertRaises(ConfigError) as cm:
+            self.gcode.commands['RTCP_PROBE_ORIENT'](FakeGCmd({}))
+        self.assertIn("Must home B", str(cm.exception))
+    def test_orient_works_with_b_homed_but_not_in_homed_axes(self):
+        self.assertNotIn('b', self.rp.toolhead.homed)
+        self.gcode.commands['RTCP_PROBE_ORIENT'](FakeGCmd({}))
+        self.assertAlmostEqual(
+            self.rp.toolhead.get_position()[rtcp_probe_mod.B_POS_INDEX],
+            self.rp.probe_b_position, places=9)
     def test_status(self):
         status = self.rp.get_status()
         self.assertTrue(status['oriented'])

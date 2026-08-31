@@ -440,6 +440,12 @@ the touching.
   angular origin is wherever the bed happened to be at startup.  A saved
   `BED_MESH_PROFILE` is therefore meaningless after a restart - the mesh
   has to be recalibrated before each print.
+* **B is not in `homed_axes`.**  A rotational axis is a rotary axis
+  object, not one of the kinematics' linear axes, so
+  `toolhead.get_status()['homed_axes']` only ever reports x/y/z.  Its
+  homed flag is on the axis object itself, reached through
+  `toolhead.get_extra_axes()` - which is what `[rtcp_probe]` keeps a
+  reference to.  Testing `'b' in homed_axes` always reads false.
 * **`PROBE_CALIBRATE` and `Z_OFFSET_APPLY_PROBE` do not apply.**  They
   assume the probe is a fixed distance below the nozzle.  Calibrate
   `z_offset` as the difference between the two circle radii instead.
