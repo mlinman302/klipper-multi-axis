@@ -30,6 +30,23 @@
 # the bed this much low" - and no separate z_offset subtraction is done
 # on top of the geometry: the shortened probe radius *is* that offset.
 #
+# Which position the offset is measured from depends on whether RTCP
+# compensation is switched on, because that decides what the toolhead
+# reports:
+#
+#   RTCP on   the toolhead position is the tool tip, so the offset is
+#             probe_vec - tip_vec, and both ends of it swing with B.
+#   RTCP off  the toolhead position is the carriage.  The pivot is a
+#             fixed offset from the carriage - exactly [rtcp]'s
+#             pivot_x_offset / pivot_length - so the offset is that plus
+#             the pivot -> probe vector, and the nozzle does not enter
+#             into it at all.
+#
+# The RTCP-off form is the one to prefer for homing and bed mesh.  It
+# needs no compensated moves, so it works before every axis is homed; at
+# the probing angle the probe hangs straight below the pivot, which makes
+# its radial term vanish along with any dependence on invert_b_direction.
+#
 # The module registers itself as the printer object 'probe_transform',
 # which klippy/extras/probe.py consults in place of the fixed x/y/z
 # offsets.  See docs/Multi_Axis.md.
@@ -159,22 +176,29 @@ class RTCPProbe:
         # Check the bed is reachable.  The arm radius cannot go negative,
         # so with the probe outboard of the nozzle the middle of the bed
         # is unreachable however far the arm is driven back.
-        off_r = self.get_offsets(self.probe_b_position)[0]
+        # RTCP can be toggled at runtime, so both frames have to work
         rail_r = get_rail('r')
         if rail_r is not None and self.bed_radius is not None:
             r_min, r_max = rail_r.get_range()
-            reach_min = max(0., max(0., r_min) + off_r)
-            reach_max = r_max + off_r
-            if reach_min > 0. or reach_max < self.bed_radius:
-                raise config_error(
-                    "[%s] with the probe %.2f mm %sboard of the nozzle it can"
-                    " only reach bed radii %.2f..%.2f, not 0..%.2f.  If the"
-                    " probe is really on the other side of the nozzle, flip"
-                    " invert_b_direction - that keeps probe_b_position and"
-                    " probe_b_offset as they are"
-                    % (self.name, abs(off_r),
-                       "out" if off_r > 0. else "in",
-                       reach_min, reach_max, self.bed_radius))
+            frames = [
+                ("with RTCP on",
+                 self.get_offsets(self.probe_b_position)[0]),
+                ("with RTCP off",
+                 self.get_carriage_offsets(self.probe_b_position)[0]),
+            ]
+            for frame, off_r in frames:
+                reach_min = max(0., max(0., r_min) + off_r)
+                reach_max = r_max + off_r
+                if reach_min > 0. or reach_max < self.bed_radius:
+                    raise config_error(
+                        "[%s] %s the probe is %.2f mm %sboard of the reported"
+                        " position, so it only reaches bed radii %.2f..%.2f,"
+                        " not 0..%.2f.  If the probe is really on the other"
+                        " side, flip invert_b_direction - that keeps"
+                        " probe_b_position and probe_b_offset as they are"
+                        % (self.name, frame, abs(off_r),
+                           "out" if off_r > 0. else "in",
+                           reach_min, reach_max, self.bed_radius))
 
     ######################################################################
     # Geometry
@@ -193,15 +217,27 @@ class RTCPProbe:
         return (radial_sign * (lt * math.sin(theta) - lp * math.sin(psi)),
                 lt * math.cos(theta) - lp * math.cos(psi))
 
+    def get_carriage_offsets(self, b_angle):
+        # Offset of the probe point from the *carriage*, for use while
+        # RTCP compensation is off.  The pivot rides the carriage at a
+        # fixed (pivot_x_offset, pivot_length), so only the pivot -> probe
+        # vector turns with B.  pivot_x_offset is a machine-frame
+        # constant, the same one rtcp.py applies, so it is not mirrored.
+        psi = math.radians(b_angle - self.probe_b_position)
+        lp = self.probe_radius
+        radial_sign = -1. if self.invert_b else 1.
+        return (self.rtcp.pivot_x - radial_sign * lp * math.sin(psi),
+                self.rtcp.pivot_z - lp * math.cos(psi))
+
     def _current_b(self):
         return self.toolhead.get_position()[B_POS_INDEX]
 
     def _current_offsets(self):
-        if not self.rtcp.enabled:
-            raise self.printer.command_error(
-                "[%s] needs RTCP compensation enabled - the probe offsets are"
-                " measured from the nozzle tip" % (self.name,))
-        return self.get_offsets(self._current_b())
+        # Whichever frame the toolhead is currently reporting in
+        b_angle = self._current_b()
+        if self.rtcp.enabled:
+            return self.get_offsets(b_angle)
+        return self.get_carriage_offsets(b_angle)
 
     def _b_is_homed(self):
         return bool(self.b_axis.get_status().get('homed'))
@@ -277,6 +313,7 @@ class RTCPProbe:
                 'nozzle_b_position': (self.probe_b_position
                                       + self.probe_b_offset),
                 'invert_b_direction': self.invert_b,
+                'rtcp_enabled': self.rtcp.enabled,
                 'pivot_radius': self.tool_radius,
                 'probe_radius': self.probe_radius,
                 'radial_offset': off_r,
@@ -317,6 +354,21 @@ class RTCPProbe:
             raise gcmd.error("MODE must be PROBE, TOOL or B")
         if not self._b_is_homed():
             raise gcmd.error("Must home B before orienting the probe")
+        if self.rtcp.enabled:
+            # With RTCP on the compensation turns a B move into an X/Z
+            # one, so it needs those axes homed.  Probing does not need
+            # RTCP at all - see get_carriage_offsets() - so the way out is
+            # to turn it off rather than to home in a different order.
+            curtime = self.printer.get_reactor().monotonic()
+            homed = self.toolhead.get_status(curtime)['homed_axes']
+            missing = [a for a in 'xyz' if a not in homed]
+            if missing:
+                raise gcmd.error(
+                    "Turning B with RTCP on is an X/Z move, and %s %s not"
+                    " homed yet.  Run SET_RTCP ENABLE=0 first - probing does"
+                    " not need the compensation."
+                    % (", ".join(missing).upper(),
+                       "is" if len(missing) == 1 else "are"))
         self._move_b(b_angle, gcmd)
         gcmd.respond_info("rtcp_probe: B moved to %.3f" % (b_angle,))
 
@@ -342,16 +394,22 @@ class RTCPProbe:
     cmd_RTCP_PROBE_INFO_help = "Report the probe geometry on the tilting head"
     def cmd_RTCP_PROBE_INFO(self, gcmd):
         b_angle = gcmd.get_float('B', self._current_b())
-        off_r, off_z = self.get_offsets(b_angle)
-        pd_r, pd_z = self.get_offsets(self.probe_b_position)
+        if self.rtcp.enabled:
+            frame, offsets = "the nozzle tip (RTCP on)", self.get_offsets
+        else:
+            frame = "the carriage (RTCP off)"
+            offsets = self.get_carriage_offsets
+        off_r, off_z = offsets(b_angle)
+        pd_r, pd_z = offsets(self.probe_b_position)
         gcmd.respond_info(
-            "rtcp_probe: pivot radius %.4f, probe radius %.4f\n"
+            "rtcp_probe: pivot radius %.4f, probe radius %.4f,"
+            " offsets measured from %s\n"
             "probe faces the bed at B=%.3f%s, the nozzle at B=%.3f\n"
             "at B=%.3f the probe is %.4f radial, %.4f z from the nozzle\n"
-            "while probing it is %.4f %sboard of the nozzle and %.4f below"
-            " it, so the nozzle sits at z=%.4f when the probe triggers on a"
-            " flat bed"
-            % (self.tool_radius, self.probe_radius,
+            "while probing it is %.4f %sboard of the reported position and"
+            " %.4f below it, so the toolhead reads z=%.4f when the probe"
+            " triggers on a flat bed"
+            % (self.tool_radius, self.probe_radius, frame,
                self.probe_b_position,
                "" if self.cfg_probe_b_position is not None else " (derived)",
                self.probe_b_position + self.probe_b_offset,

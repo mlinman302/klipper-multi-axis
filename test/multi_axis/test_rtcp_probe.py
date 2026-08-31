@@ -356,7 +356,7 @@ class TestChecks(unittest.TestCase):
         # the measured angles give with invert_b_direction the wrong way.
         with self.assertRaises(ConfigError) as cm:
             build({'invert_b_direction': False})
-        self.assertIn("only reach bed radii", str(cm.exception))
+        self.assertIn("only reaches bed radii", str(cm.exception))
         self.assertIn("invert_b_direction", str(cm.exception))
     def test_probing_with_the_wrong_b_is_rejected(self):
         _, rp = build()
@@ -369,11 +369,26 @@ class TestChecks(unittest.TestCase):
         _, rp = build({'check_probe_b_angle': False})
         rp.toolhead.position[rtcp_probe_mod.B_POS_INDEX] = 0.
         rp.descend_limit_z(-8.)
-    def test_probing_with_rtcp_disabled_is_rejected(self):
+    def test_orienting_with_rtcp_on_and_unhomed_axes_is_rejected(self):
+        # With RTCP on, turning B is an X/Z move, so it cannot run before
+        # those axes are homed.  The error has to point at SET_RTCP rather
+        # than leave the user re-ordering their homing macro.
+        printer, rp = build()
+        rp.toolhead.homed = ""
+        gcode = printer.lookup_object('gcode')
+        with self.assertRaises(ConfigError) as cm:
+            gcode.commands['RTCP_PROBE_ORIENT'](FakeGCmd({}))
+        self.assertIn("SET_RTCP ENABLE=0", str(cm.exception))
+    def test_orienting_with_rtcp_off_needs_only_b_homed(self):
+        # Which is the whole point: a bare B move touches no linear axis
         printer, rp = build()
         printer.lookup_object('rtcp').enabled = False
-        with self.assertRaises(ConfigError):
-            rp.get_z_endstop_position()
+        rp.toolhead.homed = ""
+        gcode = printer.lookup_object('gcode')
+        gcode.commands['RTCP_PROBE_ORIENT'](FakeGCmd({}))
+        self.assertAlmostEqual(
+            rp.toolhead.get_position()[rtcp_probe_mod.B_POS_INDEX],
+            rp.probe_b_position, places=9)
     def test_a_probe_z_offset_larger_than_the_pivot_is_rejected(self):
         with self.assertRaises(ConfigError):
             build(z_offset=-100.)
@@ -422,6 +437,56 @@ class TestCommands(unittest.TestCase):
         self.assertTrue(status['oriented'])
         self.assertAlmostEqual(status['probe_b_position'],
                                PROBE_B_POSITION, places=9)
+
+
+class TestCarriageFrame(unittest.TestCase):
+    # With RTCP compensation off the toolhead reports the carriage, not
+    # the tool tip.  This is the frame homing and bed mesh should use: it
+    # needs no compensated moves, so it works before every axis is homed.
+    def setUp(self):
+        self.printer, self.rp = build()
+        self.printer.lookup_object('rtcp').enabled = False
+    def test_offset_is_the_pivot_plus_the_probe_arm(self):
+        off_r, off_z = self.rp.get_carriage_offsets(PROBE_B_POSITION)
+        self.assertAlmostEqual(off_r, PIVOT_X, places=9)
+        self.assertAlmostEqual(off_z, PIVOT_Z - self.rp.probe_radius,
+                               places=9)
+    def test_at_the_probing_angle_it_is_a_plain_probe(self):
+        # The probe hangs straight below the pivot, and the pivot is
+        # straight above the carriage, so the probe lands on the machine's
+        # B=0 tool reference point - just z_offset higher
+        off_r, off_z = self.rp.get_carriage_offsets(PROBE_B_POSITION)
+        self.assertAlmostEqual(off_r, 0., places=9)
+        self.assertAlmostEqual(off_z, -Z_OFFSET, places=9)
+        self.assertAlmostEqual(self.rp.get_z_endstop_position(), Z_OFFSET,
+                               places=9)
+    def test_the_probing_angle_does_not_depend_on_the_mirror(self):
+        # sin(psi) is zero there, so invert_b_direction has nothing to act
+        # on - the one parameter that cannot be derived drops out
+        _, other = build({'invert_b_direction': not INVERT_B,
+                          'bed_radius': None})
+        other.printer.lookup_object('rtcp').enabled = False
+        self.assertEqual(self.rp.get_carriage_offsets(PROBE_B_POSITION),
+                         other.get_carriage_offsets(PROBE_B_POSITION))
+    def test_bed_and_tool_radius_coincide(self):
+        for bed_x, bed_y in [(50., 0.), (0., -50.), (-25., 10.), (3., -4.)]:
+            tool = self.rp.bed_to_tool((bed_x, bed_y))
+            self.assertAlmostEqual(tool[0], bed_x, places=9)
+            self.assertAlmostEqual(tool[1], bed_y, places=9)
+    def test_bed_z_matches_the_stock_z_offset_convention(self):
+        # Stock klipper reports bed_z = test_z - z_offset; here the
+        # geometry has to arrive at the same number
+        pos = [60., 0., 4.5, 0., 0., 0., 0.]
+        res = self.rp.create_probe_result(pos)
+        self.assertAlmostEqual(res.bed_z, 4.5 - Z_OFFSET, places=9)
+        self.assertAlmostEqual(res.bed_x, 60., places=9)
+    def test_the_probe_reaches_barely_below_the_reported_position(self):
+        # So horizontal_move_z can go back to an ordinary value
+        self.assertLess(abs(self.rp.get_z_endstop_position()), 1.)
+    def test_descend_limit_accounts_for_the_probe(self):
+        limit = self.rp.descend_limit_z(-8.)
+        off_z = self.rp.get_carriage_offsets(PROBE_B_POSITION)[1]
+        self.assertAlmostEqual(limit + off_z, -8., places=9)
 
 
 if __name__ == '__main__':

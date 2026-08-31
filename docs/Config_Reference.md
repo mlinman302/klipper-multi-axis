@@ -2570,9 +2570,14 @@ negative `z_offset` - the probe reads the bed low - is a *shorter* probe
 radius). `z_offset` is therefore consumed by the geometry and is not
 subtracted a second time. Leave `x_offset` and `y_offset` unset.
 
-Because the probe hangs well below the nozzle while probing, `[bed_mesh]`
-`horizontal_move_z` - a nozzle height - must be larger than on a normal
-printer. `RTCP_PROBE_INFO` reports the exact clearance needed.
+Which position the offset is measured from follows `[rtcp]`: with
+compensation on it is the tool tip, with it off the carriage. **Homing
+and bed mesh should run with RTCP off** - probing does not need the
+compensation, and with it on a B move becomes an X/Z move that cannot run
+before those axes are homed. `RTCP_PROBE_INFO` reports the geometry for
+whichever frame is active, including the `horizontal_move_z` a
+`[bed_mesh]` needs; with RTCP on that is a nozzle height and much larger
+than usual, with it off an ordinary value works.
 
 ```
 [rtcp_probe]
@@ -2591,7 +2596,9 @@ probe_b_offset:
 #   direction of B, and the [rtcp] pivot offsets are not a reliable guide
 #   to it on a machine whose B zero comes from an endstop. True mirrors
 #   the radial offset, leaving both angles and the z offset untouched.
-#   The default is False.
+#   It has no effect while probing with RTCP off, where the probe hangs
+#   straight below the pivot and the mirrored term is zero. The default
+#   is False.
 #bed_radius:
 #   Largest bed radius (in mm) the mesh will ask for. When set, klippy
 #   checks at startup that the arm can put the probe over the whole bed.
