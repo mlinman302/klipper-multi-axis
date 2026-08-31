@@ -385,16 +385,36 @@ the geometry* and is not subtracted a second time as it is on a normal
 printer.
 
 With `psi` the rotation away from the probing angle
-(`B - probe_b_position`) and `theta = psi - probe_b_offset`, the probe
-sits at
+(`B - probe_b_position`), `theta = psi - probe_b_offset` and `s` either
+`+1` or `-1` from `invert_b_direction`, the probe sits at
 
 ```
-radial offset = L*sin(theta) - (L+z_offset)*sin(psi)
-z offset      = L*cos(theta) - (L+z_offset)*cos(psi)
+radial offset = s * (L*sin(theta) - (L+z_offset)*sin(psi))
+z offset      =      L*cos(theta) - (L+z_offset)*cos(psi)
 ```
 
 from the nozzle tip - which, with `[rtcp]` enabled, is the position the
 toolhead reports.
+
+`[rtcp]` supplies more than `L` here: `pivot_x_offset` and
+`pivot_length` also fix the B angle at which the tip hangs straight below
+the pivot, which is the printing orientation and the phase the derived
+`probe_b_position` default is measured from.  They must therefore be
+expressed in the same B frame the endstop sets.  The simplest way to
+arrange that is to make the printing orientation `B=0`, which means
+`pivot_x_offset: 0` and the whole pivot-to-tip distance in
+`pivot_length` - the derived probing angle is then just
+`-probe_b_offset`.
+
+`probe_b_position` and `probe_b_offset` fix *where* the nozzle and the
+probe point (the nozzle faces the bed at `probe_b_position +
+probe_b_offset`), but not which side of the pivot each is on while it
+points there.  That depends on the physical direction of B, and the
+`[rtcp]` pivot offsets cannot be trusted to settle it on a machine whose
+B zero comes from an endstop - hence `invert_b_direction`, which mirrors
+the head about the z axis.  Mirroring negates the radial component and
+leaves the z one alone, so it does not disturb either measured angle nor
+the height the probe reaches below the nozzle.
 
 ### How it is applied
 
@@ -431,10 +451,13 @@ the touching.
   yet, the head has to already be above `orient_lift_z`.  The `HOME_Z`
   macro in `config/example-corertheta.cfg` runs `RTCP_PROBE_ORIENT
   MODE=PROBE` first.
-* **The sign of `probe_b_offset` decides whether the bed centre is
-  reachable.**  The arm radius cannot go negative, so a probe that sits
-  *outboard* of the nozzle can never be brought over the middle of the
-  bed.  Set `bed_radius` and klippy checks this at startup.
+* **`invert_b_direction` decides whether the bed centre is reachable.**
+  The arm radius cannot go negative, so a probe that sits *outboard* of
+  the nozzle can never be brought over the middle of the bed, however far
+  the arm is driven back.  Set `bed_radius` and klippy checks this at
+  startup.  On the reference machine the probe is 48.9mm inboard, so the
+  arm covers bed radii 0..50 from an arm radius of 48.91..98.91 and never
+  approaches the polar singularity at the centre.
 * **The mesh turns with the bed.**  The g-code x/y frame of a polar
   machine is fixed to the bed, and `[stepper_c]` does not home, so the
   angular origin is wherever the bed happened to be at startup.  A saved
