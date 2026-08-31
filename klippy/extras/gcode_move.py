@@ -312,7 +312,7 @@ class GCodeMove:
             # tip position that g-code works in
             mpos = list(toolhead.get_position())
             mpos[:3] = calc_pos[:3]
-            calc_pos[:3] = rtcp.machine_to_tip(mpos)[:3]
+            calc_pos[:3] = rtcp.machine_to_tool(mpos)[:3]
         kinfo = zip("XYZ", calc_pos)
         kin_pos = " ".join(["%s:%.6f" % (a, v) for a, v in kinfo])
         anames = self._get_axis_names()

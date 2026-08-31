@@ -991,8 +991,11 @@ class EddyProbeOffsets:
     def __init__(self, config):
         self.x_offset = config.getfloat('x_offset', 0.)
         self.y_offset = config.getfloat('y_offset', 0.)
+        self.b_offset = config.getfloat('b_offset', 0.)
     def get_offsets(self, gcmd=None):
         return self.x_offset, self.y_offset, 0.
+    def get_b_offset(self):
+        return self.b_offset
 
 # Wrapper around ProbeParameterHelper
 class EddyParameterHelper:
@@ -1061,6 +1064,8 @@ class PrinterEddyProbe:
         if gcmd is not None and gcmd.get('METHOD', '').lower() == "tap":
             return (0., 0., 0.)
         return self.probe_offsets.get_offsets(gcmd)
+    def get_b_offset(self):
+        return self.probe_offsets.get_b_offset()
     def get_status(self, eventtime):
         return self.cmd_helper.get_status(eventtime)
     def start_probe_session(self, gcmd):

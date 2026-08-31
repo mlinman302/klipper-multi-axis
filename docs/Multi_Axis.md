@@ -277,44 +277,96 @@ bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipelin
 ## RTCP (Rotational Tool Center Point)
 
 The machine has a head that tilts about **B** (an axis parallel to Y).
-With `[rtcp]` configured, g-code commands where the **tool tip** should
-be; as the head tilts, the tip swings about the pivot, so the linear
-carriages move to hold the tip where it was asked to be.
+`[rtcp]` describes the tool on that head and switches the compensation on
+and off.
 
 ```
 [rtcp]
-pivot_length: 40.0     # mm from the tool tip to the B pivot, at B=0
-#pivot_x_offset: 0.0   # X offset from tip to pivot at B=0, if any
+tool_vertical_offset: 40.0     # mm the tool tip sits below the B pivot
+#tool_horizontal_offset: 0.0   # mm it sits inboard of the pivot
+#horizontal_frame:             # radial or cartesian; follows kinematics
 #enable: True
 ```
 
+### The two conventions
+
+Everything else follows from two rules, and neither is configurable:
+
+* **At `B = 0` the nozzle points straight down**, exactly as on a printer
+  with no tilting head.  This holds whether compensation is on or off, so
+  machine coordinates equal commanded coordinates at `B = 0` and homing,
+  the bed mesh, Z offsets and every existing config value stay in the
+  frame they already use.
+* **A positive B tilts the nozzle outboard** — the tip swings away from
+  the centre of the bed and rises.  A machine that turns the other way
+  inverts B in its kinematics (`invert_b_direction` in `[printer]` /
+  `[corertheta]`), never in `[rtcp]`.  Keeping the rotation sense in one
+  place is the point: it is the one thing that cannot be derived, and it
+  used to be settable in two.
+
+The tool is then two numbers, each positive in the direction the tool
+actually sits: `tool_vertical_offset` (how far the tip is *below* the
+pivot) and `tool_horizontal_offset` (how far it is *inboard* of the
+pivot, towards the centre of the bed).
+
+### The toggle
+
+| | `SET_RTCP ENABLE=1` | `SET_RTCP ENABLE=0` |
+| --- | --- | --- |
+| g-code commands | the tool tip | the carriage |
+| a B move | swings the tip, so the carriages move to cancel it | just turns the head |
+| used for | printing | homing, probing, bed mesh |
+
+Toggling does not move the machine: `SET_RTCP` converts the reported
+position between the two frames so the carriages stay where they are.  At
+`B = 0` the two frames coincide and the conversion is a no-op, which is
+why the example macros toggle there.
+
 ### The transform
 
-With the pivot at offset `(px, pz)` from the tip when `B = 0`:
+Writing `h` for the horizontal offset and `v` for the vertical one, the
+tip sits at `(-h, -v)` relative to the pivot at `B = 0`.  Rotating that
+by `b` and subtracting the `b = 0` value gives the carriage displacement:
 
 ```
-machine_x = x + px*(cos b - 1) + pz*sin b
-machine_y = y
-machine_z = z - px*sin b       + pz*(cos b - 1)
+dh(b) = h*(cos b - 1) - v*sin b
+dz(b) = h*sin b       + v*(cos b - 1)
 ```
 
-The `-1` terms normalise the transform so that machine coordinates equal
-the commanded tip position at `B = 0`.  That keeps homing, bed mesh, Z
-offsets and every existing config value in the frame they already use —
-`B = 0` behaves exactly like a machine without RTCP.
+Sanity check at `b = 90` with `h = 0`: `dh = -v`, `dz = -v`.  The nozzle
+has tilted a quarter turn outboard, so the tip is now level with the
+pivot and `v` further out; the carriage retreats by `v` and drops by `v`
+to leave the tip alone.  That is what `test_kin_6axis.c` and
+`test_gcode_pipeline.py` both assert, with the same numbers.
 
-Sanity check at `B = 90` with `px = 0`: the tool now points along −X from
-the pivot, so the carriage must move `+pz` in X and `−pz` in Z to leave
-the tip alone.  That is what the transform gives, and what
-`test_kin_6axis.c` asserts.
+### Which direction is "horizontal"
+
+The tip swings in the direction the tool leans, which is not the same
+axis on every machine:
+
+* **`cartesian`** — the tip swings along +X.  `machine_x = x + dh`.
+  For a cartesian, corexy or generic_cartesian gantry.
+* **`radial`** — the tip swings along the arm, away from the centre of
+  the bed.  For a polar machine such as corertheta, where x/y are *bed*
+  coordinates and the arm travels in radius.  The correction scales x and
+  y together, so it changes the arm radius and leaves the bed angle
+  alone.
+
+The default follows the kinematics — radial for `corertheta` and `polar`,
+cartesian otherwise — and `horizontal_frame` overrides it.  Getting this
+wrong on a polar machine is not a small error: a cartesian correction is
+only right at bed angle zero, and swings the arm sideways everywhere
+else.
+
+`dz` is applied to Z in both frames.
 
 ### How it is applied
 
 `kin_rtcp.c` *wraps* each kinematic stepper rather than replacing it, the
-same way `kin_idex.c` does, so it composes with cartesian, corexy or
-generic_cartesian underneath: the corrected coordinate is handed to the
-original solver.  `[rtcp]` installs the wrappers at connect time exactly
-as `[input_shaper]` does.
+same way `kin_idex.c` does, so it composes with cartesian, corexy,
+generic_cartesian or corertheta underneath: the corrected coordinate is
+handed to the original solver.  `[rtcp]` installs the wrappers at connect
+time exactly as `[input_shaper]` does.
 
 Two details matter:
 
@@ -322,11 +374,13 @@ Two details matter:
   six-axis queue.  It is therefore continuous *through* a move, not just
   correct at the endpoints — this is the whole reason the rotational axes
   had to move into the toolhead trapq.
-* **A stepper driven by X or Z becomes active on B.**  `rtcp_set_sk()`
-  ORs `AF_B` into the wrapped stepper's `active_flags`.  Without that, a
-  rotation-only move would be considered irrelevant to the X and Z
-  steppers, no steps would be generated for them, and the tip would swing
-  away instead of staying put.
+* **A stepper driven by a linear axis becomes active on B.**
+  `rtcp_set_sk()` ORs `AF_B` into the wrapped stepper's `active_flags`.
+  Without that, a rotation-only move would be considered irrelevant to
+  those steppers, no steps would be generated, and the tip would swing
+  away instead of staying put.  In the cartesian frame that means X and
+  Z; in the radial frame Y joins them, since the correction scales x and
+  y together.
 
 ### Reported positions
 
@@ -335,6 +389,11 @@ active those differ from the tip coordinates g-code uses, so the inverse
 transform is applied when reading positions back out of the steppers —
 in `HomingMove.calc_toolhead_pos()` and in `GET_POSITION`.  Everything
 the user sees stays in the tip frame.
+
+`rtcp.py` repeats the transform in Python rather than calling the C
+through cffi, so a position can be converted on a host with no compiled
+`c_helper.so`.  The two implementations have to be kept in step; the
+tests pin both to the same numbers.
 
 ### Reach checking
 
@@ -345,19 +404,24 @@ into machine coordinates and compares them against
 `axis_minimum`/`axis_maximum`.  Checking the endpoints is sufficient
 because B varies monotonically within a move, so the offset does too.
 
+In the radial frame it additionally rejects a move whose corrected arm
+radius would go negative.  The transform would happily produce a point on
+the far side of the bed centre at the same bed angle — which is within
+the machine's x/y bounds, and is not somewhere the arm can be.  It is
+also the one case the inverse transform cannot recover, since `hypot()`
+has already lost the sign.
+
 This check runs for any move that reaches the motion queue, **including
 rotation-only moves** — under RTCP a bare `G1 B45` moves the carriages.
 
-Plan the rail travel for it: with a 40 mm pivot and B limited to ±45°,
-the X carriage swings ±28.3 mm beyond the tip position and the Z carriage
-dips 11.7 mm below it.
+Plan the rail travel for it: with a 40 mm tool offset and B limited to
+±45°, the horizontal carriage swings ±28.3 mm beyond the tip position and
+the Z carriage dips 11.7 mm below it.
 
 ### Commands
 
-`SET_RTCP [ENABLE=0|1] [PIVOT_LENGTH=<mm>] [PIVOT_X_OFFSET=<mm>]` toggles
-or retunes the compensation at runtime.  Changing it re-syncs the
-toolhead position, since the same tip position now maps to a different
-machine position.
+`SET_RTCP [ENABLE=0|1] [VERTICAL_OFFSET=<mm>] [HORIZONTAL_OFFSET=<mm>]`
+toggles or retunes the compensation at runtime.
 
 ### Scope
 
@@ -368,152 +432,124 @@ order convention), and belongs in `rtcp_calc_position()`.
 
 ## Probing and mesh bed levelling on a tilting head
 
-A probe bolted to the tilting head is not at a fixed offset from the
-nozzle.  It swings with the head, and on the core r-theta machine the
-offset it ends up at is **radial** - along the arm - because the bed
-angle the probe sits at is the same as the nozzle's.  `[probe]`
-`x_offset`/`y_offset`, which are fixed cartesian numbers, cannot express
-that.
+The probe is bolted to the tilting head, a fixed angle around the B pivot
+from the nozzle.  The temptation is to model that as geometry — two
+concentric circles about the pivot, the probe's offset from the nozzle a
+function of B — and an earlier version of this fork did.  It is the wrong
+shape for the problem.
 
-`klippy/extras/rtcp_probe.py` supplies the geometry instead.  The model
-is two concentric circles about the B pivot: the nozzle tip rides one of
-radius `L = hypot(pivot_x_offset, pivot_length)`, the probe point rides
-one of radius `L + z_offset`, and `probe_b_offset` is the angle between
-them.  A negative probe `z_offset` - "the probe reads the bed low" - is
-exactly a probe circle that much smaller, so `z_offset` is *consumed by
-the geometry* and is not subtracted a second time as it is on a normal
-printer.
-
-With `psi` the rotation away from the probing angle
-(`B - probe_b_position`), `theta = psi - probe_b_offset` and `s` either
-`+1` or `-1` from `invert_b_direction`, the probe sits at
+The probe is used in **exactly one orientation**: the B angle at which
+its pin hangs vertically.  In that orientation, and with RTCP
+compensation off, it is an ordinary probe at a fixed offset from the
+toolhead.  So it owns four measured numbers, all in its own config
+section (`[bltouch]` here):
 
 ```
-radial offset = s * (L*sin(theta) - (L+z_offset)*sin(psi))
-z offset      =      L*cos(theta) - (L+z_offset)*cos(psi)
+[bltouch]
+b_offset: 45     # B angle at which the pin is vertical
+x_offset: 0      # where the probe sits relative to the carriage
+y_offset: 0      #   at that angle, with RTCP off
+z_offset: -0.1   # how far the trigger point is below the nozzle
 ```
 
-from the nozzle tip.
+`b_offset` is also the angular distance from the nozzle round to the
+probe, because the nozzle is vertical at `B = 0` by definition.
 
-### Two frames, and why probing should use the second
+`z_offset` keeps its stock Klipper meaning and is calibrated the stock
+way.  Its geometric meaning here is the difference between the probe's
+and the nozzle's radius about the B pivot — but nothing computes it from
+that, and nothing should: it is measured.
 
-That formula measures from the nozzle tip, which is what the toolhead
-reports **while RTCP compensation is on**.  With it off the toolhead
-reports the carriage instead, and the offset is a different - simpler -
-thing.  The pivot rides the carriage at a fixed
-`(pivot_x_offset, pivot_length)`, the very numbers `[rtcp]` already
-carries, so only the pivot-to-probe arm turns with B:
+### Why probing runs with RTCP off
 
-```
-radial offset = pivot_x_offset  - s * (L+z_offset)*sin(psi)
-z offset      = pivot_length    -     (L+z_offset)*cos(psi)
-```
-
-**Homing and bed mesh should run with RTCP off.**  Three reasons:
+This is the whole reason the model collapses to four constants.
 
 1. With RTCP on, turning B *is* an X/Z move, so `G28 B` cannot be
-   followed by a probe orientation until X, Y and Z are all homed - and
-   Z is exactly what is being homed.  With RTCP off a B move touches no
+   followed by a probe orientation until X, Y and Z are all homed — and Z
+   is exactly what is being homed.  With RTCP off a B move touches no
    linear axis and works with nothing homed.
-2. At the probing angle `sin(psi)` is zero, so the radial term collapses
-   to `pivot_x_offset` and the mirror drops out entirely.
-   `invert_b_direction` - the one parameter that cannot be derived - has
-   no effect on probing.
-3. When `pivot_x_offset` is zero, the probe lands on the carriage
-   reference point, `z_offset` higher.  That is the plain probe case:
-   `horizontal_move_z` goes back to an ordinary value, and the arm radius
-   is simply the bed radius being probed.
+2. With RTCP off the toolhead position *is* the carriage, so the probe's
+   offset from it does not depend on B at all once the head is at the
+   probing angle.  There is no geometry left to get wrong.
+3. `horizontal_move_z` goes back to being an ordinary carriage height,
+   the arm radius is simply the bed radius being probed, and the mesh z
+   values are the reported toolhead z at each trigger.
 
-`[rtcp_probe]` picks the frame from `rtcp.enabled` at the moment each
-offset is needed, so both work; the startup reach check covers both.
+So it is not a recommendation, it is enforced: `PROBE`, `G28 Z` through
+`probe:z_virtual_endstop` and `BED_MESH_CALIBRATE` are all refused with
+compensation on, and refused with B away from the probe's `b_offset`.
+`rtcp.check_disabled()` and `rtcp_probe.check_probe_ready()` do the
+refusing, and both say what to run instead.
 
-The catch is that third point's other half: with RTCP off the arm radius
-*is* the bed radius, so probing the centre of the bed drives the arm to
-radius zero, where a polar machine's bed angle is undefined.  Home Z off
-centre, and if the mesh's centre point misbehaves, either set
+The catch is point 3's other half: with RTCP off the arm radius *is* the
+bed radius, so probing the centre of the bed drives the arm to radius
+zero, where a polar machine's bed angle is undefined.  Home Z off centre,
+and if the mesh's centre point misbehaves, either set
 `max_angular_velocity` in `[printer]` to slow moves near the middle or
 declare a small `faulty_region` around it so `[bed_mesh]` substitutes
 neighbouring points.
 
-`[rtcp]` supplies more than `L` here: `pivot_x_offset` and
-`pivot_length` also fix the B angle at which the tip hangs straight below
-the pivot, which is the printing orientation and the phase the derived
-`probe_b_position` default is measured from.  They must therefore be
-expressed in the same B frame the endstop sets.  The simplest way to
-arrange that is to make the printing orientation `B=0`, which means
-`pivot_x_offset: 0` and the whole pivot-to-tip distance in
-`pivot_length` - the derived probing angle is then just
-`-probe_b_offset`.
+### The one thing that is not stock
 
-`probe_b_position` and `probe_b_offset` fix *where* the nozzle and the
-probe point (the nozzle faces the bed at `probe_b_position +
-probe_b_offset`), but not which side of the pivot each is on while it
-points there.  That depends on the physical direction of B, and the
-`[rtcp]` pivot offsets cannot be trusted to settle it on a machine whose
-B zero comes from an endstop - hence `invert_b_direction`, which mirrors
-the head about the z axis.  Mirroring negates the radial component and
-leaves the z one alone, so it does not disturb either measured angle nor
-the height the probe reaches below the nozzle.
+On a polar machine the toolhead's x/y are *bed* coordinates while the
+probe is displaced along the arm.  A fixed pair of bed-frame offsets
+would only be right at bed angle zero.  So the x/y pair is applied in the
+machine's own frame at the toolhead — `x_offset` along the arm (positive
+outboard), `y_offset` across it — which on a cartesian machine is just
+x and y, and the arithmetic reduces to the stock subtraction.
 
-### How it is applied
-
-`probe.py` looks up an optional printer object named `probe_transform`
-and, when one is present, uses it in place of the configured x/y/z
-offsets at four points:
+That is all `klippy/extras/rtcp_probe.py` does with the offsets, plus
+turning the head to and from the probing orientation.  It registers
+itself as the printer object `probe_transform`, which `probe.py` consults
+at three points:
 
 | Site | Without a transform | With one |
 | --- | --- | --- |
-| `DescendToEndstopHelper.descend_until_trigger` (descent target) | the z axis `position_min` | `descend_limit_z()`, so it is the *probe* that stops at `position_min` |
-| `DescendToEndstopHelper.descend_until_trigger` (result) | `manual_probe.create_probe_result` | `create_probe_result()` |
+| `ProbePointsHelper.start_probe` | — | `check_probe_ready()`, before the first move |
+| `DescendToEndstopHelper.descend_until_trigger` | `manual_probe.create_probe_result` | `check_probe_ready()`, then `create_probe_result()` |
 | `ProbePointsHelper._move_next` | subtract x/y offsets | `bed_to_tool()` |
-| `ProbePointsHelper.start_probe` (`horizontal_move_z` check) | the probe `z_offset` | `get_z_endstop_position()` - how far the probe reaches below the nozzle |
+
+The z offset is deliberately *not* the transform's business: it keeps its
+ordinary meaning, so the `horizontal_move_z` check and the probing
+descent limit are stock code.
 
 `G28 Z` needs no hook of its own: `homing.py` derives the homed z from
 the probe result's `bed_z`, so the transform reaches it through
 `create_probe_result()`.  `HomingViaProbeHelper.get_position_endstop()`
-deliberately stays static - it is read while the rails are still being
+deliberately stays static — it is read while the rails are still being
 built, before any transform exists.
 
-Everything downstream - `[bed_mesh]`, `[z_tilt]`, `[bed_tilt]`,
-`PROBE_ACCURACY` - consumes `ProbeResult` and needs no change.  Manual
+Everything downstream — `[bed_mesh]`, `[z_tilt]`, `[bed_tilt]`,
+`PROBE_ACCURACY` — consumes `ProbeResult` and needs no change.  Manual
 probing (`METHOD=manual`) ignores the transform: there the nozzle does
 the touching.
 
 ### Consequences worth knowing
 
-* **`horizontal_move_z` is measured in whichever frame is active.**
-  With RTCP on it is a nozzle height and the probe hangs about 20mm
-  below the nozzle, so it must exceed that or the probe is dragged
-  through the bed; `probe.py` refuses the calibration if it does not.
-  With RTCP off - the recommended way to probe - it is a carriage height
-  and the probe reaches only `z_offset` below it, so an ordinary value
-  works.  `RTCP_PROBE_INFO` prints the figure for the active frame.
 * **`G28 Z` needs the probe facing the bed**, with RTCP off so that
-  turning B does not become an X/Z move before Z is homed, and - since Z
-  is not homed yet - the head already clear of the bed.  The `HOME_Z`
+  turning B does not become an X/Z move before Z is homed, and — since Z
+  is not homed yet — the head already clear of the bed.  The `HOME_Z`
   macro in `config/example-corertheta.cfg` does all three.
   `RTCP_PROBE_ORIENT` refuses to turn B with RTCP on and X/Y/Z unhomed,
   and says to run `SET_RTCP ENABLE=0`.
-* **`invert_b_direction` decides whether the bed centre is reachable
-  with RTCP on.**  The arm radius cannot go negative, so a probe that
-  sits *outboard* of the reported position can never be brought over the
-  middle of the bed.  Set `bed_radius` and klippy checks both frames at
-  startup.  It does not arise with RTCP off, where the radial offset at
-  the probing angle is just `pivot_x_offset`.
+* **An outboard probe can put the bed centre out of reach.**  The arm
+  radius cannot go negative, so a probe with a positive `x_offset` can
+  never be brought over the middle of the bed.  Set `bed_radius` in
+  `[rtcp_probe]` and klippy checks at startup.
 * **The mesh turns with the bed.**  The g-code x/y frame of a polar
   machine is fixed to the bed, and `[stepper_c]` does not home, so the
   angular origin is wherever the bed happened to be at startup.  A saved
-  `BED_MESH_PROFILE` is therefore meaningless after a restart - the mesh
+  `BED_MESH_PROFILE` is therefore meaningless after a restart — the mesh
   has to be recalibrated before each print.
 * **B is not in `homed_axes`.**  A rotational axis is a rotary axis
   object, not one of the kinematics' linear axes, so
   `toolhead.get_status()['homed_axes']` only ever reports x/y/z.  Its
   homed flag is on the axis object itself, reached through
-  `toolhead.get_extra_axes()` - which is what `[rtcp_probe]` keeps a
+  `toolhead.get_extra_axes()` — which is what `[rtcp_probe]` keeps a
   reference to.  Testing `'b' in homed_axes` always reads false.
-* **`PROBE_CALIBRATE` and `Z_OFFSET_APPLY_PROBE` do not apply.**  They
-  assume the probe is a fixed distance below the nozzle.  Calibrate
-  `z_offset` as the difference between the two circle radii instead.
+* **`PROBE_CALIBRATE` works normally**, since `z_offset` is now an
+  ordinary z offset — run it with RTCP off and the probe oriented, as
+  everything else in this section.
 
 ## Deliberate limitations (current stage)
 

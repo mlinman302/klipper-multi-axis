@@ -3,13 +3,12 @@
 DICTIONARY atmega2560.dict
 CONFIG multi_axis_rtcp_probe.cfg
 
-# Report the derived geometry before anything moves
+# Report the geometry before anything moves
 RTCP_PROBE_INFO
-RTCP_PROBE_INFO B=0
 
-# Probing does not need RTCP - the probe's offset from the carriage is
-# just the pivot plus the probe arm - and turning it off keeps a B move
-# from becoming an X/Z one before those axes are homed.
+# Probing runs in the carriage frame, where the probe is at a fixed
+# offset from the toolhead - and with RTCP off a B move does not become
+# an X/Z one before those axes are homed.  Probing with it on is refused.
 SET_RTCP ENABLE=0
 
 # Home the arm and the tilt axis.  Z cannot be homed until the head has
@@ -38,7 +37,8 @@ G1 Z40 F300
 RTCP_PROBE_ORIENT MODE=TOOL
 
 # Mesh the round bed.  With RTCP off the arm radius is the bed radius, so
-# the generated points take it from 0 to 50.
+# the generated points take it from 0 to 50.  The mesh z values come
+# straight from the reported toolhead z at each trigger.
 RTCP_PROBE_ORIENT MODE=PROBE
 BED_MESH_CALIBRATE
 BED_MESH_OUTPUT

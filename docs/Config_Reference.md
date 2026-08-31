@@ -2220,6 +2220,13 @@ pin:
 z_offset:
 #   The distance (in mm) between the bed and the nozzle when the probe
 #   triggers. This parameter must be provided.
+#b_offset: 0.0
+#   Only for a probe carried on a head that tilts about B - see [rtcp].
+#   The B angle (in degrees) at which the probe points straight down.
+#   The nozzle points straight down at B=0, so this is also the angular
+#   distance from the nozzle round to the probe, and the x/y/z offsets
+#   above are the ones measured with the head at this angle. The default
+#   is 0.
 #speed: 5.0
 #   Speed (in mm/s) of the Z axis when probing. It may be possible to
 #   change this value at runtime via a "PROBE_SPEED" command
@@ -2365,10 +2372,19 @@ pin:
 #   Default value is 0.4.
 #x_offset:
 #y_offset:
-#   Should be left unset (or set to 0).
+#   Should be left unset (or set to 0) on an ordinary printer. On a head
+#   that tilts about B - see [rtcp] - they are where the probe sits
+#   relative to the toolhead while its pin is vertical.
 z_offset:
 #   Trigger height of the probe. Start with -0.1 (mm), and adjust later using
 #   `PROBE_CALIBRATE` command. This parameter must be provided.
+#b_offset: 0.0
+#   Only for a probe carried on a head that tilts about B - see [rtcp].
+#   The B angle (in degrees) at which the probe points straight down.
+#   The nozzle points straight down at B=0, so this is also the angular
+#   distance from the nozzle round to the probe, and the x/y/z offsets
+#   above are the ones measured with the head at this angle. The default
+#   is 0.
 #speed:
 #   Speed (in mm/s) of the Z axis when probing. It is recommended to start
 #   with the probing speed of 20 mm/s and adjust it as necessary to improve
@@ -2523,96 +2539,112 @@ at 1 (for example, "stepper_z1", "stepper_z2", etc.).
 ### [rtcp]
 
 Rotational Tool Center Point compensation for a head that tilts about the
-B axis. With RTCP enabled, `G0`/`G1` command where the *tool tip* should
-be, and the X and Z carriages move to hold the tip in place as the head
-tilts. Requires `b` in the `additional_axes` option of `[printer]`.
+B axis. Requires `b` in the `additional_axes` option of `[printer]`.
 
-At `B=0` machine coordinates equal the commanded tip position, so homing,
-bed mesh and Z offsets keep their usual meaning. Note that the carriages
-travel beyond the commanded tip position when tilted - with a 40mm pivot
-at 45 degrees, X swings 28.3mm and Z dips 11.7mm - so the rails must be
-able to reach it.
+The compensation has two states:
+
+* **On** - `G0`/`G1` command where the *tool tip* should be. A B move
+  swings the tip about the pivot, so the carriages move to cancel the
+  swing and hold the tip where it was asked to be. This is the printing
+  mode.
+* **Off** - `G0`/`G1` command the *carriage*. A B move just turns the
+  head and nothing else moves. This is the homing, probing and bed mesh
+  mode, and probing is refused with compensation on.
+
+Two conventions fix the geometry, and neither is configurable:
+
+* At `B=0` the nozzle points straight down, exactly as on a printer with
+  no tilting head. This holds in both states, so machine coordinates
+  equal commanded coordinates at `B=0` and homing, the bed mesh and Z
+  offsets keep their usual meaning.
+* A positive B tilts the nozzle **outboard** - the tip swings away from
+  the centre of the bed and rises. A machine that turns the other way
+  sets `invert_b_direction` in `[printer]` / `[corertheta]`, not here.
+
+Note that the carriages travel beyond the commanded tip position when
+tilted - with a 40mm tool offset at 45 degrees the horizontal carriage
+swings 28.3mm and Z dips 11.7mm - so the rails must be able to reach it.
 
 See [Multi_Axis.md](Multi_Axis.md) and
 [multi_axis_rtcp.cfg](../test/klippy/multi_axis_rtcp.cfg).
 
 ```
 [rtcp]
-pivot_length:
-#   Distance (in mm) from the tool tip to the B rotation pivot, measured
-#   with the head at B=0. This parameter must be provided.
-#pivot_x_offset: 0.0
-#   X offset (in mm) from the tool tip to the pivot at B=0, for a head
-#   whose tip is not directly below the pivot. The default is 0.
+tool_vertical_offset:
+#   How far (in mm) the tool tip sits below the B pivot, measured at
+#   B=0. This parameter must be provided.
+#tool_horizontal_offset: 0.0
+#   How far (in mm) the tool tip sits inboard of the B pivot at B=0 -
+#   that is, towards the centre of the bed - for a head whose tip is not
+#   directly below the pivot. The default is 0.
+#horizontal_frame:
+#   Which direction the tip swings in as the head tilts: "radial" (along
+#   the arm, away from the centre of the bed) or "cartesian" (along +X).
+#   The default follows the kinematics - radial for corertheta and
+#   polar, cartesian otherwise - and is almost never worth setting.
 #enable: True
 #   Whether compensation is active at startup. It can be toggled at
 #   runtime with SET_RTCP. The default is True.
 ```
 
-The `SET_RTCP [ENABLE=0|1] [PIVOT_LENGTH=<mm>] [PIVOT_X_OFFSET=<mm>]`
-command toggles or retunes the compensation.
+The `SET_RTCP [ENABLE=0|1] [VERTICAL_OFFSET=<mm>] [HORIZONTAL_OFFSET=<mm>]`
+command toggles or retunes the compensation. The machine does not move:
+the reported position is converted between the two frames so that the
+carriages stay where they are.
+
+The older `pivot_length` and `pivot_x_offset` options were renamed when
+the sign conventions above were fixed; klippy reports an error naming the
+replacement rather than reinterpreting an old config.
 
 ### [rtcp_probe]
 
-Probe geometry for a probe carried on the RTCP tilting head, as on the
-core r-theta machine. A probe bolted to the head has no fixed x/y offset
-from the nozzle: it swings with the head, and on a polar machine the
-resulting offset is *radial* - along the arm - rather than along a fixed
-cartesian axis. This section replaces the `[probe]` `x_offset`/`y_offset`
-with that geometry, so `PROBE`, `G28 Z` through
-`probe:z_virtual_endstop`, and `BED_MESH_CALIBRATE` all work on the
-tilting head. Requires `[rtcp]` and a probe section such as `[bltouch]`.
+Support for probing with a probe carried on the RTCP tilting head, as on
+the core r-theta machine. Requires `[rtcp]` and a probe section such as
+`[bltouch]`.
 
-The model is that the nozzle tip and the probe point ride two circles
-about the B pivot that share a centre. The pivot-to-tip radius comes from
-`[rtcp]`; the probe's is that radius plus the probe's `z_offset` (a
-negative `z_offset` - the probe reads the bed low - is a *shorter* probe
-radius). `z_offset` is therefore consumed by the geometry and is not
-subtracted a second time. Leave `x_offset` and `y_offset` unset.
+The probe is used in exactly one orientation - the B angle at which its
+pin hangs vertically - and in that orientation it is an ordinary probe at
+a fixed offset from the toolhead. It therefore owns four measured
+numbers, all of them in its own config section:
 
-Which position the offset is measured from follows `[rtcp]`: with
-compensation on it is the tool tip, with it off the carriage. **Homing
-and bed mesh should run with RTCP off** - probing does not need the
-compensation, and with it on a B move becomes an X/Z move that cannot run
-before those axes are homed. `RTCP_PROBE_INFO` reports the geometry for
-whichever frame is active, including the `horizontal_move_z` a
-`[bed_mesh]` needs; with RTCP on that is a nozzle height and much larger
-than usual, with it off an ordinary value works.
+| Option | Meaning |
+| --- | --- |
+| `b_offset` | The B angle at which the pin is vertical. The nozzle is vertical at `B=0`, so this is also the angular distance from the nozzle round to the probe. |
+| `x_offset` | Where the probe sits relative to the toolhead in that orientation, measured with RTCP off. On a polar machine `x_offset` is along the arm (positive outboard) and `y_offset` across it; on a cartesian machine they are the usual X and Y. |
+| `y_offset` | |
+| `z_offset` | How far the trigger point is below the nozzle - the usual Klipper meaning, calibrated the usual way. |
+
+None of this uses the `[rtcp]` geometry, and it must not: **probing,
+homing and bed mesh all run with RTCP off**, where a B move disturbs
+nothing else and the four offsets above are constants rather than
+functions of B. That is what lets `G28 Z` run before X and Z are homed.
+`PROBE`, `G28 Z` through `probe:z_virtual_endstop` and
+`BED_MESH_CALIBRATE` are refused with compensation on, and refused with B
+away from the probe's `b_offset`.
+
+This section itself only handles turning the head to and from that
+orientation, and applying the probe's x/y offsets in the machine's own
+frame at the toolhead - which on a polar machine is along and across the
+arm rather than along the bed x/y, since those turn with the bed.
+
+Because probing runs in the carriage frame, `horizontal_move_z` is an
+ordinary carriage height and the mesh z values are the reported toolhead
+z at each trigger.
 
 ```
 [rtcp_probe]
-probe_b_offset:
-#   Angle (in degrees) from the nozzle direction to the probe direction
-#   around the B pivot, measured in the direction of increasing B. Equal
-#   to the nozzle-down B angle minus probe_b_position. This parameter
-#   must be provided.
-#probe_b_position:
-#   The B angle (in degrees) at which the probe points straight down. The
-#   default is derived from the [rtcp] pivot offsets and probe_b_offset;
-#   set it to the measured angle if the derived one is wrong.
-#invert_b_direction: False
-#   Which side of the pivot the probe sits on while it faces the bed.
-#   The two angles above cannot express this - it depends on the physical
-#   direction of B, and the [rtcp] pivot offsets are not a reliable guide
-#   to it on a machine whose B zero comes from an endstop. True mirrors
-#   the radial offset, leaving both angles and the z offset untouched.
-#   It has no effect while probing with RTCP off, where the probe hangs
-#   straight below the pivot and the mirrored term is zero. The default
-#   is False.
 #bed_radius:
 #   Largest bed radius (in mm) the mesh will ask for. When set, klippy
 #   checks at startup that the arm can put the probe over the whole bed.
 #   The default is to make no such check.
 #check_probe_b_angle: True
-#   Whether to reject probing moves made with B away from
-#   probe_b_position. The geometry is exact at any B, but probing with
-#   the probe not facing the bed is nearly always a mistake. The default
-#   is True.
+#   Whether to reject probing with B away from the probe's b_offset. The
+#   default is True.
 #probe_b_angle_tolerance: 1.0
-#   How far (in degrees) B may sit from probe_b_position for the above
-#   check. The default is 1.0.
+#   How far (in degrees) B may sit from the probe's b_offset for the
+#   above check. The default is 1.0.
 #orient_lift_z: 40.0
-#   Nozzle height (in mm) RTCP_PROBE_ORIENT raises the head to before
+#   Carriage height (in mm) RTCP_PROBE_ORIENT raises the head to before
 #   turning B, so the probe does not sweep through the bed. The default
 #   is 40.
 #orient_speed: 20.0
@@ -2622,17 +2654,23 @@ probe_b_offset:
 ```
 
 `RTCP_PROBE_ORIENT [MODE=PROBE|TOOL|B] [B=<angle>] [LIFT_Z=<mm>]` turns
-the head so the probe (`PROBE`, the default), the nozzle (`TOOL`) or an
-explicit angle (`B`) faces the bed.
+the head so the probe (`PROBE`, the default, which is `B=b_offset`), the
+nozzle (`TOOL`, which is `B=0`) or an explicit angle (`B`) points
+straight down.
 
 `RTCP_PROBE_MOVE [X=<pos>] [Y=<pos>] [F=<speed>]` moves the head so the
 *probe* is over the given bed position. A g-code macro cannot work this
 out for itself, because it evaluates its whole template before running
-any of it and the offsets are only known once the head has been turned.
+any of it.
 
-`RTCP_PROBE_INFO [B=<angle>]` reports
-the derived geometry - the two radii, the probing B angle, the radial and
-z offsets, and the toolhead z at which the probe triggers on a flat bed.
+`RTCP_PROBE_INFO` reports the geometry - the two B angles, the probe's
+offsets and the frame they are applied in, and whether compensation is
+currently on.
+
+The older `probe_b_offset`, `probe_b_position` and `invert_b_direction`
+options were removed: the first two are now the probe section's
+`b_offset`, and the third is fixed by the B rotation convention above.
+klippy reports an error naming the replacement.
 
 ### Coupled rotational axes ([carriage] on a/b/c)
 

@@ -117,7 +117,7 @@ class HomingMove:
         # g-code uses, so convert back before reporting.
         rtcp = self.printer.lookup_object('rtcp', None)
         if rtcp is not None:
-            res = rtcp.machine_to_tip(res)
+            res = rtcp.machine_to_tool(res)
         return res
     def homing_move(self, movepos, speed, probe_pos=False,
                     triggered=True, check_triggered=True):

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include "itersolve.h"
+#include "kin_rtcp.h" // RTCP_FRAME_CARTESIAN
 #include "list.h"
 #include "stepcompress.h"
 #include "trapq.h"
@@ -34,8 +35,12 @@ extern struct stepper_kinematics *corertheta_stepper_alloc(char type,
 extern struct stepper_kinematics *rtcp_alloc(void);
 extern int rtcp_set_sk(struct stepper_kinematics *sk,
                        struct stepper_kinematics *orig_sk);
-extern void rtcp_set_pivot(struct stepper_kinematics *sk,
-                           double pivot_x, double pivot_z);
+extern void rtcp_set_tool(struct stepper_kinematics *sk,
+                          double tool_h, double tool_v, int frame);
+extern void rtcp_tool_to_machine(double tool_h, double tool_v, int frame,
+                                 double b, double *pos_xyz);
+extern void rtcp_machine_to_tool(double tool_h, double tool_v, int frame,
+                                 double b, double *pos_xyz);
 
 #define NEVER_TIME 9999999999999999.9
 
@@ -451,7 +456,7 @@ static void
 test_rtcp(void)
 {
     printf("\n-- RTCP compensation for a B axis head --\n");
-    const double L = 40.;   // pivot sits 40mm above the tip at B=0
+    const double L = 40.;   // the tip sits 40mm below the pivot at B=0
     struct stepper_kinematics *rx = rtcp_alloc();
     struct stepper_kinematics *rz = rtcp_alloc();
     struct stepper_kinematics *ry = rtcp_alloc();
@@ -462,9 +467,9 @@ test_rtcp(void)
     check("rtcp_set_sk on y", rtcp_set_sk(ry, cartesian_stepper_alloc('y')),
           0, 0.);
     check("rtcp_set_sk rejects NULL", rtcp_set_sk(rtcp_alloc(), NULL), -1, 0.);
-    rtcp_set_pivot(rx, 0., L);
-    rtcp_set_pivot(rz, 0., L);
-    rtcp_set_pivot(ry, 0., L);
+    rtcp_set_tool(rx, 0., L, RTCP_FRAME_CARTESIAN);
+    rtcp_set_tool(rz, 0., L, RTCP_FRAME_CARTESIAN);
+    rtcp_set_tool(ry, 0., L, RTCP_FRAME_CARTESIAN);
 
     // X and Z must now respond to B - otherwise a rotation-only move
     // generates no steps and the tip is not held
@@ -481,23 +486,24 @@ test_rtcp(void)
     check("B=0: x", sample(tq0, rx, t0), 0., 1e-9);
     check("B=0: z", sample(tq0, rz, t0), 0., 1e-9);
 
-    // Tilt to B=90 holding the tip still.  The tool now points along -X
-    // from the pivot, so the carriage must go +L in X and -L in Z.
+    // Tilt to B=90 holding the tip still.  A positive B tilts the nozzle
+    // outboard, so the tool now points along +X from the pivot and the
+    // carriage must retreat to -L in X and drop to -L in Z.
     double d_b90[KIN_AXES] = {0., 0., 0., 0., 90., 0.};
     struct trapq *tq90 = queue_move(t0, move_t, zero, d_b90);
-    check("B=90: x carriage", sample(tq90, rx, t0 + move_t), L, 1e-9);
+    check("B=90: x carriage", sample(tq90, rx, t0 + move_t), -L, 1e-9);
     check("B=90: z carriage", sample(tq90, rz, t0 + move_t), -L, 1e-9);
     check("B=90: y carriage", sample(tq90, ry, t0 + move_t), 0., 1e-9);
     // B=-90 mirrors it
     double d_bm90[KIN_AXES] = {0., 0., 0., 0., -90., 0.};
     struct trapq *tqm90 = queue_move(t0, move_t, zero, d_bm90);
-    check("B=-90: x carriage", sample(tqm90, rx, t0 + move_t), -L, 1e-9);
+    check("B=-90: x carriage", sample(tqm90, rx, t0 + move_t), L, 1e-9);
     check("B=-90: z carriage", sample(tqm90, rz, t0 + move_t), -L, 1e-9);
 
     // Mid-rotation the compensation must already be applied - this is
     // the part that only works because B shares the move's time base
     double b_mid = 45.;
-    double x_want = L * sin(b_mid * M_PI / 180.);
+    double x_want = -L * sin(b_mid * M_PI / 180.);
     double z_want = L * (cos(b_mid * M_PI / 180.) - 1.);
     check("B=45 (midway): x carriage", sample(tq90, rx, t0 + move_t / 2.),
           x_want, 1e-9);
@@ -509,20 +515,36 @@ test_rtcp(void)
     double d_xb[KIN_AXES] = {100., 0., 0., 0., 90., 0.};
     struct trapq *tqxb = queue_move(t0, move_t, start_xz, d_xb);
     check("tip X move + tilt: x carriage", sample(tqxb, rx, t0 + move_t),
-          110. + L, 1e-9);
+          110. - L, 1e-9);
     check("tip X move + tilt: z carriage", sample(tqxb, rz, t0 + move_t),
           5. - L, 1e-9);
 
-    // A pivot offset in X shifts where the tip sits under the pivot
+    // A horizontal tool offset shifts where the tip sits under the pivot
     struct stepper_kinematics *ox = rtcp_alloc();
     rtcp_set_sk(ox, cartesian_stepper_alloc('x'));
-    rtcp_set_pivot(ox, 3., L);
-    check("px offset at B=0", sample(tq0, ox, t0), 0., 1e-9);
-    check("px offset at B=90", sample(tq90, ox, t0 + move_t),
-          3. * (cos(M_PI / 2.) - 1.) + L * sin(M_PI / 2.), 1e-9);
+    rtcp_set_tool(ox, 3., L, RTCP_FRAME_CARTESIAN);
+    check("horizontal offset at B=0", sample(tq0, ox, t0), 0., 1e-9);
+    check("horizontal offset at B=90", sample(tq90, ox, t0 + move_t),
+          3. * (cos(M_PI / 2.) - 1.) - L * sin(M_PI / 2.), 1e-9);
 
-    // Disabling (zero pivot) restores the identity and drops the B link
-    rtcp_set_pivot(rx, 0., 0.);
+    // The round trip through the standalone transforms must be exact
+    double rt[3] = {30., -12., 4.};
+    rtcp_tool_to_machine(3., L, RTCP_FRAME_RADIAL, 37., rt);
+    rtcp_machine_to_tool(3., L, RTCP_FRAME_RADIAL, 37., rt);
+    check("radial round trip: x", rt[0], 30., 1e-9);
+    check("radial round trip: y", rt[1], -12., 1e-9);
+    check("radial round trip: z", rt[2], 4., 1e-9);
+    // In the radial frame the correction changes the arm radius and
+    // leaves the bed angle alone
+    double rad[3] = {0., 50., 0.};
+    rtcp_tool_to_machine(0., L, RTCP_FRAME_RADIAL, 90., rad);
+    check("radial B=90: x", rad[0], 0., 1e-9);
+    check("radial B=90: radius", rad[1], 50. - L, 1e-9);
+    check("radial B=90: z", rad[2], -L, 1e-9);
+
+    // Disabling (zero tool offsets) restores the identity and drops the
+    // B link
+    rtcp_set_tool(rx, 0., 0., RTCP_FRAME_CARTESIAN);
     check("disabled: x carriage", sample(tq90, rx, t0 + move_t), 0., 1e-9);
     check("disabled: not active on B", (rx->active_flags & AF_B) != 0, 0, 0.);
 
@@ -577,7 +599,7 @@ test_corertheta_rtcp_branch_cut(void)
     struct stepper_kinematics *raw = corertheta_stepper_alloc('c', .25);
     struct stepper_kinematics *bed = rtcp_alloc();
     check("branch cut: rtcp_set_sk on the bed", rtcp_set_sk(bed, raw), 0, 0.);
-    rtcp_set_pivot(bed, 21.94, 65.6);
+    rtcp_set_tool(bed, 21.94, 65.6, RTCP_FRAME_RADIAL);
 
     struct trapq *tq = trapq_alloc();
     itersolve_set_trapq(bed, tq, bed_step_dist);
@@ -607,13 +629,15 @@ test_corertheta_rtcp_branch_cut(void)
           itersolve_get_commanded_pos(raw),
           itersolve_get_commanded_pos(bed), 1e-12);
     // The bed turns the short way through pi, not the long way back
-    // around.  atan2 of the rtcp-corrected endpoints puts the sweep at
-    // 0.472308 rad; the tolerance is one bed half step (0.000196).
+    // around.  The radial correction scales x and y together, so it moves
+    // the arm radius and leaves the bed angle alone - the sweep is just
+    // atan2 of the toolpath endpoints, 0.438957 rad.  The tolerance is
+    // one bed half step (0.000196).
     double end_angle = itersolve_get_commanded_pos(bed);
     double swept = end_angle - start_angle;
     if (swept < -M_PI)
         swept += 2. * M_PI;
-    check("branch cut: bed sweep across the cut", swept, 0.472308, 0.0004);
+    check("branch cut: bed sweep across the cut", swept, 0.438957, 0.0004);
 
     stepcompress_free(sc);
     trapq_free(tq);
