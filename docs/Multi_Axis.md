@@ -156,6 +156,7 @@ klippy/extras/gcode_move.py        A/B/C g-code words
 klippy/extras/homing.py            homing across six axes
 klippy/extras/motion_report.py     six-axis trapq dumps
 klippy/extras/rtcp.py              installs RTCP, reach checks
+klippy/extras/rtcp_probe.py        probe geometry on the tilting head
 ```
 
 ## Position vector layout
@@ -263,12 +264,14 @@ alongside the linear axes.
 | ---- | ------- | ------ |
 | `test/multi_axis/run_c_tests.sh` | any host with a C compiler | Shared time base, core r-theta coefficients, RTCP geometry, 3-axis regression, benchmark |
 | `test/multi_axis/test_gcode_pipeline.py` | any host with Python + cffi | Real `gcode.py`, `gcode_move.py`, `Move`, `LookAheadQueue`, `RotaryAxis` |
+| `test/multi_axis/test_rtcp_probe.py` | any host with Python + cffi | Tilting-head probe geometry, the radial probe transform, its config checks |
 | `test/klippy/multi_axis.test` | Linux (`scripts/test_klippy.py`) | Uncoupled A/C axes: config load, homing, step generation |
 | `test/klippy/multi_axis_rtheta.test` | Linux (`scripts/test_klippy.py`) | Coupled core r-theta stage |
 | `test/klippy/multi_axis_rtcp.test` | Linux (`scripts/test_klippy.py`) | RTCP on a B axis tilting head |
+| `test/klippy/multi_axis_rtcp_probe.test` | Linux (`scripts/test_klippy.py`) | Probing and round-bed mesh with the probe on the tilting head |
 
 ```bash
-bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py
+bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py     && python test/multi_axis/test_rtcp_probe.py
 ```
 
 ## RTCP (Rotational Tool Center Point)
@@ -363,6 +366,84 @@ are carried through the transform untouched.  Extending to a full
 three-rotation head would mean composing three rotations (and fixing an
 order convention), and belongs in `rtcp_calc_position()`.
 
+## Probing and mesh bed levelling on a tilting head
+
+A probe bolted to the tilting head is not at a fixed offset from the
+nozzle.  It swings with the head, and on the core r-theta machine the
+offset it ends up at is **radial** - along the arm - because the bed
+angle the probe sits at is the same as the nozzle's.  `[probe]`
+`x_offset`/`y_offset`, which are fixed cartesian numbers, cannot express
+that.
+
+`klippy/extras/rtcp_probe.py` supplies the geometry instead.  The model
+is two concentric circles about the B pivot: the nozzle tip rides one of
+radius `L = hypot(pivot_x_offset, pivot_length)`, the probe point rides
+one of radius `L + z_offset`, and `probe_b_offset` is the angle between
+them.  A negative probe `z_offset` - "the probe reads the bed low" - is
+exactly a probe circle that much smaller, so `z_offset` is *consumed by
+the geometry* and is not subtracted a second time as it is on a normal
+printer.
+
+With `psi` the rotation away from the probing angle
+(`B - probe_b_position`) and `theta = psi - probe_b_offset`, the probe
+sits at
+
+```
+radial offset = L*sin(theta) - (L+z_offset)*sin(psi)
+z offset      = L*cos(theta) - (L+z_offset)*cos(psi)
+```
+
+from the nozzle tip - which, with `[rtcp]` enabled, is the position the
+toolhead reports.
+
+### How it is applied
+
+`probe.py` looks up an optional printer object named `probe_transform`
+and, when one is present, uses it in place of the configured x/y/z
+offsets at four points:
+
+| Site | Without a transform | With one |
+| --- | --- | --- |
+| `DescendToEndstopHelper.descend_until_trigger` (descent target) | the z axis `position_min` | `descend_limit_z()`, so it is the *probe* that stops at `position_min` |
+| `DescendToEndstopHelper.descend_until_trigger` (result) | `manual_probe.create_probe_result` | `create_probe_result()` |
+| `ProbePointsHelper._move_next` | subtract x/y offsets | `bed_to_tool()` |
+| `ProbePointsHelper.start_probe` (`horizontal_move_z` check) | the probe `z_offset` | `get_z_endstop_position()` - how far the probe reaches below the nozzle |
+
+`G28 Z` needs no hook of its own: `homing.py` derives the homed z from
+the probe result's `bed_z`, so the transform reaches it through
+`create_probe_result()`.  `HomingViaProbeHelper.get_position_endstop()`
+deliberately stays static - it is read while the rails are still being
+built, before any transform exists.
+
+Everything downstream - `[bed_mesh]`, `[z_tilt]`, `[bed_tilt]`,
+`PROBE_ACCURACY` - consumes `ProbeResult` and needs no change.  Manual
+probing (`METHOD=manual`) ignores the transform: there the nozzle does
+the touching.
+
+### Consequences worth knowing
+
+* **`horizontal_move_z` is a nozzle height.**  While probing, the probe
+  hangs `-z offset` below the nozzle - about 20mm on the reference
+  machine - so `horizontal_move_z` must exceed that or the probe is
+  dragged through the bed.  `probe.py` refuses the calibration if it
+  does not.  `RTCP_PROBE_INFO` prints the figure.
+* **`G28 Z` needs the probe facing the bed** and, since Z is not homed
+  yet, the head has to already be above `orient_lift_z`.  The `HOME_Z`
+  macro in `config/example-corertheta.cfg` runs `RTCP_PROBE_ORIENT
+  MODE=PROBE` first.
+* **The sign of `probe_b_offset` decides whether the bed centre is
+  reachable.**  The arm radius cannot go negative, so a probe that sits
+  *outboard* of the nozzle can never be brought over the middle of the
+  bed.  Set `bed_radius` and klippy checks this at startup.
+* **The mesh turns with the bed.**  The g-code x/y frame of a polar
+  machine is fixed to the bed, and `[stepper_c]` does not home, so the
+  angular origin is wherever the bed happened to be at startup.  A saved
+  `BED_MESH_PROFILE` is therefore meaningless after a restart - the mesh
+  has to be recalibrated before each print.
+* **`PROBE_CALIBRATE` and `Z_OFFSET_APPLY_PROBE` do not apply.**  They
+  assume the probe is a fixed distance below the nozzle.  Calibrate
+  `z_offset` as the difference between the two circle radii instead.
+
 ## Deliberate limitations (current stage)
 
 * **Rotation does not affect the feedrate.**  `G1 X10 A360` takes exactly
@@ -376,8 +457,10 @@ order convention), and belongs in `rtcp_calc_position()`.
 * RTCP compensates B only; A and C rotations do not move the linear
   axes.
 * Rotational axes are not part of a kinematics class' linear limits, so
-  bed mesh, probing and `kinematics.axis_minimum/maximum` still describe
-  X/Y/Z only.
+  `kinematics.axis_minimum/maximum` still describes X/Y/Z only.  Probing
+  and bed mesh do account for the B angle - see "Probing and mesh bed
+  levelling on a tilting head" above - but only through the probe
+  geometry, not through the reach checks.
 
 ## Next
 

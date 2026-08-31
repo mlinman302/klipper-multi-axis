@@ -2552,6 +2552,74 @@ pivot_length:
 The `SET_RTCP [ENABLE=0|1] [PIVOT_LENGTH=<mm>] [PIVOT_X_OFFSET=<mm>]`
 command toggles or retunes the compensation.
 
+### [rtcp_probe]
+
+Probe geometry for a probe carried on the RTCP tilting head, as on the
+core r-theta machine. A probe bolted to the head has no fixed x/y offset
+from the nozzle: it swings with the head, and on a polar machine the
+resulting offset is *radial* - along the arm - rather than along a fixed
+cartesian axis. This section replaces the `[probe]` `x_offset`/`y_offset`
+with that geometry, so `PROBE`, `G28 Z` through
+`probe:z_virtual_endstop`, and `BED_MESH_CALIBRATE` all work on the
+tilting head. Requires `[rtcp]` and a probe section such as `[bltouch]`.
+
+The model is that the nozzle tip and the probe point ride two circles
+about the B pivot that share a centre. The pivot-to-tip radius comes from
+`[rtcp]`; the probe's is that radius plus the probe's `z_offset` (a
+negative `z_offset` - the probe reads the bed low - is a *shorter* probe
+radius). `z_offset` is therefore consumed by the geometry and is not
+subtracted a second time. Leave `x_offset` and `y_offset` unset.
+
+Because the probe hangs well below the nozzle while probing, `[bed_mesh]`
+`horizontal_move_z` - a nozzle height - must be larger than on a normal
+printer. `RTCP_PROBE_INFO` reports the exact clearance needed.
+
+```
+[rtcp_probe]
+probe_b_offset:
+#   Angle (in degrees) from the nozzle direction to the probe direction
+#   around the B pivot, measured in the direction of increasing B. A
+#   positive value places the probe inboard of the nozzle - at a smaller
+#   arm radius - while it is probing. This parameter must be provided.
+#probe_b_position:
+#   The B angle (in degrees) at which the probe points straight down. The
+#   default is derived from the [rtcp] pivot offsets and probe_b_offset;
+#   set it to the measured angle if the derived one is wrong.
+#bed_radius:
+#   Largest bed radius (in mm) the mesh will ask for. When set, klippy
+#   checks at startup that the arm can put the probe over the whole bed.
+#   The default is to make no such check.
+#check_probe_b_angle: True
+#   Whether to reject probing moves made with B away from
+#   probe_b_position. The geometry is exact at any B, but probing with
+#   the probe not facing the bed is nearly always a mistake. The default
+#   is True.
+#probe_b_angle_tolerance: 1.0
+#   How far (in degrees) B may sit from probe_b_position for the above
+#   check. The default is 1.0.
+#orient_lift_z: 40.0
+#   Nozzle height (in mm) RTCP_PROBE_ORIENT raises the head to before
+#   turning B, so the probe does not sweep through the bed. The default
+#   is 40.
+#orient_speed: 20.0
+#   Speed (in degrees per second) of the B rotation. The default is 20.
+#orient_lift_speed: 5.0
+#   Speed (in mm per second) of the lift. The default is 5.
+```
+
+`RTCP_PROBE_ORIENT [MODE=PROBE|TOOL|B] [B=<angle>] [LIFT_Z=<mm>]` turns
+the head so the probe (`PROBE`, the default), the nozzle (`TOOL`) or an
+explicit angle (`B`) faces the bed.
+
+`RTCP_PROBE_MOVE [X=<pos>] [Y=<pos>] [F=<speed>]` moves the head so the
+*probe* is over the given bed position. A g-code macro cannot work this
+out for itself, because it evaluates its whole template before running
+any of it and the offsets are only known once the head has been turned.
+
+`RTCP_PROBE_INFO [B=<angle>]` reports
+the derived geometry - the two radii, the probing B angle, the radial and
+z offsets, and the toolhead z at which the probe triggers on a flat bed.
+
 ### Coupled rotational axes ([carriage] on a/b/c)
 
 With `kinematics: generic_cartesian`, a carriage may be placed on a

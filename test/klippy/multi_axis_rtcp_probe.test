@@ -1,0 +1,49 @@
+# Tests for probing and mesh bed levelling with the probe on the
+# RTCP tilting head of a core r-theta machine
+DICTIONARY atmega2560.dict
+CONFIG multi_axis_rtcp_probe.cfg
+
+# Report the derived geometry before anything moves
+RTCP_PROBE_INFO
+RTCP_PROBE_INFO B=0
+
+# Home the arm and the tilt axis.  Z cannot be homed until the head has
+# been turned so the probe faces the bed.
+G28 X
+G28 B
+
+# Turn the probe to the bed and put it over the middle of the bed - after
+# homing the arm is parked at its outermost radius, well off the bed
+RTCP_PROBE_ORIENT MODE=PROBE
+RTCP_PROBE_MOVE X=0 Y=0 F=50
+G28 Z
+
+# A single probe at the bed centre, then away from it
+PROBE
+RTCP_PROBE_MOVE X=40 Y=0 F=50
+PROBE
+RTCP_PROBE_MOVE X=0 Y=-40 F=50
+PROBE
+
+# Probing must not be attempted with the nozzle, rather than the probe,
+# facing the bed
+G1 Z40 F300
+RTCP_PROBE_ORIENT MODE=TOOL
+
+# Mesh the round bed.  The generated points cover a 50mm radius; the arm
+# travels between 48.91 and 98.91mm of radius to reach them.
+RTCP_PROBE_ORIENT MODE=PROBE
+BED_MESH_CALIBRATE
+BED_MESH_OUTPUT
+
+# Print with the mesh applied and the nozzle facing the bed again
+RTCP_PROBE_ORIENT MODE=TOOL
+G1 Z10 F300
+G1 X0 Y0 F3000
+G1 X20 Y0 Z0.3 F1500
+G1 X20 Y20 E1 F1500
+G1 X-20 Y20 E2 F1500
+G1 X-20 Y-20 E3 F1500
+
+BED_MESH_CLEAR
+M84

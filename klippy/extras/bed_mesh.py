@@ -352,6 +352,14 @@ class BedMeshCalibrate:
         probe = self.printer.lookup_object('probe', None)
         if probe is not None:
             x_offset, y_offset = probe.get_offsets()[:2]
+        # A machine whose probe is not at a fixed offset from the nozzle
+        # works out the tool position itself - see probe.py.  Its offsets
+        # depend on the head's orientation, so they are only worth
+        # printing once the head is turned to face the bed with the probe.
+        probe_transform = self.printer.lookup_object('probe_transform', None)
+        if probe_transform is not None:
+            if not probe_transform.get_status().get('oriented'):
+                probe_transform = None
         print_func("bed_mesh: generated points\nIndex"
                    " |  Tool Adjusted  |   Probe")
         points = self.probe_mgr.get_base_points()
@@ -360,7 +368,11 @@ class BedMeshCalibrate:
                 end = len(points) - 1
                 print_func("...points %d through %d truncated" % (i, end))
                 break
-            adj_pt = "(%.1f, %.1f)" % (x - x_offset, y - y_offset)
+            if probe_transform is not None:
+                adj_pt = "(%.1f, %.1f)" % tuple(
+                    probe_transform.bed_to_tool((x, y)))
+            else:
+                adj_pt = "(%.1f, %.1f)" % (x - x_offset, y - y_offset)
             mesh_pt = "(%.1f, %.1f)" % (x, y)
             print_func(
                 "  %-4d| %-16s| %s" % (i, adj_pt, mesh_pt))

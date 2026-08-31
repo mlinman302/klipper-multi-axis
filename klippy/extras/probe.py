@@ -205,6 +205,27 @@ class LookupZSteppers:
             if stepper.is_active_axis('z'):
                 self.add_stepper_cb(stepper)
 
+# Optional dynamic probe offsets ("probe_transform")
+#
+# A probe is normally at a fixed x/y/z offset from the nozzle, which is
+# what ProbeOffsetsHelper describes.  A machine may instead register a
+# printer object named 'probe_transform' to compute that offset itself -
+# on the corertheta machine the probe is carried on the tilting head, so
+# its offset from the nozzle depends on the B angle and is radial rather
+# than cartesian (see klippy/extras/rtcp_probe.py).  When present it
+# supersedes the configured x/y/z offsets and must implement:
+#   bed_to_tool(coord)         - toolhead x/y that puts the probe over
+#                                bed position coord
+#   create_probe_result(pos)   - manual_probe.ProbeResult for a trigger
+#                                with the toolhead at pos
+#   get_z_endstop_position()   - toolhead z at which the probe triggers
+#                                on a bed at z == 0, used to check that
+#                                moves clear the bed
+#   descend_limit_z(z_min)     - lowest toolhead z a probing move may
+#                                descend to for a probe limit of z_min
+def lookup_probe_transform(printer):
+    return printer.lookup_object('probe_transform', None)
+
 # Support homing via probe using the probe:z_virtual_endstop pseudo-pin
 class HomingViaProbeHelper:
     def __init__(self, config, position_endstop, query_endstop_cb=None):
@@ -233,6 +254,10 @@ class HomingViaProbeHelper:
             return False
         return self.query_endstop_cb(print_time)
     def get_position_endstop(self):
+        # Note this is read while the rails are still being built, so it
+        # cannot consult a probe_transform - those are only resolved at
+        # connect time.  It does not need to: homing.py derives the homed
+        # z from the probe result's bed_z, which the transform supplies.
         return self.position_endstop
     # Printer pins module setup_pin() interface
     def setup_pin(self, pin_type, pin_params):
@@ -256,16 +281,25 @@ class DescendToEndstopHelper:
         LookupZSteppers(config, self.mcu_probe.add_stepper)
     def descend_until_trigger(self, gcmd):
         toolhead = self.printer.lookup_object('toolhead')
+        probe_transform = lookup_probe_transform(self.printer)
         pos = toolhead.get_position()
-        pos[2] = self.z_min_position
+        if probe_transform is not None:
+            # The probe is not at a fixed offset below the nozzle, so the
+            # nozzle must stop short of the z axis position_min
+            pos[2] = probe_transform.descend_limit_z(self.z_min_position)
+        else:
+            pos[2] = self.z_min_position
         speed = self.param_helper.get_probe_params(gcmd)['probe_speed']
         phoming = self.printer.lookup_object('homing')
         check_movement = (self.always_check_movement
                           or not phoming.check_probe_first_home(gcmd))
         ppos = phoming.probing_move(self.mcu_probe, pos, speed,
                                     check_movement=check_movement)
-        offsets = self.probe_offsets.get_offsets()
-        res = manual_probe.create_probe_result(ppos, offsets)
+        if probe_transform is not None:
+            res = probe_transform.create_probe_result(ppos)
+        else:
+            offsets = self.probe_offsets.get_offsets()
+            res = manual_probe.create_probe_result(ppos, offsets)
         self.results.append(res)
     def pull_trigger_positions(self):
         res = self.results
@@ -440,6 +474,7 @@ class ProbePointsHelper:
         # Internal probing state
         self.lift_speed = self.speed
         self.probe_offsets = (0., 0., 0.)
+        self.probe_transform = None
         self.manual_results = []
     def minimum_points(self,n):
         if len(self.probe_points) < n:
@@ -471,8 +506,11 @@ class ProbePointsHelper:
         # Move to next XY probe point
         nextpos = list(self.probe_points[probe_num])
         if self.use_offsets:
-            nextpos[0] -= self.probe_offsets[0]
-            nextpos[1] -= self.probe_offsets[1]
+            if self.probe_transform is not None:
+                nextpos[:2] = self.probe_transform.bed_to_tool(nextpos)
+            else:
+                nextpos[0] -= self.probe_offsets[0]
+                nextpos[1] -= self.probe_offsets[1]
         self._move(nextpos, self.speed)
     def start_probe(self, gcmd):
         manual_probe.verify_no_manual_probe(self.printer)
@@ -483,18 +521,26 @@ class ProbePointsHelper:
         self.horizontal_move_z = gcmd.get_float('HORIZONTAL_MOVE_Z',
                                                 def_move_z)
         if probe is None or method == 'manual':
-            # Manual probe
+            # Manual probe - the nozzle does the touching, so the probe
+            # offsets (dynamic ones included) do not apply
             self.lift_speed = self.speed
             self.probe_offsets = (0., 0., 0.)
+            self.probe_transform = None
             self.manual_results = []
             self._manual_probe_start()
             return
         # Perform automatic probing
         self.lift_speed = probe.get_probe_params(gcmd)['lift_speed']
         self.probe_offsets = probe.get_offsets(gcmd)
-        if self.horizontal_move_z < self.probe_offsets[2]:
-            raise gcmd.error("horizontal_move_z can't be less than"
-                             " probe's z_offset")
+        self.probe_transform = lookup_probe_transform(self.printer)
+        if self.probe_transform is not None:
+            min_horiz_z = self.probe_transform.get_z_endstop_position()
+        else:
+            min_horiz_z = self.probe_offsets[2]
+        if self.horizontal_move_z < min_horiz_z:
+            raise gcmd.error("horizontal_move_z of %.3f can't be less than the"
+                             " %.3f the probe reaches below the toolhead"
+                             % (self.horizontal_move_z, min_horiz_z))
         probe_session = probe.start_probe_session(gcmd)
         probe_num = 0
         while 1:
