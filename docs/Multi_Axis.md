@@ -393,8 +393,47 @@ radial offset = s * (L*sin(theta) - (L+z_offset)*sin(psi))
 z offset      =      L*cos(theta) - (L+z_offset)*cos(psi)
 ```
 
-from the nozzle tip - which, with `[rtcp]` enabled, is the position the
-toolhead reports.
+from the nozzle tip.
+
+### Two frames, and why probing should use the second
+
+That formula measures from the nozzle tip, which is what the toolhead
+reports **while RTCP compensation is on**.  With it off the toolhead
+reports the carriage instead, and the offset is a different - simpler -
+thing.  The pivot rides the carriage at a fixed
+`(pivot_x_offset, pivot_length)`, the very numbers `[rtcp]` already
+carries, so only the pivot-to-probe arm turns with B:
+
+```
+radial offset = pivot_x_offset  - s * (L+z_offset)*sin(psi)
+z offset      = pivot_length    -     (L+z_offset)*cos(psi)
+```
+
+**Homing and bed mesh should run with RTCP off.**  Three reasons:
+
+1. With RTCP on, turning B *is* an X/Z move, so `G28 B` cannot be
+   followed by a probe orientation until X, Y and Z are all homed - and
+   Z is exactly what is being homed.  With RTCP off a B move touches no
+   linear axis and works with nothing homed.
+2. At the probing angle `sin(psi)` is zero, so the radial term collapses
+   to `pivot_x_offset` and the mirror drops out entirely.
+   `invert_b_direction` - the one parameter that cannot be derived - has
+   no effect on probing.
+3. When `pivot_x_offset` is zero, the probe lands on the carriage
+   reference point, `z_offset` higher.  That is the plain probe case:
+   `horizontal_move_z` goes back to an ordinary value, and the arm radius
+   is simply the bed radius being probed.
+
+`[rtcp_probe]` picks the frame from `rtcp.enabled` at the moment each
+offset is needed, so both work; the startup reach check covers both.
+
+The catch is that third point's other half: with RTCP off the arm radius
+*is* the bed radius, so probing the centre of the bed drives the arm to
+radius zero, where a polar machine's bed angle is undefined.  Home Z off
+centre, and if the mesh's centre point misbehaves, either set
+`max_angular_velocity` in `[printer]` to slow moves near the middle or
+declare a small `faulty_region` around it so `[bed_mesh]` substitutes
+neighbouring points.
 
 `[rtcp]` supplies more than `L` here: `pivot_x_offset` and
 `pivot_length` also fix the B angle at which the tip hangs straight below
@@ -442,22 +481,25 @@ the touching.
 
 ### Consequences worth knowing
 
-* **`horizontal_move_z` is a nozzle height.**  While probing, the probe
-  hangs `-z offset` below the nozzle - about 20mm on the reference
-  machine - so `horizontal_move_z` must exceed that or the probe is
-  dragged through the bed.  `probe.py` refuses the calibration if it
-  does not.  `RTCP_PROBE_INFO` prints the figure.
-* **`G28 Z` needs the probe facing the bed** and, since Z is not homed
-  yet, the head has to already be above `orient_lift_z`.  The `HOME_Z`
-  macro in `config/example-corertheta.cfg` runs `RTCP_PROBE_ORIENT
-  MODE=PROBE` first.
-* **`invert_b_direction` decides whether the bed centre is reachable.**
-  The arm radius cannot go negative, so a probe that sits *outboard* of
-  the nozzle can never be brought over the middle of the bed, however far
-  the arm is driven back.  Set `bed_radius` and klippy checks this at
-  startup.  On the reference machine the probe is 48.9mm inboard, so the
-  arm covers bed radii 0..50 from an arm radius of 48.91..98.91 and never
-  approaches the polar singularity at the centre.
+* **`horizontal_move_z` is measured in whichever frame is active.**
+  With RTCP on it is a nozzle height and the probe hangs about 20mm
+  below the nozzle, so it must exceed that or the probe is dragged
+  through the bed; `probe.py` refuses the calibration if it does not.
+  With RTCP off - the recommended way to probe - it is a carriage height
+  and the probe reaches only `z_offset` below it, so an ordinary value
+  works.  `RTCP_PROBE_INFO` prints the figure for the active frame.
+* **`G28 Z` needs the probe facing the bed**, with RTCP off so that
+  turning B does not become an X/Z move before Z is homed, and - since Z
+  is not homed yet - the head already clear of the bed.  The `HOME_Z`
+  macro in `config/example-corertheta.cfg` does all three.
+  `RTCP_PROBE_ORIENT` refuses to turn B with RTCP on and X/Y/Z unhomed,
+  and says to run `SET_RTCP ENABLE=0`.
+* **`invert_b_direction` decides whether the bed centre is reachable
+  with RTCP on.**  The arm radius cannot go negative, so a probe that
+  sits *outboard* of the reported position can never be brought over the
+  middle of the bed.  Set `bed_radius` and klippy checks both frames at
+  startup.  It does not arise with RTCP off, where the radial offset at
+  the probing angle is just `pivot_x_offset`.
 * **The mesh turns with the bed.**  The g-code x/y frame of a polar
   machine is fixed to the bed, and `[stepper_c]` does not home, so the
   angular origin is wherever the bed happened to be at startup.  A saved

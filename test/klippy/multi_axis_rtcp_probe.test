@@ -7,15 +7,22 @@ CONFIG multi_axis_rtcp_probe.cfg
 RTCP_PROBE_INFO
 RTCP_PROBE_INFO B=0
 
+# Probing does not need RTCP - the probe's offset from the carriage is
+# just the pivot plus the probe arm - and turning it off keeps a B move
+# from becoming an X/Z one before those axes are homed.
+SET_RTCP ENABLE=0
+
 # Home the arm and the tilt axis.  Z cannot be homed until the head has
 # been turned so the probe faces the bed.
 G28 X
 G28 B
 
-# Turn the probe to the bed and put it over the middle of the bed - after
-# homing the arm is parked at its outermost radius, well off the bed
+# Turn the probe to the bed, then put it over the bed - after homing the
+# arm is parked at its outermost radius, well off it.  Home Z off centre:
+# with RTCP off the arm radius is the bed radius being probed, and a
+# polar machine handles radius zero badly.
 RTCP_PROBE_ORIENT MODE=PROBE
-RTCP_PROBE_MOVE X=0 Y=0 F=50
+RTCP_PROBE_MOVE X=25 Y=0 F=50
 G28 Z
 
 # A single probe at the bed centre, then away from it
@@ -30,14 +37,15 @@ PROBE
 G1 Z40 F300
 RTCP_PROBE_ORIENT MODE=TOOL
 
-# Mesh the round bed.  The generated points cover a 50mm radius; the arm
-# travels between 48.91 and 98.91mm of radius to reach them.
+# Mesh the round bed.  With RTCP off the arm radius is the bed radius, so
+# the generated points take it from 0 to 50.
 RTCP_PROBE_ORIENT MODE=PROBE
 BED_MESH_CALIBRATE
 BED_MESH_OUTPUT
 
-# Print with the mesh applied and the nozzle facing the bed again
+# Print with the mesh applied, RTCP back on and the nozzle facing the bed
 RTCP_PROBE_ORIENT MODE=TOOL
+SET_RTCP ENABLE=1
 G1 Z10 F300
 G1 X0 Y0 F3000
 G1 X20 Y0 Z0.3 F1500
