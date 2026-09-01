@@ -41,10 +41,10 @@ G1 X55 F3000
 SET_RTCP ENABLE=1
 G1 X50 F3000
 
-# Retune the pivot length at runtime
-SET_RTCP PIVOT_LENGTH=42.5
+# Retune the tool geometry at runtime
+SET_RTCP VERTICAL_OFFSET=42.5
 G1 B10 F600
-SET_RTCP PIVOT_LENGTH=40.0
+SET_RTCP VERTICAL_OFFSET=40.0
 G1 B0 F600
 
 # Re-home with RTCP active

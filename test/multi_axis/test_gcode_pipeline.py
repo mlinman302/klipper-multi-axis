@@ -449,14 +449,16 @@ class TestRotaryLimits(unittest.TestCase):
             self.assertEqual(sts['rotates_about'], about)
 
 
-def make_rtcp(printer, toolhead, pivot_z=40., pivot_x=0.):
+def make_rtcp(printer, toolhead, tool_v=40., tool_h=0.,
+              frame=rtcp_mod.FRAME_CARTESIAN):
     # Build an RTCP object without config/chelper, then exercise its real
     # transform and range-check logic
     r = rtcp_mod.RTCP.__new__(rtcp_mod.RTCP)
     r.printer = printer
     r.toolhead = toolhead
-    r.pivot_z = pivot_z
-    r.pivot_x = pivot_x
+    r.tool_v = tool_v
+    r.tool_h = tool_h
+    r.frame = frame
     r.enabled = True
     r.orig_stepper_kinematics = []
     r.rtcp_stepper_kinematics = []
@@ -475,53 +477,84 @@ class TestRTCP(unittest.TestCase):
     def test_identity_at_zero_tilt(self):
         printer, gcode, gmove, th, resp = build_env(('b',))
         r = make_rtcp(printer, th)
-        m = r.tip_to_machine(self._pos(10., 20., 30., 0.))
+        m = r.tool_to_machine(self._pos(10., 20., 30., 0.))
         self.assertAlmostEqual(m[0], 10.)
         self.assertAlmostEqual(m[1], 20.)
         self.assertAlmostEqual(m[2], 30.)
 
     def test_ninety_degrees(self):
-        # Tool points along -X from the pivot, so the carriage goes +L in
-        # X and -L in Z to hold the tip
+        # A positive B tilts the nozzle outboard, so at B=90 the tool
+        # points along +X from the pivot and the carriage must retreat by
+        # L in X and drop by L in Z to hold the tip.  Same numbers as the
+        # kin_rtcp.c check in test_kin_6axis.c - the two implementations
+        # have to agree.
         printer, gcode, gmove, th, resp = build_env(('b',))
-        r = make_rtcp(printer, th, pivot_z=40.)
-        m = r.tip_to_machine(self._pos(10., 5., 30., 90.))
-        self.assertAlmostEqual(m[0], 50.)
+        r = make_rtcp(printer, th, tool_v=40.)
+        m = r.tool_to_machine(self._pos(10., 5., 30., 90.))
+        self.assertAlmostEqual(m[0], -30.)
         self.assertAlmostEqual(m[1], 5.)     # Y is untouched
         self.assertAlmostEqual(m[2], -10.)
 
+    def test_radial_frame_moves_the_arm_radius_not_the_bed_angle(self):
+        # On a polar machine the tip swings along the arm, so the
+        # correction scales x and y together
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        r = make_rtcp(printer, th, tool_v=40.,
+                      frame=rtcp_mod.FRAME_RADIAL)
+        m = r.tool_to_machine(self._pos(0., 50., 0., 90.))
+        self.assertAlmostEqual(m[0], 0.)
+        self.assertAlmostEqual(m[1], 10.)
+        self.assertAlmostEqual(m[2], -40.)
+
     def test_round_trip(self):
         printer, gcode, gmove, th, resp = build_env(('b',))
-        r = make_rtcp(printer, th, pivot_z=37.5, pivot_x=2.5)
-        for b in (-90., -33.3, 0., 12.7, 45., 180.):
-            p = self._pos(11., 22., 33., b)
-            back = r.machine_to_tip(r.tip_to_machine(p))
-            for i in range(3):
-                self.assertAlmostEqual(back[i], p[i], places=9)
+        for frame in (rtcp_mod.FRAME_CARTESIAN, rtcp_mod.FRAME_RADIAL):
+            r = make_rtcp(printer, th, tool_v=37.5, tool_h=2.5,
+                          frame=frame)
+            for b in (-90., -33.3, 0., 12.7, 45., 180.):
+                # Far enough out that the radial correction never drives
+                # the arm radius through zero, which is not invertible -
+                # _check_move rejects those moves instead
+                p = self._pos(110., 22., 33., b)
+                back = r.machine_to_tool(r.tool_to_machine(p))
+                for i in range(3):
+                    self.assertAlmostEqual(back[i], p[i], places=9)
+
+    def test_a_radius_through_the_centre_is_rejected(self):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        r = make_rtcp(printer, th, tool_v=40.,
+                      frame=rtcp_mod.FRAME_RADIAL)
+        th.kin.status = {'axis_minimum': [-200., -200., -200.],
+                         'axis_maximum': [200., 200., 200.]}
+        th.register_move_check(r._check_move)
+        # At B=90 the carriage must sit 40mm inboard of the tip, which
+        # from a radius of 10 is on the far side of the bed
+        self.assertRaises(gcode_mod.CommandError,
+                          gcode.run_script, "G1 X10 Y0 B90 F600")
 
     def test_disabled_is_identity(self):
         printer, gcode, gmove, th, resp = build_env(('b',))
         r = make_rtcp(printer, th)
         r.enabled = False
         p = self._pos(10., 20., 30., 90.)
-        self.assertEqual(r.tip_to_machine(p), list(p))
-        self.assertEqual(r.machine_to_tip(p), list(p))
+        self.assertEqual(r.tool_to_machine(p), list(p))
+        self.assertEqual(r.machine_to_tool(p), list(p))
 
     def test_check_move_rejects_unreachable_machine_position(self):
         printer, gcode, gmove, th, resp = build_env(('b',))
-        r = make_rtcp(printer, th, pivot_z=40.)
+        r = make_rtcp(printer, th, tool_v=40.)
         th.kin.status = {'axis_minimum': [0., 0., 0.],
                          'axis_maximum': [200., 200., 200.]}
         th.register_move_check(r._check_move)
-        # Tip at X=190 is fine on its own, but tilting to B=90 puts the
-        # carriage at 230, past the end of the rail
+        # Tip at X=10 is fine on its own, but tilting to B=90 puts the
+        # carriage at -30, past the end of the rail
         self.assertRaises(gcode_mod.CommandError,
-                          gcode.run_script, "G1 X190 B90 F600")
+                          gcode.run_script, "G1 X10 B90 F600")
 
     def test_check_move_allows_reachable(self):
         printer, gcode, gmove, th, resp = build_env(('b',))
-        r = make_rtcp(printer, th, pivot_z=40.)
-        th.kin.status = {'axis_minimum': [0., 0., -100.],
+        r = make_rtcp(printer, th, tool_v=40.)
+        th.kin.status = {'axis_minimum': [-100., 0., -100.],
                          'axis_maximum': [200., 200., 200.]}
         th.register_move_check(r._check_move)
         gcode.run_script("G1 X100 Z50 B90 F600")
@@ -531,7 +564,7 @@ class TestRTCP(unittest.TestCase):
         # A B-only move still moves the carriages under RTCP, so it must
         # go through the machine-position check
         printer, gcode, gmove, th, resp = build_env(('b',))
-        r = make_rtcp(printer, th, pivot_z=40.)
+        r = make_rtcp(printer, th, tool_v=40.)
         th.kin.status = {'axis_minimum': [0., 0., 0.],
                          'axis_maximum': [200., 200., 200.]}
         th.register_move_check(r._check_move)

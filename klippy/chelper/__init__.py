@@ -182,12 +182,8 @@ defs_kin_rtcp = """
     struct stepper_kinematics *rtcp_alloc(void);
     int rtcp_set_sk(struct stepper_kinematics *sk
         , struct stepper_kinematics *orig_sk);
-    void rtcp_set_pivot(struct stepper_kinematics *sk
-        , double pivot_x, double pivot_z);
-    void rtcp_tip_to_machine(double pivot_x, double pivot_z, double b
-        , double *pos_xz);
-    void rtcp_machine_to_tip(double pivot_x, double pivot_z, double b
-        , double *pos_xz);
+    void rtcp_set_tool(struct stepper_kinematics *sk
+        , double tool_h, double tool_v, int frame);
 """
 
 defs_kin_bproject = """

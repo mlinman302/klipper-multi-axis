@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.normpath(KLIPPY_DIR))
 # stepper.py imports mcu, which needs pyserial; nothing under test uses it
 sys.modules.setdefault('mcu', types.ModuleType('mcu'))
 
+from extras import rtcp as rtcp_mod
 from extras import rtcp_probe as rtcp_probe_mod
 
 
@@ -90,15 +91,22 @@ class FakeToolhead:
                 self.position[i] = v
 
 class FakeRTCP:
-    def __init__(self, pivot_x, pivot_z, enabled=True):
-        self.pivot_x, self.pivot_z = pivot_x, pivot_z
-        self.enabled = enabled
+    # Stands in for [rtcp]: rtcp_probe only reads the frame and the
+    # enable flag off it, and asks it to enforce the latter
+    def __init__(self, frame, enabled=True):
+        self.frame, self.enabled = frame, enabled
+    def check_disabled(self, what):
+        if self.enabled:
+            raise ConfigError("%s must run with RTCP compensation off"
+                              % (what,))
 
 class FakeProbe:
-    def __init__(self, z_offset):
-        self.z_offset = z_offset
+    def __init__(self, offsets, b_offset):
+        self.offsets, self.b_offset = offsets, b_offset
     def get_offsets(self, gcmd=None):
-        return (0., 0., self.z_offset)
+        return tuple(self.offsets)
+    def get_b_offset(self):
+        return self.b_offset
 
 class FakeGCode:
     def __init__(self):
@@ -127,6 +135,7 @@ class FakePrinter:
         self.event_handlers.setdefault(event, []).append(callback)
 
 class FakeConfig:
+    error = ConfigError
     def __init__(self, printer, values):
         self.printer = printer
         self.values = values
@@ -134,16 +143,24 @@ class FakeConfig:
         return self.printer
     def get_name(self):
         return 'rtcp_probe'
+    def get(self, option, default=Ellipsis, **kwargs):
+        if option in self.values:
+            return self.values[option]
+        if default is Ellipsis:
+            raise ConfigError("Option '%s' is not valid" % (option,))
+        return default
     def getfloat(self, option, default=Ellipsis, **kwargs):
         if option in self.values:
             return float(self.values[option])
         if default is Ellipsis:
             raise ConfigError("Option '%s' is not valid" % (option,))
         return None if default is None else float(default)
-    def getboolean(self, option, default=Ellipsis):
+    def getboolean(self, option, default=Ellipsis, **kwargs):
         if option in self.values:
             return bool(self.values[option])
         return default
+    def has_value(self, option):
+        return option in self.values
 
 class FakeGCmd:
     def __init__(self, params=None):
@@ -162,219 +179,231 @@ class FakeGCmd:
         self.responses.append(msg)
 
 
-# The reference machine: config/example-corertheta.cfg
-PIVOT_X, PIVOT_Z = 21.94, 65.6
-Z_OFFSET = -0.1
+# The reference machine: config/example-corertheta.cfg.  The nozzle
+# points straight down at B=0 by definition, and the BLTouch pin does so
+# at B=45 - that angle is the probe's b_offset.  At that angle the pin
+# hangs straight below the pivot, which is straight above the carriage,
+# so the probe has no x/y offset from the toolhead and triggers 0.1mm
+# above it.
 PROBE_B_OFFSET = 45.
-PROBE_B_POSITION = -26.5
-TOOL_RADIUS = math.hypot(PIVOT_X, PIVOT_Z)
+PROBE_OFFSETS = (0., 0., -0.1)
+BED_RADIUS = 50.
 
 
-def build(config_values=None, pivot=(PIVOT_X, PIVOT_Z), z_offset=Z_OFFSET,
-          b_range=(-48., 100.), r_range=(0., 149.21), connect=True):
+def build(config_values=None, offsets=PROBE_OFFSETS,
+          b_offset=PROBE_B_OFFSET, frame=rtcp_mod.FRAME_RADIAL,
+          b_range=(-45., 100.), r_range=(0., 149.21), connect=True,
+          bed_radius=BED_RADIUS):
     printer = FakePrinter()
-    printer.add_object('rtcp', FakeRTCP(pivot[0], pivot[1]))
-    printer.add_object('probe', FakeProbe(z_offset))
+    printer.add_object('rtcp', FakeRTCP(frame))
+    printer.add_object('probe', FakeProbe(offsets, b_offset))
     kin = FakeKinematics({'b': FakeRail(*b_range), 'r': FakeRail(*r_range)})
     printer.add_object('toolhead', FakeToolhead(kin))
-    values = {'probe_b_offset': PROBE_B_OFFSET,
-              'probe_b_position': PROBE_B_POSITION,
-              'bed_radius': 50.}
+    values = {'bed_radius': bed_radius}
     if config_values is not None:
         values.update(config_values)
     values = {k: v for k, v in values.items() if v is not None}
     obj = rtcp_probe_mod.load_config(FakeConfig(printer, values))
     if connect:
         obj._connect()
-        # Park B where the probe faces the bed, as the orient command does
-        obj.toolhead.position[rtcp_probe_mod.B_POS_INDEX] = \
-            obj.probe_b_position
+        # Park B where the probe faces the bed, as the orient command
+        # does, and drop into the carriage frame that probing runs in
+        obj.toolhead.position[rtcp_probe_mod.B_POS_INDEX] = b_offset
+        printer.lookup_object('rtcp').enabled = False
     return printer, obj
 
 
 ######################################################################
-# Tests
+# The angles
 ######################################################################
 
-class TestGeometry(unittest.TestCase):
+class TestAngles(unittest.TestCase):
     def setUp(self):
         self.printer, self.rp = build()
-    def test_radii(self):
-        # The probe rides a circle concentric with the nozzle's, shorter
-        # by the probe z_offset
-        self.assertAlmostEqual(self.rp.tool_radius, TOOL_RADIUS, places=9)
-        self.assertAlmostEqual(self.rp.probe_radius, TOOL_RADIUS + Z_OFFSET,
-                               places=9)
-    def test_probe_faces_the_bed_at_probe_b_position(self):
-        # The probe is straight below the pivot there, so its offset from
-        # the pivot is purely vertical
-        off_r, off_z = self.rp.get_offsets(self.rp.probe_b_position)
-        expect_r = -TOOL_RADIUS * math.sin(math.radians(PROBE_B_OFFSET))
-        expect_z = (TOOL_RADIUS * math.cos(math.radians(PROBE_B_OFFSET))
-                    - (TOOL_RADIUS + Z_OFFSET))
-        self.assertAlmostEqual(off_r, expect_r, places=9)
-        self.assertAlmostEqual(off_z, expect_z, places=9)
-    def test_probe_is_inboard_and_below_while_probing(self):
-        off_r, off_z = self.rp.get_offsets(self.rp.probe_b_position)
-        self.assertLess(off_r, 0.)      # towards the centre of the bed
-        self.assertLess(off_z, 0.)      # below the nozzle
-    def test_nozzle_faces_the_bed_a_probe_b_offset_away(self):
-        # Turning B by probe_b_offset swaps which of the two faces down,
-        # so there the nozzle is the lower of the pair
-        b_tool = self.rp.probe_b_position + PROBE_B_OFFSET
-        off_z = self.rp.get_offsets(b_tool)[1]
-        self.assertGreater(off_z, 0.)
-    def test_z_endstop_is_where_the_nozzle_sits_at_a_trigger(self):
-        off_z = self.rp.get_offsets(self.rp.probe_b_position)[1]
-        self.assertAlmostEqual(self.rp.get_z_endstop_position(), -off_z,
-                               places=9)
-        self.assertGreater(self.rp.get_z_endstop_position(), 20.)
-    def test_descend_limit_stops_the_probe_not_the_nozzle(self):
-        # The nozzle must stop short so it is the probe that reaches the
-        # z axis position_min
-        limit = self.rp.descend_limit_z(-8.)
-        off_z = self.rp.get_offsets(self.rp.probe_b_position)[1]
-        self.assertAlmostEqual(limit + off_z, -8., places=9)
-        self.assertGreater(limit, 0.)
-    def test_derived_probe_b_position(self):
-        # Left out of the config it follows from the pivot offsets: the
-        # nozzle faces the bed at -atan2(pivot_x, pivot_z)
-        _, rp = build({'probe_b_position': None}, pivot=(-PIVOT_X, PIVOT_Z))
-        nozzle_b = math.degrees(math.atan2(PIVOT_X, PIVOT_Z))
-        self.assertAlmostEqual(rp.probe_b_position,
-                               nozzle_b - PROBE_B_OFFSET, places=9)
 
+    def test_the_nozzle_points_down_at_b_zero(self):
+        # Not derived from anything - it is the definition
+        self.assertEqual(self.rp.get_nozzle_b_position(), 0.)
 
-class TestTransform(unittest.TestCase):
-    def setUp(self):
-        self.printer, self.rp = build()
-        self.off_r = self.rp.get_offsets(self.rp.probe_b_position)[0]
-    def _round_trip(self, bed_x, bed_y):
-        tool = self.rp.bed_to_tool((bed_x, bed_y))
-        pos = [tool[0], tool[1], 12.5, 0., 0., 0., 0.]
-        return tool, self.rp.create_probe_result(pos)
-    def test_round_trip(self):
-        for bed_x, bed_y in [(0., 0.), (50., 0.), (0., -50.), (-25., 10.),
-                             (35.355, 35.355), (3., -4.)]:
-            tool, res = self._round_trip(bed_x, bed_y)
-            self.assertAlmostEqual(res.bed_x, bed_x, places=9)
-            self.assertAlmostEqual(res.bed_y, bed_y, places=9)
-    def test_offset_is_purely_radial(self):
-        # The probe shares the nozzle's bed angle, so only the radius
-        # changes - the bed point and the tool point are colinear with
-        # the centre and on the same side of it
-        for bed_x, bed_y in [(50., 0.), (-25., 10.), (3., -4.)]:
-            tool = self.rp.bed_to_tool((bed_x, bed_y))
-            self.assertAlmostEqual(bed_x * tool[1] - bed_y * tool[0], 0.,
-                                   places=9)
-            self.assertGreater(bed_x * tool[0] + bed_y * tool[1], 0.)
-            self.assertAlmostEqual(math.hypot(*tool),
-                                   math.hypot(bed_x, bed_y) - self.off_r,
-                                   places=9)
-    def test_bed_centre_is_reached_from_a_safe_radius(self):
-        # The whole point of mounting the probe inboard: the arm never has
-        # to approach the polar singularity at the centre of the bed
-        tool = self.rp.bed_to_tool((0., 0.))
-        self.assertAlmostEqual(math.hypot(*tool), -self.off_r, places=9)
-        self.assertGreater(math.hypot(*tool), 40.)
-    def test_arm_stays_within_its_travel_over_the_whole_bed(self):
-        radii = [math.hypot(*self.rp.bed_to_tool((r, 0.)))
-                 for r in [0., 12.5, 25., 37.5, 50.]]
-        self.assertGreater(min(radii), 0.)
-        self.assertLess(max(radii), 149.21)
-    def test_bed_z_is_the_nozzle_z_plus_the_probe_offset(self):
-        off_z = self.rp.get_offsets(self.rp.probe_b_position)[1]
-        pos = [60., 0., 21.5, 0., 0., 0., 0.]
-        res = self.rp.create_probe_result(pos)
-        self.assertAlmostEqual(res.bed_z, 21.5 + off_z, places=9)
-        self.assertEqual((res.test_x, res.test_y, res.test_z),
-                         (60., 0., 21.5))
-    def test_a_flat_bed_at_the_nominal_height_reads_zero(self):
-        # Descending until the probe triggers leaves the nozzle at the z
-        # endstop position, which must map back to a bed z of zero
-        pos = [60., 0., self.rp.get_z_endstop_position(), 0., 0., 0., 0.]
-        self.assertAlmostEqual(self.rp.create_probe_result(pos).bed_z, 0.,
-                               places=9)
+    def test_the_probing_angle_is_the_probes_b_offset(self):
+        self.assertAlmostEqual(self.rp.get_probe_b_position(),
+                               PROBE_B_OFFSET, places=9)
 
-
-class TestChecks(unittest.TestCase):
-    def test_probing_b_outside_the_axis_range_is_rejected(self):
-        # This is what a sign error in probe_b_offset looks like
+    def test_a_probe_b_offset_outside_the_b_range_is_rejected(self):
         with self.assertRaises(ConfigError) as cm:
-            build({'probe_b_position': None})
-        self.assertIn("outside the", str(cm.exception))
-    def test_a_probe_outboard_of_the_nozzle_cannot_reach_the_centre(self):
-        # The arm radius cannot go negative, so the middle of the bed is
-        # out of reach however far the arm is driven back
-        with self.assertRaises(ConfigError) as cm:
-            build({'probe_b_offset': -PROBE_B_OFFSET,
-                   'probe_b_position': 26.5})
-        self.assertIn("only reach bed radii", str(cm.exception))
-    def test_probing_with_the_wrong_b_is_rejected(self):
+            build(b_offset=120.)
+        self.assertIn("b_offset", str(cm.exception))
+
+    def test_the_removed_options_name_their_replacements(self):
+        for old in ('probe_b_offset', 'probe_b_position',
+                    'invert_b_direction'):
+            with self.assertRaises(ConfigError) as cm:
+                build({old: 1.})
+            self.assertIn(old, str(cm.exception))
+
+
+######################################################################
+# The radial frame
+######################################################################
+
+class TestRadialFrame(unittest.TestCase):
+    def test_zero_offsets_are_the_identity(self):
         _, rp = build()
-        rp.toolhead.position[rtcp_probe_mod.B_POS_INDEX] = \
-            rp.probe_b_position + 10.
+        for pt in ((0., 0.), (25., 0.), (-30., 12.), (0., -50.)):
+            self.assertAlmostEqual(rp.bed_to_tool(pt)[0], pt[0], places=9)
+            self.assertAlmostEqual(rp.bed_to_tool(pt)[1], pt[1], places=9)
+
+    def test_a_radial_offset_only_changes_the_arm_radius(self):
+        # x_offset is along the arm, so the bed angle is untouched.
+        # bed_radius is left out: an outboard probe cannot reach the
+        # centre of the bed, which is the next test.
+        _, rp = build(offsets=(8., 0., -0.1), bed_radius=None)
+        tool = rp.bed_to_tool((0., 40.))
+        self.assertAlmostEqual(math.hypot(*tool), 32., places=9)
+        self.assertAlmostEqual(math.atan2(tool[1], tool[0]), math.pi / 2.,
+                               places=9)
+
+    def test_bed_to_tool_and_back_round_trips(self):
+        for offsets in ((0., 0., -0.1), (8., 0., -0.1), (-6., 3.5, 0.2),
+                        (0., -4., 0.)):
+            _, rp = build(offsets=offsets, bed_radius=None)
+            for pt in ((25., 0.), (-30., 12.), (0., -45.), (18., -22.)):
+                tool = rp.bed_to_tool(pt)
+                back = rp.tool_to_bed(tool[0], tool[1])
+                self.assertAlmostEqual(back[0], pt[0], places=8, msg=str(pt))
+                self.assertAlmostEqual(back[1], pt[1], places=8, msg=str(pt))
+
+    def test_a_point_inside_the_tangential_offset_is_unreachable(self):
+        # No bed angle can swing a probe 5mm off the arm onto a point 2mm
+        # from the centre
+        _, rp = build(offsets=(0., 5., -0.1))
+        with self.assertRaises(ConfigError):
+            rp.bed_to_tool((2., 0.))
+
+    def test_an_outboard_probe_that_cannot_reach_the_centre_is_rejected(self):
         with self.assertRaises(ConfigError) as cm:
-            rp.descend_limit_z(-8.)
-        self.assertIn("RTCP_PROBE_ORIENT", str(cm.exception))
-    def test_the_check_can_be_turned_off(self):
-        _, rp = build({'check_probe_b_angle': False})
-        rp.toolhead.position[rtcp_probe_mod.B_POS_INDEX] = 0.
-        rp.descend_limit_z(-8.)
-    def test_probing_with_rtcp_disabled_is_rejected(self):
-        printer, rp = build()
-        printer.lookup_object('rtcp').enabled = False
-        with self.assertRaises(ConfigError):
-            rp.get_z_endstop_position()
-    def test_a_probe_z_offset_larger_than_the_pivot_is_rejected(self):
-        with self.assertRaises(ConfigError):
-            build(z_offset=-100.)
+            build(offsets=(20., 0., -0.1))
+        self.assertIn("x_offset", str(cm.exception))
+
+    def test_an_inboard_probe_reaching_the_whole_bed_is_accepted(self):
+        build(offsets=(-20., 0., -0.1))
 
 
-class TestCommands(unittest.TestCase):
-    def setUp(self):
-        self.printer, self.rp = build()
-        self.gcode = self.printer.lookup_object('gcode')
-    def test_orient_lifts_before_turning_b(self):
-        self.rp.toolhead.position[2] = 1.
-        gcmd = FakeGCmd({'MODE': 'PROBE'})
-        self.gcode.commands['RTCP_PROBE_ORIENT'](gcmd)
-        lift, turn = self.rp.toolhead.moves[-2:]
-        self.assertEqual(lift[0][2], self.rp.orient_lift_z)
-        self.assertEqual(turn[0][rtcp_probe_mod.B_POS_INDEX],
-                         self.rp.probe_b_position)
-    def test_orient_tool_faces_the_nozzle_at_the_bed(self):
-        gcmd = FakeGCmd({'MODE': 'TOOL'})
-        self.gcode.commands['RTCP_PROBE_ORIENT'](gcmd)
-        self.assertAlmostEqual(
-            self.rp.toolhead.moves[-1][0][rtcp_probe_mod.B_POS_INDEX],
-            self.rp.probe_b_position + PROBE_B_OFFSET, places=9)
-    def test_probe_move_puts_the_probe_over_the_bed_point(self):
-        gcmd = FakeGCmd({'X': 40., 'Y': 0.})
-        self.gcode.commands['RTCP_PROBE_MOVE'](gcmd)
-        pos = self.rp.toolhead.get_position()
-        res = self.rp.create_probe_result([pos[0], pos[1], 0.])
+######################################################################
+# The cartesian frame
+######################################################################
+
+class TestCartesianFrame(unittest.TestCase):
+    def test_offsets_are_plain_subtraction(self):
+        _, rp = build(offsets=(3., -2., -0.1),
+                      frame=rtcp_mod.FRAME_CARTESIAN)
+        self.assertEqual(rp.bed_to_tool((25., 10.)), [22., 12.])
+        self.assertEqual(rp.tool_to_bed(22., 12.), (25., 10.))
+
+
+######################################################################
+# Probe results
+######################################################################
+
+class TestProbeResult(unittest.TestCase):
+    def test_z_offset_keeps_its_stock_meaning(self):
+        _, rp = build(offsets=(0., 0., -0.1))
+        res = rp.create_probe_result((25., 0., 3.5))
+        self.assertAlmostEqual(res.bed_z, 3.6, places=9)
+        self.assertAlmostEqual(res.test_z, 3.5, places=9)
+
+    def test_the_result_names_where_the_probe_touched(self):
+        _, rp = build(offsets=(8., 0., -0.1), bed_radius=None)
+        res = rp.create_probe_result((32., 0., 1.))
         self.assertAlmostEqual(res.bed_x, 40., places=9)
         self.assertAlmostEqual(res.bed_y, 0., places=9)
-    def test_orient_needs_b_homed(self):
-        # B's homed flag is on the rotary axis object - it never shows up
-        # in toolhead homed_axes, so reading it from there always failed
-        self.rp.b_axis.is_homed = False
+        self.assertAlmostEqual(res.test_x, 32., places=9)
+
+
+######################################################################
+# The guards
+######################################################################
+
+class TestGuards(unittest.TestCase):
+    def test_probing_with_rtcp_on_is_refused(self):
+        printer, rp = build()
+        printer.lookup_object('rtcp').enabled = True
         with self.assertRaises(ConfigError) as cm:
-            self.gcode.commands['RTCP_PROBE_ORIENT'](FakeGCmd({}))
-        self.assertIn("Must home B", str(cm.exception))
-    def test_orient_works_with_b_homed_but_not_in_homed_axes(self):
-        self.assertNotIn('b', self.rp.toolhead.homed)
-        self.gcode.commands['RTCP_PROBE_ORIENT'](FakeGCmd({}))
-        self.assertAlmostEqual(
+            rp.check_probe_ready()
+        self.assertIn("RTCP", str(cm.exception))
+
+    def test_probing_at_the_probing_angle_is_allowed(self):
+        _, rp = build()
+        rp.check_probe_ready()
+
+    def test_probing_away_from_the_probing_angle_is_refused(self):
+        _, rp = build()
+        rp.toolhead.position[rtcp_probe_mod.B_POS_INDEX] = 0.
+        with self.assertRaises(ConfigError) as cm:
+            rp.check_probe_ready()
+        self.assertIn("RTCP_PROBE_ORIENT", str(cm.exception))
+
+    def test_the_angle_check_can_be_turned_off(self):
+        _, rp = build({'check_probe_b_angle': False})
+        rp.toolhead.position[rtcp_probe_mod.B_POS_INDEX] = 0.
+        rp.check_probe_ready()
+
+    def test_oriented_needs_both_rtcp_off_and_the_right_angle(self):
+        printer, rp = build()
+        self.assertTrue(rp.get_status()['oriented'])
+        printer.lookup_object('rtcp').enabled = True
+        self.assertFalse(rp.get_status()['oriented'])
+        printer.lookup_object('rtcp').enabled = False
+        rp.toolhead.position[rtcp_probe_mod.B_POS_INDEX] = 0.
+        self.assertFalse(rp.get_status()['oriented'])
+
+
+######################################################################
+# Orienting the head
+######################################################################
+
+class TestOrient(unittest.TestCase):
+    def setUp(self):
+        self.printer, self.rp = build()
+
+    def _orient(self, mode):
+        gcmd = FakeGCmd({'MODE': mode})
+        self.rp.cmd_RTCP_PROBE_ORIENT(gcmd)
+        return gcmd
+
+    def test_mode_probe_turns_b_to_the_probing_angle(self):
+        self.rp.toolhead.moves = []
+        self._orient('PROBE')
+        turn = self.rp.toolhead.moves[-1]
+        self.assertEqual(turn[0][rtcp_probe_mod.B_POS_INDEX],
+                         PROBE_B_OFFSET)
+
+    def test_mode_tool_turns_b_to_zero(self):
+        self.rp.toolhead.moves = []
+        self._orient('TOOL')
+        turn = self.rp.toolhead.moves[-1]
+        self.assertEqual(turn[0][rtcp_probe_mod.B_POS_INDEX], 0.)
+
+    def test_orienting_needs_b_homed(self):
+        self.rp.toolhead.b_axis.is_homed = False
+        with self.assertRaises(ConfigError):
+            self._orient('PROBE')
+
+    def test_orienting_with_rtcp_on_and_unhomed_axes_is_rejected(self):
+        self.printer.lookup_object('rtcp').enabled = True
+        self.rp.toolhead.homed = "y"
+        with self.assertRaises(ConfigError) as cm:
+            self._orient('PROBE')
+        self.assertIn("SET_RTCP ENABLE=0", str(cm.exception))
+
+    def test_orienting_with_rtcp_off_needs_only_b_homed(self):
+        self.rp.toolhead.homed = ""
+        self.rp.toolhead.moves = []
+        self._orient('PROBE')
+        self.assertEqual(
             self.rp.toolhead.get_position()[rtcp_probe_mod.B_POS_INDEX],
-            self.rp.probe_b_position, places=9)
-    def test_status(self):
-        status = self.rp.get_status()
-        self.assertTrue(status['oriented'])
-        self.assertAlmostEqual(status['probe_b_position'],
-                               PROBE_B_POSITION, places=9)
+            PROBE_B_OFFSET)
 
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main()

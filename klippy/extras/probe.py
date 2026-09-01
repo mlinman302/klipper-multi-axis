@@ -207,22 +207,23 @@ class LookupZSteppers:
 
 # Optional dynamic probe offsets ("probe_transform")
 #
-# A probe is normally at a fixed x/y/z offset from the nozzle, which is
-# what ProbeOffsetsHelper describes.  A machine may instead register a
-# printer object named 'probe_transform' to compute that offset itself -
-# on the corertheta machine the probe is carried on the tilting head, so
-# its offset from the nozzle depends on the B angle and is radial rather
-# than cartesian (see klippy/extras/rtcp_probe.py).  When present it
-# supersedes the configured x/y/z offsets and must implement:
+# ProbeOffsetsHelper describes the probe's offset from the nozzle as a
+# fixed x/y/z displacement in the coordinates g-code uses.  A machine may
+# register a printer object named 'probe_transform' to apply that offset
+# in a frame of its own instead - on the corertheta machine x/y are bed
+# coordinates while the probe is displaced along the rotating arm, so the
+# two do not line up (see klippy/extras/rtcp_probe.py).  The transform
+# may also refuse to probe at all if the machine is not in a state where
+# the configured offsets hold.  When present it must implement:
+#   check_probe_ready()        - raise a command_error if the machine is
+#                                not oriented/configured to probe
 #   bed_to_tool(coord)         - toolhead x/y that puts the probe over
 #                                bed position coord
 #   create_probe_result(pos)   - manual_probe.ProbeResult for a trigger
 #                                with the toolhead at pos
-#   get_z_endstop_position()   - toolhead z at which the probe triggers
-#                                on a bed at z == 0, used to check that
-#                                moves clear the bed
-#   descend_limit_z(z_min)     - lowest toolhead z a probing move may
-#                                descend to for a probe limit of z_min
+# The z offset is *not* the transform's business: it keeps its ordinary
+# meaning, so horizontal_move_z and the probing descent limit are handled
+# by the stock code below.
 def lookup_probe_transform(printer):
     return printer.lookup_object('probe_transform', None)
 
@@ -282,13 +283,10 @@ class DescendToEndstopHelper:
     def descend_until_trigger(self, gcmd):
         toolhead = self.printer.lookup_object('toolhead')
         probe_transform = lookup_probe_transform(self.printer)
-        pos = toolhead.get_position()
         if probe_transform is not None:
-            # The probe is not at a fixed offset below the nozzle, so the
-            # nozzle must stop short of the z axis position_min
-            pos[2] = probe_transform.descend_limit_z(self.z_min_position)
-        else:
-            pos[2] = self.z_min_position
+            probe_transform.check_probe_ready()
+        pos = toolhead.get_position()
+        pos[2] = self.z_min_position
         speed = self.param_helper.get_probe_params(gcmd)['probe_speed']
         phoming = self.printer.lookup_object('homing')
         check_movement = (self.always_check_movement
@@ -446,8 +444,17 @@ class ProbeOffsetsHelper:
         self.x_offset = config.getfloat('x_offset', 0.)
         self.y_offset = config.getfloat('y_offset', 0.)
         self.z_offset = config.getfloat('z_offset')
+        # On a machine whose head tilts about B (see klippy/extras/rtcp.py)
+        # the probe is carried on that head and is only usable at one B
+        # angle - the one at which its pin hangs vertically.  The nozzle
+        # is vertical at B=0, so this is also the angular distance from
+        # the nozzle round to the probe.  The x/y/z offsets above are
+        # measured with the head at this angle.
+        self.b_offset = config.getfloat('b_offset', 0.)
     def get_offsets(self, gcmd=None):
         return self.x_offset, self.y_offset, self.z_offset
+    def get_b_offset(self):
+        return self.b_offset
 
 
 ######################################################################
@@ -534,9 +541,11 @@ class ProbePointsHelper:
         self.probe_offsets = probe.get_offsets(gcmd)
         self.probe_transform = lookup_probe_transform(self.printer)
         if self.probe_transform is not None:
-            min_horiz_z = self.probe_transform.get_z_endstop_position()
-        else:
-            min_horiz_z = self.probe_offsets[2]
+            # Fail before the first move rather than after it - the probe
+            # points are computed in the transform's frame, so it has to
+            # be valid for the whole run, not just at the first descent
+            self.probe_transform.check_probe_ready()
+        min_horiz_z = self.probe_offsets[2]
         if self.horizontal_move_z < min_horiz_z:
             raise gcmd.error("horizontal_move_z of %.3f can't be less than the"
                              " %.3f the probe reaches below the toolhead"
@@ -668,6 +677,8 @@ class PrinterProbe:
         return self.param_helper.get_probe_params(gcmd)
     def get_offsets(self, gcmd=None):
         return self.probe_offsets.get_offsets(gcmd)
+    def get_b_offset(self):
+        return self.probe_offsets.get_b_offset()
     def get_status(self, eventtime):
         return self.cmd_helper.get_status(eventtime)
     def start_probe_session(self, gcmd):
