@@ -984,6 +984,66 @@ class TestBProjection(unittest.TestCase):
         move = th.lookahead.queue[-1]
         self.assertAlmostEqual(math.sqrt(move.max_cruise_v2), 10.)
 
+    def test_probe_angle_guard(self):
+        # The probe pin is vertical at exactly one B, and the band must
+        # not reach it or the pin gets tilted while probing
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th)
+        bp.probe_b = None
+        self.assertIsNone(bp._probe_angle_error(40., 5.))
+        bp.probe_b = -45.
+        # Exactly on the boundary is a true pass-through, so allowed
+        self.assertIsNone(bp._probe_angle_error(40., 5.))
+        self.assertIsNone(bp._probe_angle_error(40., 3.))
+        # Inside the band is not
+        self.assertIsNotNone(bp._probe_angle_error(41., 5.))
+        bp.probe_b = -41.
+        self.assertIsNotNone(bp._probe_angle_error(40., 5.))
+        # A disabled transform touches nothing
+        self.assertIsNone(bp._probe_angle_error(0., 5.))
+
+    def test_probe_angle_comes_from_the_probe_not_rtcp_probe(self):
+        # [rtcp_probe] resolves its probe in its own klippy:connect
+        # handler, which may not have run yet - reaching through it here
+        # halted the printer with "'NoneType' object has no attribute
+        # 'get_b_offset'".  The angle must come off the probe object,
+        # which exists from config parse whatever the section order.
+        printer, gcode, gmove, th, resp = build_env(('b',))
+
+        class NotYetConnectedRTCPProbe:
+            probe = None
+            def get_probe_b_position(self):
+                return self.probe.get_b_offset()   # would raise
+
+        class FakeProbe:
+            @staticmethod
+            def get_b_offset():
+                return -45.
+
+        printer.add_object('rtcp_probe', NotYetConnectedRTCPProbe())
+        printer.add_object('probe', FakeProbe())
+        printer.add_object('toolhead', th)
+        bp = make_bprojection(printer, th, max_angle=40., taper_range=3.)
+        bp.toolhead = None
+        bp.probe_b = None
+        # Wrapping the steppers needs chelper; this is about where the
+        # probe angle is read from
+        bp._update_kinematics = lambda: None
+        bp._connect()
+        self.assertAlmostEqual(bp.probe_b, -45.)
+
+    def test_retune_cannot_widen_the_band_over_the_probe(self):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th, max_angle=40., taper_range=3.)
+        bp.probe_b = -45.
+        printer.add_object('b_projection', bp)
+        gcode.register_command('SET_B_PROJECTION', bp.cmd_SET_B_PROJECTION)
+        self.assertRaises(gcode_mod.CommandError, gcode.run_script,
+                          "SET_B_PROJECTION MAX_ANGLE=60")
+        # ...and the rejected value was not applied
+        self.assertAlmostEqual(bp.max_angle, 40.)
+
+
     def test_rtcp_uses_the_projected_angle(self):
         # RTCP holds the tip still for the tilt the head really makes.
         # At a bed angle of 90 the projection flattens B away, so there

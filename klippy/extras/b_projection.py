@@ -65,6 +65,8 @@ class BAxisProjection:
         self.max_b_accel = config.getfloat('max_b_accel', None, above=0.)
         self.orig_stepper_kinematics = []
         self.bproject_stepper_kinematics = []
+        # B angle at which the probe pin hangs vertical, once known
+        self.probe_b = None
         # [rtcp] wraps the steppers in its own klippy:connect handler and
         # this wrapper has to end up outside it, so make sure the rtcp
         # object - and therefore its handler - is created first
@@ -89,19 +91,35 @@ class BAxisProjection:
             self.max_b_velocity = self.toolhead.max_velocity / b_ratio
         # The probe is used at exactly one B angle, and the pin will not
         # be vertical there unless that angle reaches the machine
-        # untouched - so it has to sit outside the band
-        rtcp_probe = self.printer.lookup_object('rtcp_probe', None)
-        if rtcp_probe is not None:
-            probe_b = rtcp_probe.get_probe_b_position()
-            if abs(probe_b) < self.max_angle + self.taper_range:
-                raise self.printer.config_error(
-                    "[b_projection] would tilt the probing angle: the probe"
-                    " is vertical at B=%.3f, which is inside the projected"
-                    " band of +/-%.3f.  Raise max_angle + taper_range above"
-                    " it, or lower them below it."
-                    % (probe_b, self.max_angle + self.taper_range))
+        # untouched - so it has to sit outside the band.  Read the angle
+        # off the probe object, which exists from config parse, rather
+        # than through [rtcp_probe], which resolves its probe in its own
+        # klippy:connect handler - that may not have run yet, and whether
+        # it has depends on the order of the config sections.
+        if self.printer.lookup_object('rtcp_probe', None) is not None:
+            probe = self.printer.lookup_object('probe', None)
+            get_b_offset = getattr(probe, 'get_b_offset', None)
+            if get_b_offset is not None:
+                self.probe_b = get_b_offset()
+        err = self._probe_angle_error(self.max_angle, self.taper_range)
+        if err is not None:
+            raise self.printer.config_error(err)
         self.toolhead.register_move_check(self._check_move)
         self._update_kinematics()
+
+    def _probe_angle_error(self, max_angle, taper_range):
+        # Returns a message if the band would swallow the probing angle,
+        # else None.  The caller raises the error kind that suits it.
+        if self.probe_b is None or max_angle <= 0.:
+            return None
+        band = max_angle + taper_range
+        if abs(self.probe_b) >= band:
+            return None
+        return ("[b_projection] would tilt the probing angle: the probe pin"
+                " is vertical at B=%.3f, which is inside the projected band"
+                " of +/-%.3f.  Lower max_angle + taper_range below it, or"
+                " move the probe angle out of the band."
+                % (self.probe_b, band))
 
     ######################################################################
     # Stepper wrapping
@@ -254,6 +272,13 @@ class BAxisProjection:
         enable = gcmd.get_int('ENABLE', None, minval=0, maxval=1)
         max_angle = gcmd.get_float('MAX_ANGLE', None, minval=0.)
         taper_range = gcmd.get_float('TAPER_RANGE', None, above=0.)
+        # Check before applying - a wider band could swallow the angle the
+        # probe pin is vertical at
+        err = self._probe_angle_error(
+            self.max_angle if max_angle is None else max_angle,
+            self.taper_range if taper_range is None else taper_range)
+        if err is not None:
+            raise gcmd.error(err)
         if enable is not None:
             self.enabled = bool(enable)
         if max_angle is not None:
