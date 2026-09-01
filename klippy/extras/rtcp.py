@@ -27,6 +27,11 @@ B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
 
 
 class RTCP:
+    # Optional bed-frame B projection - see klippy/extras/b_projection.py.
+    # A class attribute so that code building an RTCP without running
+    # __init__ (the host tests do) still finds it.
+    b_project = None
+
     def __init__(self, config):
         self.printer = config.get_printer()
         self.toolhead = None
@@ -55,6 +60,7 @@ class RTCP:
             raise self.printer.config_error(
                 "[rtcp] requires a B axis - add 'b' to the"
                 " 'additional_axes' option of the [printer] section")
+        self.b_project = self.printer.lookup_object('b_projection', None)
         self.toolhead.register_move_check(self._check_move)
         self._update_kinematics()
 
@@ -102,12 +108,21 @@ class RTCP:
     ######################################################################
     # Coordinate transforms
     ######################################################################
+    def get_machine_b(self, pos):
+        # The angle the head is really turned to for a commanded toolhead
+        # position.  Normally the commanded B itself, but [b_projection]
+        # re-interprets B in the bed frame, and it is the projected angle
+        # that swings the tip.
+        if self.b_project is None:
+            return pos[B_POS_INDEX]
+        return self.b_project.project_pos(pos)
+
     def tip_to_machine(self, pos):
         # Machine (carriage) position for a toolhead position vector
         px, pz = self.get_pivot()
         if not px and not pz:
             return list(pos)
-        b_rad = math.radians(pos[B_POS_INDEX])
+        b_rad = math.radians(self.get_machine_b(pos))
         sin_b, cos_b_1 = math.sin(b_rad), math.cos(b_rad) - 1.
         res = list(pos)
         res[0] = pos[0] + px * cos_b_1 + pz * sin_b
@@ -135,7 +150,10 @@ class RTCP:
         # position it maps to is also reachable.  Both endpoints are
         # checked - the B angle changes monotonically within a move, so
         # the RTCP offset does too, and no interior point is further out
-        # than the ends.
+        # than the ends.  (With [b_projection] the machine's B also
+        # follows the bed angle, which is not monotonic over a long arc;
+        # the endpoints are then a close bound rather than a strict one,
+        # and the projection only ever shrinks |B| towards zero.)
         px, pz = self.get_pivot()
         if not px and not pz:
             return

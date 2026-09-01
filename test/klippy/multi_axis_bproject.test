@@ -1,0 +1,70 @@
+# Tests for the bed-frame interpretation of the B axis - a commanded B
+# is a lean toward the bed's +x, and the machine gets its projection
+# onto the plane the head can actually tilt in
+DICTIONARY atmega2560.dict
+CONFIG multi_axis_bproject.cfg
+
+# Report the transform before anything moves
+GET_POSITION
+
+# Home the arm and the tilt axis.  The park angle of -90 is outside the
+# band, so homing is unaffected by the projection.
+G28 X
+G28 B
+
+# Z homes on the probe, which needs B=45 - also outside the band
+RTCP_PROBE_ORIENT MODE=PROBE
+RTCP_PROBE_MOVE X=0 Y=0 F=50
+G28 Z
+RTCP_PROBE_ORIENT MODE=TOOL
+
+# Hold B while the bed turns underneath.  The commanded B stays at 10
+# but the machine's B sweeps 10 -> 0 -> -10 -> 0 -> 10 as the arm goes
+# round the bed, so both gantry motors move on every one of these.
+G1 Z10 F300
+G1 X30 Y0 F3000
+G1 B10 F600
+G1 X0 Y30 F3000
+G1 X-30 Y0 F3000
+G1 X0 Y-30 F3000
+G1 X30 Y0 F3000
+
+# A B move at a bed angle where the projection is at its strongest,
+# and at one where it flattens the lean away entirely
+G1 B-10 F600
+G1 B0 F600
+G1 X0 Y30 F3000
+G1 B10 F600
+G1 B-10 F600
+G1 B0 F600
+
+# Cross the taper band in both directions.  This is the transition
+# from a projected print angle to a pass-through orientation angle;
+# it has to be continuous, and slow enough for the gantry to follow.
+G1 X20 Y20 F3000
+G1 B35 F600
+G1 B45 F600
+G1 B35 F600
+G1 B0 F600
+
+# Printing with a held lean while the bed turns
+G1 X20 Y0 Z0.3 F1500
+G1 B15 F600
+G1 X0 Y20 E1 F1500
+G1 X-20 Y0 E2 F1500
+G1 X0 Y-20 E3 F1500
+G1 B0 F600
+
+# Turning the projection off must leave the machine where it is
+G1 X0 Y20 F3000
+G1 B10 F600
+SET_B_PROJECTION ENABLE=0
+G1 B0 F600
+SET_B_PROJECTION ENABLE=1 MAX_ANGLE=30 TAPER_RANGE=10
+G1 B10 F600
+G1 B0 F600
+SET_B_PROJECTION ENABLE=1 MAX_ANGLE=40 TAPER_RANGE=5
+
+GET_POSITION
+M114
+M84

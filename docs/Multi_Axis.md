@@ -146,6 +146,7 @@ klippy/chelper/kin_generic.c       linear combination of all six axes
                                      (this is what expresses core r-theta)
 klippy/chelper/kin_rotary_axis.c   the uncoupled rotational stepper
 klippy/chelper/kin_rtcp.c          the RTCP transform (wraps a solver)
+klippy/chelper/kin_bproject.c      the bed-frame B projection (wraps a solver)
 klippy/chelper/__init__.py         build + cffi declarations
 klippy/stepper.py                  kin_coords() - the position gather
 klippy/toolhead.py                 position vector, Move, trapq_append
@@ -156,6 +157,7 @@ klippy/extras/gcode_move.py        A/B/C g-code words
 klippy/extras/homing.py            homing across six axes
 klippy/extras/motion_report.py     six-axis trapq dumps
 klippy/extras/rtcp.py              installs RTCP, reach checks
+klippy/extras/b_projection.py      installs the B projection, speed limits
 klippy/extras/rtcp_probe.py        probe geometry on the tilting head
 ```
 
@@ -262,13 +264,14 @@ alongside the linear axes.
 
 | Test | Runs on | Covers |
 | ---- | ------- | ------ |
-| `test/multi_axis/run_c_tests.sh` | any host with a C compiler | Shared time base, core r-theta coefficients, RTCP geometry, 3-axis regression, benchmark |
+| `test/multi_axis/run_c_tests.sh` | any host with a C compiler | Shared time base, core r-theta coefficients, RTCP geometry, the bed-frame B projection, 3-axis regression, benchmark |
 | `test/multi_axis/test_gcode_pipeline.py` | any host with Python + cffi | Real `gcode.py`, `gcode_move.py`, `Move`, `LookAheadQueue`, `RotaryAxis` |
 | `test/multi_axis/test_rtcp_probe.py` | any host with Python + cffi | Tilting-head probe geometry, the radial probe transform, its config checks |
 | `test/klippy/multi_axis.test` | Linux (`scripts/test_klippy.py`) | Uncoupled A/C axes: config load, homing, step generation |
 | `test/klippy/multi_axis_rtheta.test` | Linux (`scripts/test_klippy.py`) | Coupled core r-theta stage |
 | `test/klippy/multi_axis_rtcp.test` | Linux (`scripts/test_klippy.py`) | RTCP on a B axis tilting head |
 | `test/klippy/multi_axis_rtcp_probe.test` | Linux (`scripts/test_klippy.py`) | Probing and round-bed mesh with the probe on the tilting head |
+| `test/klippy/multi_axis_bproject.test` | Linux (`scripts/test_klippy.py`) | Bed-frame B projection: held leans through a bed turn, the taper band, `SET_B_PROJECTION` |
 
 ```bash
 bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py     && python test/multi_axis/test_rtcp_probe.py
@@ -365,6 +368,82 @@ Only B is compensated — that is the machine this fork targets.  A and C
 are carried through the transform untouched.  Extending to a full
 three-rotation head would mean composing three rotations (and fixing an
 order convention), and belongs in `rtcp_calc_position()`.
+
+## Bed-frame B on a rotating bed (`[b_projection]`)
+
+On the core r-theta machine the head tilts about the machine's Y axis,
+so the tool can only lean within the machine's XZ plane.  The bed,
+however, turns underneath it.  A tool orientation expressed in the *bed*
+frame — which is the frame the G-code X/Y words already use — is
+therefore not reachable in general, and the best the machine can do is
+the projection of it onto the plane it can tilt in.
+
+`[b_projection]` makes that the meaning of `B`.  A commanded `B` is a
+lean toward the bed's +X direction, and the machine is driven to
+
+```
+b_machine = b * cos(theta),   theta = atan2(y, x)   (the bed angle)
+```
+
+so holding `B10` through a full turn of the bed sweeps the machine's B
+over 10 → 0 → −10 → 0 → 10.  `cos(theta)` is `x/|xy|`, so no
+trigonometry is involved.
+
+### Why the B axis owns this, and not the bed
+
+The obvious alternative is to make the bed axis (`[stepper_c]`) own the
+compensation, since the correction is a function of the bed angle.  It
+cannot:
+
+* **The bed motor's own position does not change.**  It still follows
+  `atan2(y, x)`.  The bed only *supplies* the angle.
+* **A stepper kinematic computes its own stepper's position and nothing
+  else.**  There is no way for the bed solver to reach across and rewrite
+  the B another solver will read.
+
+B, on the other hand, is *consumed* in three places — both gantry motors
+of the differential and the RTCP tip correction — so the remap has to sit
+ahead of all three.  It is installed as a wrapping
+`stepper_kinematics` (the `kin_shaper.c` / `kin_rtcp.c` idiom), *outside*
+the RTCP wrapper, so the whole chain below it sees one consistent B: the
+angle the head is really turned to.  Getting that ordering wrong would
+make RTCP hold the tip still for a tilt the head is not actually making.
+
+It also has to live in C rather than in a Python move transform, for the
+same reason RTCP does: the bed angle changes continuously *within* a
+move, so a per-move transform would only be right at the endpoints.
+
+### The band, and why it is tapered
+
+Not every `B` is a print angle.  `RTCP_PROBE_ORIENT MODE=PROBE` swings
+the head to `B45` to point the probe down, and `G28 B` parks it at −90;
+both have to reach the machine untouched.  Angles at or beyond
+`max_angle + taper_range` therefore pass straight through.
+
+Switching at a hard threshold would put a discontinuity of up to
+`max_angle` degrees into the machine's B — at a bed angle of 90°, `B39.9`
+maps to ≈0 while `B40.1` maps to 40.1 — which arrives at the step
+compressor as thousands of steps in a few microseconds ("Internal error
+in stepcompress").  The correction is instead faded out with a smoothstep
+over `taper_range` degrees above `max_angle`, and `_check_move()` slows
+any move whose machine B moves faster than the commanded B — crossing the
+band, or swinging the bed while B is held — down to `max_b_velocity`.
+
+### Reported positions
+
+`calc_position()` resolves the *machine* B out of the gantry motors, so
+`calc_toolhead_pos()` maps it back through `machine_to_commanded()` after
+the RTCP inverse.  The projection is not invertible where `cos(theta)` is
+near zero — every commanded B maps to nearly the same machine B there —
+and in that case the B the toolhead already believes it is at is kept,
+which is correct whenever B did not move.  In practice every homing move
+happens at `B0`, `B±45` or `B−90`, where the transform is the identity
+and the inverse is exact.
+
+### Scope
+
+The transform is specific to a rotating bed and is rejected on any
+kinematics other than `corertheta`.  A and C are not touched.
 
 ## Probing and mesh bed levelling on a tilting head
 

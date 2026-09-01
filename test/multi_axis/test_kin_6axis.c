@@ -31,6 +31,13 @@ extern struct stepper_kinematics *generic_cartesian_stepper_alloc(
     double a_x, double a_y, double a_z, double a_a, double a_b, double a_c);
 extern struct stepper_kinematics *corertheta_stepper_alloc(char type,
                                                            double b_ratio);
+extern struct stepper_kinematics *bproject_alloc(void);
+extern int bproject_set_sk(struct stepper_kinematics *sk,
+                           struct stepper_kinematics *orig_sk);
+extern void bproject_set_params(struct stepper_kinematics *sk,
+                                double max_angle, double taper_range);
+extern double bproject_project_b(double b, double x, double y,
+                                 double max_angle, double taper_range);
 extern struct stepper_kinematics *rtcp_alloc(void);
 extern int rtcp_set_sk(struct stepper_kinematics *sk,
                        struct stepper_kinematics *orig_sk);
@@ -619,6 +626,98 @@ test_corertheta_rtcp_branch_cut(void)
     trapq_free(tq);
 }
 
+// [b_projection]: a commanded B is a lean toward the *bed's* +x, so what
+// the machine can reach is that lean projected onto its own xz plane -
+// scaled by cos of the bed angle.
+static void
+test_b_projection(void)
+{
+    printf("\n-- bed-frame B projection --\n");
+    const double MA = 40., TR = 5.;
+    const double S = 70.710678118654755;  // 100/sqrt(2)
+
+    // The pure mapping.  Holding B at 10 degrees through a turn of the
+    // bed sweeps the machine's B over 10 -> 0 -> -10 -> 0.
+    check("proj: bed angle 0 leaves B alone",
+          bproject_project_b(10., 100., 0., MA, TR), 10., 1e-12);
+    check("proj: bed angle 90 flattens B",
+          bproject_project_b(10., 0., 100., MA, TR), 0., 1e-12);
+    check("proj: bed angle 180 negates B",
+          bproject_project_b(10., -100., 0., MA, TR), -10., 1e-12);
+    check("proj: bed angle 45 scales B by cos",
+          bproject_project_b(10., S, S, MA, TR), 7.0710678, 1e-6);
+    check("proj: bed angle 270 flattens B",
+          bproject_project_b(10., 0., -100., MA, TR), 0., 1e-12);
+    check("proj: B=0 is a fixed point",
+          bproject_project_b(0., 0., 100., MA, TR), 0., 1e-12);
+
+    // Orientation angles beyond the band reach the machine untouched -
+    // that is what lets RTCP_PROBE_ORIENT and G28 B mean what they say
+    check("proj: probe angle passes through",
+          bproject_project_b(45., 0., 100., MA, TR), 45., 1e-12);
+    check("proj: park angle passes through",
+          bproject_project_b(-90., 0., 100., MA, TR), -90., 1e-12);
+
+    // ...and the taper across the band keeps the machine's B continuous,
+    // instead of jumping by up to max_angle in one step
+    check("proj: mid-taper is half corrected",
+          bproject_project_b(42.5, 0., 100., MA, TR), 21.25, 1e-9);
+    double just_in = bproject_project_b(44.999, 0., 100., MA, TR);
+    double just_out = bproject_project_b(45.001, 0., 100., MA, TR);
+    check("proj: continuous at the top of the band",
+          just_out - just_in, 0., 0.01);
+    double below = bproject_project_b(39.999, 0., 100., MA, TR);
+    double above = bproject_project_b(40.001, 0., 100., MA, TR);
+    check("proj: continuous at the bottom of the band",
+          above - below, 0., 0.01);
+    check("proj: a zero max_angle is the identity",
+          bproject_project_b(10., 0., 100., 0., TR), 10., 1e-12);
+
+    // Wrapped around a corertheta gantry motor: the '+' solver is
+    // b_ratio*B + radius, and it must see the projected B
+    struct stepper_kinematics *plus = bproject_alloc();
+    check("bproject_set_sk on the + gantry motor",
+          bproject_set_sk(plus, corertheta_stepper_alloc('+', 1.)), 0, 0.);
+    check("bproject_set_sk rejects NULL",
+          bproject_set_sk(bproject_alloc(), NULL), -1, 0.);
+    bproject_set_params(plus, MA, TR);
+    check("wrapped: B reads through at bed angle 0",
+          itersolve_calc_position_from_coord(plus, 100., 0., 0., 0., 10., 0.),
+          110., 1e-9);
+    check("wrapped: B is flattened at bed angle 90",
+          itersolve_calc_position_from_coord(plus, 0., 100., 0., 0., 10., 0.),
+          100., 1e-9);
+    check("wrapped: park angle still reaches the motor",
+          itersolve_calc_position_from_coord(plus, 0., 100., 0., 0., -90., 0.),
+          10., 1e-9);
+    // A B-only move now depends on where the bed is, so the stepper has
+    // to become active on x and y as well - a move no axis claims
+    // generates no steps at all
+    check("wrapped: active on b", itersolve_is_active_axis(plus, 'b'), 1, 0.);
+    check("wrapped: active on x", itersolve_is_active_axis(plus, 'x'), 1, 0.);
+    check("wrapped: active on y", itersolve_is_active_axis(plus, 'y'), 1, 0.);
+
+    // Outside RTCP, so the tip correction uses the angle the head is
+    // really turned to.  At bed angle 90 the projected B is zero, so the
+    // head is upright and the tip is not swung at all.
+    const double L = 40.;
+    struct stepper_kinematics *cx = bproject_alloc();
+    struct stepper_kinematics *inner = rtcp_alloc();
+    check("chain: rtcp over cartesian x",
+          rtcp_set_sk(inner, cartesian_stepper_alloc('x')), 0, 0.);
+    rtcp_set_pivot(inner, 0., L);
+    check("chain: bproject over rtcp", bproject_set_sk(cx, inner), 0, 0.);
+    bproject_set_params(cx, MA, TR);
+    check("chain: upright head is not corrected",
+          itersolve_calc_position_from_coord(cx, 0., 100., 0., 0., 10., 0.),
+          0., 1e-9);
+    // Along the bed's x axis the projection is the identity, so the full
+    // RTCP swing of L*sin(B) is applied
+    check("chain: full tilt gets the full tip correction",
+          itersolve_calc_position_from_coord(cx, 5., 0., 0., 0., 10., 0.),
+          5. + L * sin(10. * M_PI / 180.), 1e-9);
+}
+
 int
 main(void)
 {
@@ -630,6 +729,7 @@ main(void)
     test_existing_kinematics_unchanged();
     test_set_position_and_active_axis();
     test_rtcp();
+    test_b_projection();
     benchmark();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures != 0;

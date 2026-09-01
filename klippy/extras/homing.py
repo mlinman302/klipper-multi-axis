@@ -118,6 +118,12 @@ class HomingMove:
         rtcp = self.printer.lookup_object('rtcp', None)
         if rtcp is not None:
             res = rtcp.machine_to_tip(res)
+        # calc_position() likewise reports the B the head is really turned
+        # to; with [b_projection] active that is the projection of the
+        # commanded B, so map it back into the commanded frame
+        bproj = self.printer.lookup_object('b_projection', None)
+        if bproj is not None:
+            res = bproj.machine_to_commanded(res, thpos)
         return res
     def homing_move(self, movepos, speed, probe_pos=False,
                     triggered=True, check_triggered=True):

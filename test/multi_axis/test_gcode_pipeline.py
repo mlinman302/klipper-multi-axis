@@ -31,6 +31,7 @@ import toolhead as toolhead_mod
 from extras import gcode_move as gcode_move_mod
 from kinematics import rotary_axis as rotary_axis_mod
 from extras import rtcp as rtcp_mod
+from extras import b_projection as bproject_mod
 
 
 ######################################################################
@@ -795,6 +796,174 @@ class TestCoreRThetaCalcPosition(unittest.TestCase):
         sp = self._stepper_positions(200., 0., 0., 0.)
         sp['stepper_z'] = 10.       # only z moved
         self.assertGreater(kin.calc_position(sp)[0], 0.)
+
+
+######################################################################
+# Bed-frame B projection
+######################################################################
+
+# Pure-Python mirror of bproject_project_b() in
+# klippy/chelper/kin_bproject.c.  The C function is what the steppers
+# actually run and is covered by test/multi_axis/run_c_tests.sh; this
+# stands in for it here so the host-side logic built on top of it - the
+# inverse and the speed limiting - can be tested without a compiled
+# c_helper.so.
+def _project_b(b, x, y, max_angle, taper_range):
+    ab = abs(b)
+    if max_angle <= 0. or ab >= max_angle + taper_range:
+        return b
+    r2 = x * x + y * y
+    cos_t = x / math.sqrt(r2) if r2 >= 0.010**2 else 1.
+    w = 1.
+    if ab > max_angle:
+        t = (ab - max_angle) / taper_range
+        w = 1. - t * t * (3. - 2. * t)
+    return b * (1. + w * (cos_t - 1.))
+
+
+class FakeFFILib:
+    @staticmethod
+    def bproject_project_b(b, x, y, max_angle, taper_range):
+        return _project_b(b, x, y, max_angle, taper_range)
+
+
+class FakeChelper:
+    @staticmethod
+    def get_ffi():
+        return None, FakeFFILib
+
+
+def make_bprojection(printer, toolhead, max_angle=40., taper_range=5.,
+                     max_b_velocity=60.):
+    # Build the object without config or chelper, then exercise its real
+    # transform, inverse and move-check logic
+    bp = bproject_mod.BAxisProjection.__new__(bproject_mod.BAxisProjection)
+    bp.printer = printer
+    bp.toolhead = toolhead
+    bp.enabled = True
+    bp.max_angle = max_angle
+    bp.taper_range = taper_range
+    bp.max_b_velocity = max_b_velocity
+    bp.max_b_accel = None
+    bp.orig_stepper_kinematics = []
+    bp.bproject_stepper_kinematics = []
+    return bp
+
+
+class TestBProjection(unittest.TestCase):
+    def setUp(self):
+        self._real_chelper = bproject_mod.chelper
+        bproject_mod.chelper = FakeChelper
+
+    def tearDown(self):
+        bproject_mod.chelper = self._real_chelper
+
+    def _pos(self, x=0., y=0., b=0.):
+        return [x, y, 0., 0., 0., b, 0.]
+
+    def test_b_index(self):
+        self.assertEqual(bproject_mod.B_POS_INDEX, 5)
+
+    def test_sweep_over_a_bed_turn(self):
+        # A held B of 10 sweeps the machine over 10 -> 0 -> -10 -> 0
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th)
+        for (x, y), want in (((100., 0.), 10.), ((0., 100.), 0.),
+                             ((-100., 0.), -10.), ((0., -100.), 0.)):
+            self.assertAlmostEqual(bp.project_pos(self._pos(x, y, 10.)),
+                                   want, places=9)
+        s = 100. / math.sqrt(2.)
+        self.assertAlmostEqual(bp.project_pos(self._pos(s, s, 10.)),
+                               10. / math.sqrt(2.), places=9)
+
+    def test_orientation_angles_pass_through(self):
+        # The probe angle and the park angle are outside the band, so
+        # RTCP_PROBE_ORIENT and G28 B keep meaning what they say
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th)
+        for b in (45., -90., 60.):
+            self.assertAlmostEqual(bp.project_pos(self._pos(0., 100., b)),
+                                   b, places=9)
+
+    def test_taper_is_continuous(self):
+        # A hard cutoff would jump the machine's B by up to max_angle in
+        # one step, which the step compressor cannot absorb
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th)
+        prev = bp.project_pos(self._pos(0., 100., 39.))
+        b = 39.
+        while b < 46.:
+            b += 0.02
+            cur = bp.project_pos(self._pos(0., 100., b))
+            self.assertLess(abs(cur - prev), 0.5)
+            prev = cur
+        self.assertAlmostEqual(bp.project_pos(self._pos(0., 100., 42.5)),
+                               21.25, places=9)
+
+    def test_disabled_is_identity(self):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th)
+        bp.enabled = False
+        p = self._pos(0., 100., 10.)
+        self.assertEqual(bp.project_pos(p), 10.)
+        self.assertEqual(bp.machine_to_commanded(p), list(p))
+
+    def test_inverse_round_trips(self):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th)
+        for b in (-90., -45., -37.5, -10., 0., 10., 25., 41.5, 44., 45., 60.):
+            for deg in range(0, 360, 17):
+                th_rad = math.radians(deg)
+                x, y = 60. * math.cos(th_rad), 60. * math.sin(th_rad)
+                if abs(math.cos(th_rad)) < 0.2 and abs(b) < 45.:
+                    continue    # not invertible - covered below
+                machine = self._pos(x, y, bp.project_pos(self._pos(x, y, b)))
+                back = bp.machine_to_commanded(machine, self._pos(x, y, b))
+                self.assertAlmostEqual(back[5], b, places=6)
+
+    def test_inverse_falls_back_where_not_invertible(self):
+        # At a bed angle of 90 every commanded B flattens to the same
+        # machine B, so the B the toolhead already has is kept
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th)
+        machine = self._pos(0., 100., bp.project_pos(self._pos(0., 100., 25.)))
+        back = bp.machine_to_commanded(machine, self._pos(0., 100., 25.))
+        self.assertAlmostEqual(back[5], 25., places=1)
+
+    def test_held_b_through_a_bed_move_is_speed_limited(self):
+        # B does not change, but the bed swings a quarter turn under it,
+        # so the machine's B runs from 10 to 0 - the move has to be slowed
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th, max_b_velocity=1.)
+        th.register_move_check(bp._check_move)
+        gcode.run_script("G1 X60 B10 F600")
+        gcode.run_script("G1 X0 Y60 F600")
+        move = th.lookahead.queue[-1]
+        # ~10 degrees of machine B over the move, at 1 deg/s
+        self.assertLess(math.sqrt(move.max_cruise_v2), move.move_d / 9.)
+
+    def test_move_with_no_machine_b_change_is_untouched(self):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th, max_b_velocity=1.)
+        th.register_move_check(bp._check_move)
+        gcode.run_script("G1 X60 F600")
+        gcode.run_script("G1 X20 F600")
+        move = th.lookahead.queue[-1]
+        self.assertAlmostEqual(math.sqrt(move.max_cruise_v2), 10.)
+
+    def test_rtcp_uses_the_projected_angle(self):
+        # RTCP holds the tip still for the tilt the head really makes.
+        # At a bed angle of 90 the projection flattens B away, so there
+        # is nothing for RTCP to correct.
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        r = make_rtcp(printer, th, pivot_z=40.)
+        r.b_project = make_bprojection(printer, th)
+        m = r.tip_to_machine(self._pos(0., 100., 10.))
+        self.assertAlmostEqual(m[0], 0., places=9)
+        # Along the bed's x axis the full tilt survives
+        m = r.tip_to_machine(self._pos(100., 0., 10.))
+        self.assertAlmostEqual(m[0], 100. + 40. * math.sin(math.radians(10.)),
+                               places=9)
 
 
 if __name__ == '__main__':

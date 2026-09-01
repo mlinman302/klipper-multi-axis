@@ -68,6 +68,9 @@ rtcp_calc_position(struct stepper_kinematics *sk, struct move *m
     rs->m.start_pos.a = pos.a;
     rs->m.start_pos.b = pos.b;
     rs->m.start_pos.c = pos.c;
+    // Carry the direction of travel through - a wrapped solver may need
+    // it (the corertheta bed resolves its dead zone from it)
+    rs->m.axes_r = m->axes_r;
     return rs->orig_sk->calc_position_cb(rs->orig_sk, &rs->m, DUMMY_T);
 }
 

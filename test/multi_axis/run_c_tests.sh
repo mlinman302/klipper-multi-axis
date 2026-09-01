@@ -43,6 +43,7 @@ $CC -Wall -O2 -I"$CHELPER" -o "$OUT/test_kin_6axis" \
     "$CHELPER/kin_cartesian.c" "$CHELPER/kin_corexy.c" \
     "$CHELPER/kin_generic.c" "$CHELPER/kin_rotary_axis.c" \
     "$CHELPER/kin_rtcp.c" "$CHELPER/kin_corertheta.c" \
+    "$CHELPER/kin_bproject.c" \
     "$CHELPER/stepcompress.c" "$CHELPER/msgblock.c" -lm
 
 "$OUT/test_kin_6axis"

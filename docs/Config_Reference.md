@@ -2552,6 +2552,69 @@ pivot_length:
 The `SET_RTCP [ENABLE=0|1] [PIVOT_LENGTH=<mm>] [PIVOT_X_OFFSET=<mm>]`
 command toggles or retunes the compensation.
 
+### [b_projection]
+
+Bed-frame interpretation of the B axis on a core r-theta machine.
+
+The head tilts about the machine's Y axis, so the tool can only lean
+within the machine's XZ plane - but the bed turns underneath it, so a
+tool orientation expressed in the *bed* frame (the frame the G-code X/Y
+words already use) is not reachable in general. With this section loaded
+a commanded `B` is read as a lean toward the bed's +X direction, and the
+machine is given the projection of that lean onto the plane it can tilt
+in:
+
+```
+b_machine = b * cos(theta),   theta = atan2(y, x)   (the bed angle)
+```
+
+Holding `B10` through a full turn of the bed therefore sweeps the
+machine's B over 10 -> 0 -> -10 -> 0 -> 10. At a bed angle of zero the
+two frames coincide and `B` reaches the machine unchanged.
+
+Angles beyond `max_angle` are orientation commands rather than print
+moves - swinging the probe down, parking the head - and pass through
+untouched, so `RTCP_PROBE_ORIENT` and `G28 B` keep meaning exactly what
+they say. A hard switch there would be a discontinuity of up to
+`max_angle` degrees on the machine's B, which the step compressor cannot
+absorb, so the correction is faded out with a smoothstep over
+`taper_range` degrees above `max_angle` instead. Moves that cross the
+band are slowed to keep the machine's B inside `max_b_velocity`.
+
+Requires the `corertheta` kinematics and `b` in the `additional_axes`
+option of `[printer]`. Composes with `[rtcp]`, which is given the angle
+the head is really turned to rather than the commanded one.
+
+See [Multi_Axis.md](Multi_Axis.md) and
+[multi_axis_bproject.cfg](../test/klippy/multi_axis_bproject.cfg).
+
+```
+[b_projection]
+#max_angle: 40.0
+#   Largest |B| (in degrees) that is fully projected. Beyond it plus
+#   taper_range the commanded B reaches the machine unchanged. Setting
+#   this to 0 disables the transform. The default is 40.
+#taper_range: 5.0
+#   Width of the band (in degrees) above max_angle over which the
+#   projection is faded out, so that the machine's B stays continuous
+#   across the switch to pass-through. The default is 5.
+#max_b_velocity:
+#   Ceiling (in degrees/second) on how fast the *machine's* B may be
+#   driven. Used to slow down moves whose machine B changes faster than
+#   the commanded B - crossing the taper band, or swinging the bed while
+#   B is held. The default is the printer's max_velocity converted
+#   through the corertheta b_coupling_ratio.
+#max_b_accel:
+#   Matching acceleration ceiling (in degrees/second^2). The default is
+#   to place no acceleration limit.
+#enable: True
+#   Whether the projection is active at startup. It can be toggled at
+#   runtime with SET_B_PROJECTION. The default is True.
+```
+
+The `SET_B_PROJECTION [ENABLE=0|1] [MAX_ANGLE=<deg>] [TAPER_RANGE=<deg>]`
+command toggles or retunes the transform.
+
 ### [rtcp_probe]
 
 Probe geometry for a probe carried on the RTCP tilting head, as on the

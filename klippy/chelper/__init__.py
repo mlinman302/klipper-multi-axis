@@ -22,7 +22,8 @@ SOURCE_FILES = [
     'kin_cartesian.c', 'kin_corexy.c', 'kin_corexz.c', 'kin_delta.c',
     'kin_deltesian.c', 'kin_polar.c', 'kin_rotary_delta.c', 'kin_winch.c',
     'kin_extruder.c', 'kin_shaper.c', 'kin_idex.c', 'kin_generic.c',
-    'kin_rotary_axis.c', 'kin_rtcp.c', 'kin_corertheta.c'
+    'kin_rotary_axis.c', 'kin_rtcp.c', 'kin_corertheta.c',
+    'kin_bproject.c'
 ]
 DEST_LIB = "c_helper.so"
 OTHER_FILES = [
@@ -189,6 +190,16 @@ defs_kin_rtcp = """
         , double *pos_xz);
 """
 
+defs_kin_bproject = """
+    struct stepper_kinematics *bproject_alloc(void);
+    int bproject_set_sk(struct stepper_kinematics *sk
+        , struct stepper_kinematics *orig_sk);
+    void bproject_set_params(struct stepper_kinematics *sk
+        , double max_angle, double taper_range);
+    double bproject_project_b(double b, double x, double y
+        , double max_angle, double taper_range);
+"""
+
 defs_kin_shaper = """
     int input_shaper_set_shaper_params(struct stepper_kinematics *sk, char axis
         , int n, double a[], double t[]);
@@ -268,6 +279,7 @@ defs_all = [
     defs_kin_extruder, defs_kin_shaper, defs_kin_idex,
     defs_kin_generic_cartesian, defs_kin_rotary_axis, defs_kin_rtcp,
     defs_kin_corertheta,
+    defs_kin_bproject,
 ]
 
 # Update filenames to an absolute path
