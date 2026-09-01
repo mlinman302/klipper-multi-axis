@@ -729,7 +729,7 @@ test_b_projection(void)
     struct stepper_kinematics *inner = rtcp_alloc();
     check("chain: rtcp over cartesian x",
           rtcp_set_sk(inner, cartesian_stepper_alloc('x')), 0, 0.);
-    rtcp_set_pivot(inner, 0., L);
+    rtcp_set_tool(inner, 0., L, RTCP_FRAME_CARTESIAN);
     check("chain: bproject over rtcp", bproject_set_sk(cx, inner), 0, 0.);
     bproject_set_params(cx, MA, TR);
     check("chain: upright head is not corrected",
@@ -739,7 +739,7 @@ test_b_projection(void)
     // RTCP swing of L*sin(B) is applied
     check("chain: full tilt gets the full tip correction",
           itersolve_calc_position_from_coord(cx, 5., 0., 0., 0., 10., 0.),
-          5. + L * sin(10. * M_PI / 180.), 1e-9);
+          5. - L * sin(10. * M_PI / 180.), 1e-9);
 }
 
 int

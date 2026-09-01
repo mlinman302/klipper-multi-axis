@@ -87,6 +87,19 @@ class BAxisProjection:
             kin = self.toolhead.get_kinematics()
             b_ratio = abs(getattr(kin, 'b_coeff', 1.)) or 1.
             self.max_b_velocity = self.toolhead.max_velocity / b_ratio
+        # The probe is used at exactly one B angle, and the pin will not
+        # be vertical there unless that angle reaches the machine
+        # untouched - so it has to sit outside the band
+        rtcp_probe = self.printer.lookup_object('rtcp_probe', None)
+        if rtcp_probe is not None:
+            probe_b = rtcp_probe.get_probe_b_position()
+            if abs(probe_b) < self.max_angle + self.taper_range:
+                raise self.printer.config_error(
+                    "[b_projection] would tilt the probing angle: the probe"
+                    " is vertical at B=%.3f, which is inside the projected"
+                    " band of +/-%.3f.  Raise max_angle + taper_range above"
+                    " it, or lower them below it."
+                    % (probe_b, self.max_angle + self.taper_range))
         self.toolhead.register_move_check(self._check_move)
         self._update_kinematics()
 

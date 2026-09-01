@@ -480,9 +480,11 @@ move, so a per-move transform would only be right at the endpoints.
 ### The band, and why it is tapered
 
 Not every `B` is a print angle.  `RTCP_PROBE_ORIENT MODE=PROBE` swings
-the head to `B45` to point the probe down, and `G28 B` parks it at −90;
-both have to reach the machine untouched.  Angles at or beyond
-`max_angle + taper_range` therefore pass straight through.
+the head to the probe's `b_offset` (45 on this machine) to point the pin
+down, and `G28 B` parks it at −90; both have to reach the machine
+untouched.  Angles at or beyond `max_angle + taper_range` therefore pass
+straight through, and klippy refuses to start if the probe's `b_offset`
+is not one of them.
 
 Switching at a hard threshold would put a discontinuity of up to
 `max_angle` degrees into the machine's B — at a bed angle of 90°, `B39.9`

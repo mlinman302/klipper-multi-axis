@@ -2627,7 +2627,10 @@ band are slowed to keep the machine's B inside `max_b_velocity`.
 
 Requires the `corertheta` kinematics and `b` in the `additional_axes`
 option of `[printer]`. Composes with `[rtcp]`, which is given the angle
-the head is really turned to rather than the commanded one.
+the head is really turned to rather than the commanded one. When
+`[rtcp_probe]` is present, klippy checks at startup that the probe's
+`b_offset` falls outside the band - the pin would not be vertical while
+probing otherwise.
 
 See [Multi_Axis.md](Multi_Axis.md) and
 [multi_axis_bproject.cfg](../test/klippy/multi_axis_bproject.cfg).

@@ -117,7 +117,7 @@ class HomingMove:
         # g-code uses, so convert back before reporting.
         rtcp = self.printer.lookup_object('rtcp', None)
         if rtcp is not None:
-            res = rtcp.machine_to_tip(res)
+            res = rtcp.machine_to_tool(res)
         # calc_position() likewise reports the B the head is really turned
         # to; with [b_projection] active that is the projection of the
         # commanded B, so map it back into the commanded frame

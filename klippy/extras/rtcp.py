@@ -175,6 +175,18 @@ class RTCP:
     ######################################################################
     # Coordinate transforms
     ######################################################################
+    # These mirror rtcp_deltas()/rtcp_apply() in kin_rtcp.c, which is what
+    # actually generates the steps.  They are repeated here rather than
+    # called through cffi so that positions can be converted without a
+    # compiled c_helper.so (and so the host tests can exercise them); the
+    # C file carries the derivation.
+    def _deltas(self, b_angle):
+        b_rad = math.radians(b_angle)
+        sin_b, cos_b_1 = math.sin(b_rad), math.cos(b_rad) - 1.
+        tool_h, tool_v = self.get_tool_offsets()
+        return (tool_h * cos_b_1 - tool_v * sin_b,
+                tool_h * sin_b + tool_v * cos_b_1)
+
     def get_machine_b(self, pos):
         # The angle the head is really turned to for a commanded toolhead
         # position.  Normally the commanded B itself, but [b_projection]
@@ -184,20 +196,11 @@ class RTCP:
             return pos[B_POS_INDEX]
         return self.b_project.project_pos(pos)
 
-    def tip_to_machine(self, pos):
-        # Machine (carriage) position for a toolhead position vector
-        px, pz = self.get_pivot()
-        if not px and not pz:
-            return list(pos)
-        b_rad = math.radians(self.get_machine_b(pos))
-        sin_b, cos_b_1 = math.sin(b_rad), math.cos(b_rad) - 1.
-        tool_h, tool_v = self.get_tool_offsets()
-        return (tool_h * cos_b_1 - tool_v * sin_b,
-                tool_h * sin_b + tool_v * cos_b_1)
-
-    def _transform(self, pos, sign):
+    def _transform(self, pos, sign, b_angle=None):
         res = list(pos)
-        dh, dz = self._deltas(res[B_POS_INDEX])
+        if b_angle is None:
+            b_angle = res[B_POS_INDEX]
+        dh, dz = self._deltas(b_angle)
         if not dh and not dz:
             return res
         dh, dz = sign * dh, sign * dz
@@ -219,12 +222,16 @@ class RTCP:
         return res
 
     def tool_to_machine(self, pos):
-        # Machine (carriage) position for a toolhead position vector
-        return self._transform(pos, 1.)
+        # Machine (carriage) position for a toolhead position vector.  The
+        # tip swings by the angle the head is really turned to, which
+        # [b_projection] can make differ from the commanded B.
+        return self._transform(pos, 1., self.get_machine_b(pos))
 
     def machine_to_tool(self, pos):
         # Inverse of the above - used when reading positions back out of
-        # the steppers so they are reported in the frame g-code uses
+        # the steppers so they are reported in the frame g-code uses.  The
+        # B in a machine position is already the angle the head is turned
+        # to, so it is used as it stands.
         return self._transform(pos, -1.)
 
     ######################################################################
@@ -239,8 +246,8 @@ class RTCP:
         # follows the bed angle, which is not monotonic over a long arc;
         # the endpoints are then a close bound rather than a strict one,
         # and the projection only ever shrinks |B| towards zero.)
-        px, pz = self.get_pivot()
-        if not px and not pz:
+        tool_h, tool_v = self.get_tool_offsets()
+        if not tool_h and not tool_v:
             return
         kin = self.toolhead.get_kinematics()
         status = kin.get_status(None)
@@ -256,7 +263,7 @@ class RTCP:
                 # bounds but is not somewhere the arm can be, so catch it
                 # before the check below waves it through.
                 radius = math.hypot(endpoint[0], endpoint[1])
-                dh = self._deltas(endpoint[B_POS_INDEX])[0]
+                dh = self._deltas(self.get_machine_b(endpoint))[0]
                 if radius + dh < -0.000000001:
                     raise move.move_error(
                         "RTCP move at B=%.3f needs an arm radius of %.3f,"

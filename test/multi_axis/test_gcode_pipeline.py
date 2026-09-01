@@ -989,13 +989,20 @@ class TestBProjection(unittest.TestCase):
         # At a bed angle of 90 the projection flattens B away, so there
         # is nothing for RTCP to correct.
         printer, gcode, gmove, th, resp = build_env(('b',))
-        r = make_rtcp(printer, th, pivot_z=40.)
+        r = make_rtcp(printer, th, tool_v=40.,
+                      frame=rtcp_mod.FRAME_RADIAL)
         r.b_project = make_bprojection(printer, th)
-        m = r.tip_to_machine(self._pos(0., 100., 10.))
+        m = r.tool_to_machine(self._pos(0., 100., 10.))
         self.assertAlmostEqual(m[0], 0., places=9)
+        self.assertAlmostEqual(m[1], 100., places=9)
         # Along the bed's x axis the full tilt survives
-        m = r.tip_to_machine(self._pos(100., 0., 10.))
-        self.assertAlmostEqual(m[0], 100. + 40. * math.sin(math.radians(10.)),
+        m = r.tool_to_machine(self._pos(100., 0., 10.))
+        self.assertAlmostEqual(m[0], 100. - 40. * math.sin(math.radians(10.)),
+                               places=9)
+        # ...and with the projection removed the commanded B is used
+        r.b_project = None
+        m = r.tool_to_machine(self._pos(0., 100., 10.))
+        self.assertAlmostEqual(m[1], 100. - 40. * math.sin(math.radians(10.)),
                                places=9)
 
 

@@ -314,10 +314,10 @@ class GCodeMove:
             mpos = list(toolhead.get_position())
             mpos[:3] = calc_pos[:3]
             if len(calc_pos) > 4 and calc_pos[4] is not None:
-                # machine_to_tip() undoes the tip swing, so it needs the
+                # machine_to_tool() undoes the tip swing, so it needs the
                 # angle the head is really turned to, not the commanded one
                 mpos[stepper.KIN_AXIS_INDEXES[4]] = calc_pos[4]
-            calc_pos[:3] = rtcp.machine_to_tip(mpos)[:3]
+            calc_pos[:3] = rtcp.machine_to_tool(mpos)[:3]
         kinfo = zip("XYZ", calc_pos)
         kin_pos = " ".join(["%s:%.6f" % (a, v) for a, v in kinfo])
         anames = self._get_axis_names()
