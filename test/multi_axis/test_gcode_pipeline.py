@@ -461,7 +461,7 @@ def make_rtcp(printer, toolhead, tool_v=40., tool_h=0.,
     r.frame = frame
     r.enabled = True
     r.orig_stepper_kinematics = []
-    r.rtcp_stepper_kinematics = []
+    r.rtcp_stepper_kinematics = {}
     return r
 
 
@@ -854,16 +854,163 @@ def _project_b(b, x, y, max_angle, taper_range):
     return b * (1. + w * (cos_t - 1.))
 
 
+class FakeSK:
+    # Stands in for a struct stepper_kinematics.  'kind' is which wrapper
+    # allocated it (or None for the solver underneath), 'wrapped' is what
+    # it sits on top of, and 'params' is whatever was last set on it.
+    def __init__(self, kind, wrapped=None):
+        self.kind = kind
+        self.wrapped = wrapped
+        self.params = None
+    def chain(self):
+        # Outermost first, down to the bare solver
+        node, res = self, []
+        while node is not None:
+            res.append(node.kind)
+            node = node.wrapped
+        return res
+
+
 class FakeFFILib:
     @staticmethod
     def bproject_project_b(b, x, y, max_angle, taper_range):
         return _project_b(b, x, y, max_angle, taper_range)
+    @staticmethod
+    def rtcp_alloc():
+        return FakeSK('rtcp')
+    @staticmethod
+    def rtcp_set_sk(sk, orig_sk):
+        sk.wrapped = orig_sk
+        return 0
+    @staticmethod
+    def rtcp_set_tool(sk, tool_h, tool_v, frame):
+        sk.params = (tool_h, tool_v, frame)
+    @staticmethod
+    def bproject_alloc():
+        return FakeSK('bproject')
+    @staticmethod
+    def bproject_set_sk(sk, orig_sk):
+        sk.wrapped = orig_sk
+        return 0
+    @staticmethod
+    def bproject_set_params(sk, max_angle, taper_range):
+        sk.params = (max_angle, taper_range)
+    @staticmethod
+    def free(sk):
+        pass
+
+
+class FakeFFIMain:
+    @staticmethod
+    def gc(obj, destructor):
+        return obj
 
 
 class FakeChelper:
     @staticmethod
     def get_ffi():
-        return None, FakeFFILib
+        return FakeFFIMain, FakeFFILib
+
+
+class FakeWrappedStepper:
+    # Just enough of an MCU_stepper for the wrapping code
+    def __init__(self, name):
+        self.name = name
+        self.sk = FakeSK(None)
+    def get_name(self):
+        return self.name
+    def get_trapq(self):
+        return object()
+    def get_stepper_kinematics(self):
+        return self.sk
+    def set_stepper_kinematics(self, sk):
+        self.sk = sk
+
+
+class FakeWrappedKin:
+    def __init__(self, steppers):
+        self.steppers = steppers
+    def get_steppers(self):
+        return list(self.steppers)
+
+
+class FakeWrappingToolhead:
+    def __init__(self, kin):
+        self.kin = kin
+    def get_kinematics(self):
+        return self.kin
+    def flush_step_generation(self):
+        pass
+
+
+class FakeMotionQueuing:
+    def check_step_generation_scan_windows(self):
+        pass
+
+
+class TestStepperWrapping(unittest.TestCase):
+    # [rtcp] and [b_projection] both wrap each kinematic stepper, rtcp
+    # innermost.  Retuning either one must retune the wrapper it already
+    # installed rather than adding another.
+    def setUp(self):
+        self._real = (rtcp_mod.chelper, bproject_mod.chelper)
+        rtcp_mod.chelper = bproject_mod.chelper = FakeChelper
+
+    def tearDown(self):
+        rtcp_mod.chelper, bproject_mod.chelper = self._real
+
+    def _build(self):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        printer.add_object('motion_queuing', FakeMotionQueuing())
+        steppers = [FakeWrappedStepper('stepper_x'),
+                    FakeWrappedStepper('stepper_z')]
+        wth = FakeWrappingToolhead(FakeWrappedKin(steppers))
+        r = make_rtcp(printer, wth, tool_v=40.)
+        bp = make_bprojection(printer, wth)
+        # Connect order: [rtcp] wraps first, [b_projection] outside it
+        r._update_kinematics()
+        bp._update_kinematics()
+        return r, bp, steppers
+
+    def test_connect_order_puts_rtcp_inside_the_projection(self):
+        r, bp, steppers = self._build()
+        for s in steppers:
+            self.assertEqual(s.get_stepper_kinematics().chain(),
+                             ['bproject', 'rtcp', None])
+
+    def test_set_rtcp_retunes_in_place_instead_of_re_wrapping(self):
+        # The bug this pins: with [b_projection] loaded, the stepper's
+        # outermost kinematic is the projection, so an RTCP that
+        # recognised only its own wrapper would wrap a second time.  The
+        # new outer copy took the "disabled" zero tool while the inner
+        # one kept the real offsets, so SET_RTCP ENABLE=0 reported the
+        # compensation off and the steppers went on applying it.
+        r, bp, steppers = self._build()
+        r.enabled = False
+        r._update_kinematics()
+        for s in steppers:
+            self.assertEqual(s.get_stepper_kinematics().chain(),
+                             ['bproject', 'rtcp', None])
+            rtcp_sk = s.get_stepper_kinematics().wrapped
+            self.assertEqual(rtcp_sk.params[:2], (0., 0.))
+        # ...and back on
+        r.enabled = True
+        r._update_kinematics()
+        for s in steppers:
+            self.assertEqual(s.get_stepper_kinematics().chain(),
+                             ['bproject', 'rtcp', None])
+            self.assertEqual(
+                s.get_stepper_kinematics().wrapped.params[:2], (0., 40.))
+
+    def test_repeated_toggling_adds_no_layers(self):
+        r, bp, steppers = self._build()
+        for _ in range(5):
+            r.enabled = not r.enabled
+            r._update_kinematics()
+            bp._update_kinematics()
+        for s in steppers:
+            self.assertEqual(s.get_stepper_kinematics().chain(),
+                             ['bproject', 'rtcp', None])
 
 
 def make_bprojection(printer, toolhead, max_angle=40., taper_range=5.,
@@ -879,7 +1026,7 @@ def make_bprojection(printer, toolhead, max_angle=40., taper_range=5.,
     bp.max_b_velocity = max_b_velocity
     bp.max_b_accel = None
     bp.orig_stepper_kinematics = []
-    bp.bproject_stepper_kinematics = []
+    bp.bproject_stepper_kinematics = {}
     return bp
 
 

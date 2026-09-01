@@ -64,7 +64,8 @@ class BAxisProjection:
                                               above=0.)
         self.max_b_accel = config.getfloat('max_b_accel', None, above=0.)
         self.orig_stepper_kinematics = []
-        self.bproject_stepper_kinematics = []
+        # The wrapper installed on each stepper, keyed by stepper name
+        self.bproject_stepper_kinematics = {}
         # B angle at which the probe pin hangs vertical, once known
         self.probe_b = None
         # [rtcp] wraps the steppers in its own klippy:connect handler and
@@ -125,9 +126,15 @@ class BAxisProjection:
     # Stepper wrapping
     ######################################################################
     def _get_bproject_stepper_kinematics(self, s):
+        # Found by stepper name, not by reading the stepper's outermost
+        # kinematic back - see the matching note in klippy/extras/rtcp.py.
+        # Nothing currently wraps outside this module, but recognising
+        # only our own wrapper would silently stack a second projection
+        # the moment something did.
+        bp_sk = self.bproject_stepper_kinematics.get(s.get_name())
+        if bp_sk is not None:
+            return bp_sk
         sk = s.get_stepper_kinematics()
-        if sk in self.bproject_stepper_kinematics:
-            return sk
         ffi_main, ffi_lib = chelper.get_ffi()
         bp_sk = ffi_main.gc(ffi_lib.bproject_alloc(), ffi_lib.free)
         s.set_stepper_kinematics(bp_sk)
@@ -135,7 +142,7 @@ class BAxisProjection:
             s.set_stepper_kinematics(sk)
             return None
         self.orig_stepper_kinematics.append(sk)
-        self.bproject_stepper_kinematics.append(bp_sk)
+        self.bproject_stepper_kinematics[s.get_name()] = bp_sk
         return bp_sk
 
     def _update_kinematics(self):

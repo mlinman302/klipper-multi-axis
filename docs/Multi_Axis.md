@@ -478,6 +478,17 @@ the RTCP wrapper, so the whole chain below it sees one consistent B: the
 angle the head is really turned to.  Getting that ordering wrong would
 make RTCP hold the tip still for a tilt the head is not actually making.
 
+The ordering is established once, by the order of the two `klippy:connect`
+handlers, and both modules then find the wrapper they installed by
+stepper name.  That last part matters: a module that instead recognised
+its own wrapper by reading the stepper's outermost kinematic back would,
+once something had wrapped outside it, fail to recognise anything and
+wrap a *second* time.  `SET_RTCP` would retune that new outer copy while
+the original went on compensating underneath — the compensation
+reported off and still applied, with the projection sandwiched between
+two RTCP transforms.  `test_gcode_pipeline.py`'s `TestStepperWrapping`
+pins the chain.
+
 It also has to live in C rather than in a Python move transform, for the
 same reason RTCP does: the bed angle changes continuously *within* a
 move, so a per-move transform would only be right at the endpoints.

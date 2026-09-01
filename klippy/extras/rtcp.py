@@ -110,7 +110,8 @@ class RTCP:
         self.frame = lookup_frame(config)
         self.enabled = config.getboolean('enable', True)
         self.orig_stepper_kinematics = []
-        self.rtcp_stepper_kinematics = []
+        # The wrapper installed on each stepper, keyed by stepper name
+        self.rtcp_stepper_kinematics = {}
         self.printer.register_event_handler("klippy:connect", self._connect)
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('SET_RTCP', self.cmd_SET_RTCP,
@@ -135,9 +136,20 @@ class RTCP:
     # Stepper wrapping
     ######################################################################
     def _get_rtcp_stepper_kinematics(self, s):
+        # The wrapper is installed once, at connect time, and only
+        # retuned afterwards.  It has to be found by stepper name rather
+        # than by reading s.get_stepper_kinematics() back: [b_projection]
+        # wraps these same steppers *outside* this one, so once it has
+        # done so the outermost kinematic is its wrapper, not ours.
+        # Recognising only our own would then wrap a second time, leaving
+        # rtcp -> b_projection -> rtcp -> solver: SET_RTCP would retune
+        # the new outer copy and report the compensation off while the
+        # inner one went on applying it, with the projection sandwiched
+        # the wrong way round between them.
+        rtcp_sk = self.rtcp_stepper_kinematics.get(s.get_name())
+        if rtcp_sk is not None:
+            return rtcp_sk
         sk = s.get_stepper_kinematics()
-        if sk in self.rtcp_stepper_kinematics:
-            return sk
         ffi_main, ffi_lib = chelper.get_ffi()
         rtcp_sk = ffi_main.gc(ffi_lib.rtcp_alloc(), ffi_lib.free)
         s.set_stepper_kinematics(rtcp_sk)
@@ -145,7 +157,7 @@ class RTCP:
             s.set_stepper_kinematics(sk)
             return None
         self.orig_stepper_kinematics.append(sk)
-        self.rtcp_stepper_kinematics.append(rtcp_sk)
+        self.rtcp_stepper_kinematics[s.get_name()] = rtcp_sk
         return rtcp_sk
 
     def _update_kinematics(self):
