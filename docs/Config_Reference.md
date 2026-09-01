@@ -2592,6 +2592,16 @@ command toggles or retunes the compensation. The machine does not move:
 the reported position is converted between the two frames so that the
 carriages stay where they are.
 
+Homing runs in the carriage frame, so `G28` is refused with compensation
+on, whatever axis it names - run `SET_RTCP ENABLE=0` first. This is not
+bookkeeping: with it on a B home sweeps the head looking for its endstop,
+which the compensation turns into an unchecked X/Z move of up to the
+whole tool offset before either axis is homed, while a linear home books
+its result as a tool tip rather than a carriage position and so homes the
+axis to the wrong place without raising anything. The homing macros in
+[example-corertheta.cfg](../config/example-corertheta.cfg) each turn
+compensation off for themselves and back on at the end.
+
 The older `pivot_length` and `pivot_x_offset` options were renamed when
 the sign conventions above were fixed; klippy reports an error naming the
 replacement rather than reinterpreting an old config.
@@ -2684,9 +2694,10 @@ None of this uses the `[rtcp]` geometry, and it must not: **probing,
 homing and bed mesh all run with RTCP off**, where a B move disturbs
 nothing else and the four offsets above are constants rather than
 functions of B. That is what lets `G28 Z` run before X and Z are homed.
+`G28` is refused with compensation on whatever axis it names, and
 `PROBE`, `G28 Z` through `probe:z_virtual_endstop` and
-`BED_MESH_CALIBRATE` are refused with compensation on, and refused with B
-away from the probe's `b_offset`.
+`BED_MESH_CALIBRATE` are refused with B away from the probe's `b_offset`
+as well.
 
 This section itself only handles turning the head to and from that
 orientation, and applying the probe's x/y offsets in the machine's own

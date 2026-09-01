@@ -1,0 +1,12 @@
+# Homing is refused while RTCP compensation is on.  With it on, a B home
+# sweeps the head looking for the endstop and the compensation turns that
+# into an X/Z move of up to the whole tool offset - unchecked, and before
+# either axis is homed - while a linear home books its result as a tool
+# tip rather than a carriage position.
+CONFIG multi_axis_rtcp.cfg
+DICTIONARY atmega2560.dict
+SHOULD_FAIL
+
+# [rtcp] defaults to enable: True, so this is the state the machine comes
+# up in
+G28 X Y Z

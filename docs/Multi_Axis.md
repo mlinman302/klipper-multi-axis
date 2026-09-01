@@ -325,6 +325,11 @@ position between the two frames so the carriages stay where they are.  At
 `B = 0` the two frames coincide and the conversion is a no-op, which is
 why the example macros toggle there.
 
+The right hand column is enforced rather than advised.  `G28` refuses to
+home anything at all with compensation on, and `PROBE`, `G28 Z` through
+`probe:z_virtual_endstop` and `BED_MESH_CALIBRATE` refuse as well — see
+"Why homing and probing run with RTCP off" below.
+
 ### The transform
 
 Writing `h` for the horizontal offset and `v` for the vertical one, the
@@ -541,9 +546,27 @@ way.  Its geometric meaning here is the difference between the probe's
 and the nozzle's radius about the B pivot — but nothing computes it from
 that, and nothing should: it is measured.
 
-### Why probing runs with RTCP off
+### Why homing and probing run with RTCP off
 
-This is the whole reason the model collapses to four constants.
+Homing has to, on two counts, and neither of them announces itself:
+
+* **A B home would drive the linear axes, unchecked.**  With RTCP on,
+  turning B *is* an X/Z move, and a B home sweeps the head across 1.5
+  times its range looking for the endstop — so the carriages travel by up
+  to the whole tool offset, typically before either of them is homed.
+  Nothing catches it, either: a rotation-only move has
+  `is_kinematic_move = False`, so `kin.check_move()` is skipped, and
+  `drip_move()` — which is what a homing move is — never runs the
+  registered move checks, so the reach check above does not fire.
+* **A linear home would be booked in the wrong frame.**  What `G28` sets
+  is a carriage position, but with compensation on it is read back as a
+  tool tip position.  The sweep itself still covers the right distance,
+  since B is constant through it and `dh` with it, so the axis simply
+  ends up homed `dh` away from where it thinks it is, and nothing raises
+  an error.
+
+Probing has three reasons of its own, and they are why its model
+collapses to four constants.
 
 1. With RTCP on, turning B *is* an X/Z move, so `G28 B` cannot be
    followed by a probe orientation until X, Y and Z are all homed — and Z
@@ -556,11 +579,15 @@ This is the whole reason the model collapses to four constants.
    the arm radius is simply the bed radius being probed, and the mesh z
    values are the reported toolhead z at each trigger.
 
-So it is not a recommendation, it is enforced: `PROBE`, `G28 Z` through
-`probe:z_virtual_endstop` and `BED_MESH_CALIBRATE` are all refused with
-compensation on, and refused with B away from the probe's `b_offset`.
-`rtcp.check_disabled()` and `rtcp_probe.check_probe_ready()` do the
-refusing, and both say what to run instead.
+So it is not a recommendation, it is enforced.  `G28` is refused outright
+with compensation on, whatever axis it names; `PROBE`, `G28 Z` through
+`probe:z_virtual_endstop` and `BED_MESH_CALIBRATE` are refused with it on
+*and* refused with B away from the probe's `b_offset`.
+`PrinterHoming._check_rtcp_disabled()`, `rtcp.check_disabled()` and
+`rtcp_probe.check_probe_ready()` do the refusing, and all say what to run
+instead.  The homing macros in `config/example-corertheta.cfg` each turn
+compensation off for themselves, so they work whatever state the machine
+was left in.
 
 The catch is point 3's other half: with RTCP off the arm radius *is* the
 bed radius, so probing the centre of the bed drives the arm to radius

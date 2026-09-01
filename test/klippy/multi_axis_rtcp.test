@@ -2,9 +2,13 @@
 DICTIONARY atmega2560.dict
 CONFIG multi_axis_rtcp.cfg
 
-# Home everything
+# Home everything.  Homing runs in the carriage frame and G28 refuses to
+# run with compensation on, so turn it off across the homes.  B is at
+# zero here, where the two frames coincide and toggling is a no-op.
+SET_RTCP ENABLE=0
 G28 X Y Z
 G28 B
+SET_RTCP ENABLE=1
 
 G1 X50 Y50 Z20 F3000
 
@@ -47,8 +51,13 @@ G1 B10 F600
 SET_RTCP VERTICAL_OFFSET=40.0
 G1 B0 F600
 
-# Re-home with RTCP active
+# Re-home from a tilted, compensated state.  Turning RTCP off does not
+# move the machine, it just hands the carriage position back, which is
+# the frame the homes then run in.
+G1 B30 F600
+SET_RTCP ENABLE=0
 G28 X Y Z
 G28 B
+SET_RTCP ENABLE=1
 
 M84

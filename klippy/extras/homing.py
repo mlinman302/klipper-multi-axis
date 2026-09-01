@@ -402,7 +402,24 @@ class PrinterHoming:
             if gcode_id and gcmd.get(gcode_id, None) is not None:
                 res.append(ea)
         return res
+    def _check_rtcp_disabled(self):
+        # Homing works in the carriage frame - see klippy/extras/rtcp.py.
+        # With compensation on, turning B is also an X/Z move, and one
+        # that nothing checks: a rotation-only move is not a kinematic
+        # move, so the kinematics' own check_move() is skipped, and a
+        # drip move never runs the reach check either.  The linear axes
+        # would be driven by the whole tool offset, quite possibly before
+        # they are homed.  A linear home is wrong more quietly: the
+        # position it sets is a carriage position, but with compensation
+        # on it is read back as a tool tip position, leaving the axis
+        # homed to the wrong place and no error raised at all.
+        rtcp = self.printer.lookup_object('rtcp', None)
+        if rtcp is not None:
+            rtcp.check_disabled("Homing")
     def cmd_G28(self, gcmd):
+        # Refuse before touching anything, so a home rejected on these
+        # grounds does not drop the motors on the way out
+        self._check_rtcp_disabled()
         # Move to origin
         axes = []
         for pos, axis in enumerate('XYZ'):
