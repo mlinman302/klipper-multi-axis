@@ -562,6 +562,33 @@ class TestRTCP(unittest.TestCase):
         gcode.run_script("G1 X100 Z50 B90 F600")
         self.assertAlmostEqual(th.commanded_pos[5], 90.)
 
+    def test_check_move_catches_an_interior_radius_dip(self):
+        # A chord that does not pass through the bed centre has its
+        # smallest arm radius in the middle, not at either end: from
+        # (40, -40) to (40, 40) the radius is 56.6 at both ends and dips
+        # to 40 between them.  With the tip 50 mm below the pivot and the
+        # head at B90 the correction is -50, so the ends clear the centre
+        # by 6.6 mm while the middle is 10 mm through it.  An
+        # endpoint-only check waved this through.
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        r = make_rtcp(printer, th, tool_v=50.,
+                      frame=rtcp_mod.FRAME_RADIAL)
+        th.kin.status = {'axis_minimum': [-200., -200., -200.],
+                         'axis_maximum': [200., 200., 200.]}
+        th.register_move_check(r._check_move)
+        gcode.run_script('G1 X40 Y-40 B90 F600')
+        self.assertRaises(gcode_mod.CommandError,
+                          gcode.run_script, 'G1 X40 Y40 F600')
+        # ...while the same chord kept clear of the centre is fine
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        r = make_rtcp(printer, th, tool_v=50.,
+                      frame=rtcp_mod.FRAME_RADIAL)
+        th.kin.status = {'axis_minimum': [-200., -200., -200.],
+                         'axis_maximum': [200., 200., 200.]}
+        th.register_move_check(r._check_move)
+        gcode.run_script('G1 X80 Y-40 B90 F600')
+        gcode.run_script('G1 X80 Y40 F600')
+
     def test_rotation_only_move_is_range_checked(self):
         # A B-only move still moves the carriages under RTCP, so it must
         # go through the machine-position check
@@ -1130,6 +1157,24 @@ class TestBProjection(unittest.TestCase):
         move = th.lookahead.queue[-1]
         # ~10 degrees of machine B over the move, at 1 deg/s
         self.assertLess(math.sqrt(move.max_cruise_v2), move.move_d / 9.)
+
+    def test_chord_off_the_bed_centre_is_speed_limited(self):
+        # The bug this pins.  A chord that does not pass through the bed
+        # centre has the same bed angle cosine at both ends, so an
+        # endpoint-only check saw no machine B travel at all and left the
+        # move at full speed - while the machine's B really ran from
+        # 10*cos(72) out to the full 10 in the middle and back.
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = make_bprojection(printer, th, max_b_velocity=1.)
+        th.register_move_check(bp._check_move)
+        gcode.run_script('G1 X10 Y-30 B10 F600')
+        gcode.run_script('G1 X10 Y30 F600')
+        move = th.lookahead.queue[-1]
+        self.assertAlmostEqual(bp.project_pos(move.start_pos),
+                               bp.project_pos(move.end_pos), places=9)
+        # 6.84 degrees of machine B over a 60 mm move, at 1 deg/s
+        self.assertLess(math.sqrt(move.max_cruise_v2), 9.)
+        self.assertGreater(math.sqrt(move.max_cruise_v2), 8.5)
 
     def test_move_with_no_machine_b_change_is_untouched(self):
         printer, gcode, gmove, th, resp = build_env(('b',))

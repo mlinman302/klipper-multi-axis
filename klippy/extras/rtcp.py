@@ -249,15 +249,40 @@ class RTCP:
     ######################################################################
     # Range checking
     ######################################################################
+    def _interior_points(self, move):
+        # Positions inside a move that can be worse than either end.  The
+        # commanded B changes monotonically along a move, so on its own it
+        # needs no interior check - but the geometry a move sweeps out on
+        # a polar machine is not monotonic unless the path is radial:
+        #
+        #  * where the path crosses the bed's x axis, [b_projection] is at
+        #    |cos(bed angle)| = 1, so the machine's B - and with it the
+        #    swing of the tip - is at its largest.
+        #  * where the path passes closest to the centre of the bed the
+        #    arm radius is at its smallest, which is what the radial check
+        #    below is about.
+        #
+        # A chord from (40, -30) to (40, 30) has a radius of 50 at both
+        # ends and dips to 40 in the middle; the same chord held at B10
+        # projects to the same machine B at both ends and runs out to the
+        # full 10 between them.  Every coordinate moves linearly along a
+        # move, so interpolating the whole position vector is exact.
+        sp, ep = move.start_pos, move.end_pos
+        ts = []
+        if self.b_project is not None and (sp[1] < 0.) != (ep[1] < 0.):
+            ts.append(sp[1] / (sp[1] - ep[1]))
+        if self.frame == FRAME_RADIAL:
+            dx, dy = ep[0] - sp[0], ep[1] - sp[1]
+            d2 = dx * dx + dy * dy
+            if d2 > 0.:
+                ts.append(-(sp[0] * dx + sp[1] * dy) / d2)
+        return [[s + t * (e - s) for s, e in zip(sp, ep)]
+                for t in ts if 0. < t < 1.]
+
     def _check_move(self, move):
         # The kinematics checked the *tip* position; make sure the machine
         # position it maps to is also reachable.  Both endpoints are
-        # checked - the B angle changes monotonically within a move, so
-        # the RTCP offset does too, and no interior point is further out
-        # than the ends.  (With [b_projection] the machine's B also
-        # follows the bed angle, which is not monotonic over a long arc;
-        # the endpoints are then a close bound rather than a strict one,
-        # and the projection only ever shrinks |B| towards zero.)
+        # checked, along with any interior extreme - see _interior_points().
         tool_h, tool_v = self.get_tool_offsets()
         if not tool_h and not tool_v:
             return
@@ -267,7 +292,8 @@ class RTCP:
         axis_max = status.get('axis_maximum')
         if axis_min is None or axis_max is None:
             return
-        for endpoint in (move.start_pos, move.end_pos):
+        for endpoint in ([move.start_pos, move.end_pos]
+                         + self._interior_points(move)):
             if self.frame == FRAME_RADIAL:
                 # The arm radius cannot go negative.  The transform would
                 # happily produce a point on the far side of the centre at

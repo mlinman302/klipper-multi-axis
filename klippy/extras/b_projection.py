@@ -246,6 +246,22 @@ class BAxisProjection:
     ######################################################################
     # Move checking
     ######################################################################
+    def x_axis_crossing(self, move):
+        # The point, if any, where a move crosses the bed's x axis - as a
+        # full toolhead position, since every coordinate moves linearly
+        # along a move.  The projection follows cos(bed angle), and while
+        # the bed angle itself sweeps monotonically along a straight line,
+        # its cosine does not: it peaks at |1| where the path crosses y=0,
+        # which for a path that is not radial is an interior point.  The
+        # two ends can therefore say nothing at all is happening.
+        sp, ep = move.start_pos, move.end_pos
+        if (sp[1] < 0.) == (ep[1] < 0.):
+            return None
+        t = sp[1] / (sp[1] - ep[1])
+        if not 0. < t < 1.:
+            return None
+        return [s + t * (e - s) for s, e in zip(sp, ep)]
+
     def _check_move(self, move):
         # The commanded B and the machine B do not move at the same rate:
         # a move that swings the bed while B is held changes the machine's
@@ -253,9 +269,15 @@ class BAxisProjection:
         # a move down so the gantry can follow.
         if not self.enabled or not move.move_d:
             return
-        b_start = self.project_pos(move.start_pos)
-        b_end = self.project_pos(move.end_pos)
-        axis_d = abs(b_end - b_start)
+        b_vals = [self.project_pos(move.start_pos),
+                  self.project_pos(move.end_pos)]
+        crossing = self.x_axis_crossing(move)
+        if crossing is not None:
+            # Held at B10, a chord from (10, -30) to (10, 30) reads as ten
+            # times cos(72 degrees) at both ends - no machine B travel at
+            # all - while really running out to the full 10 in the middle
+            b_vals.append(self.project_pos(crossing))
+        axis_d = max(b_vals) - min(b_vals)
         if not axis_d:
             return
         axis_ratio = move.move_d / axis_d

@@ -409,10 +409,27 @@ tests pin both to the same numbers.
 
 The kinematics check the *tip* position against the axis limits, but the
 carriages go somewhere else.  `[rtcp]` therefore registers a
-`toolhead.register_move_check()` callback that maps both move endpoints
-into machine coordinates and compares them against
-`axis_minimum`/`axis_maximum`.  Checking the endpoints is sufficient
-because B varies monotonically within a move, so the offset does too.
+`toolhead.register_move_check()` callback that maps the move into
+machine coordinates and compares it against
+`axis_minimum`/`axis_maximum`.
+
+The endpoints are not the whole story.  B itself does vary
+monotonically within a move, so on a cartesian machine the ends bound
+the offset — but the geometry a move sweeps out on a *polar* machine
+does not, unless the path happens to be radial.  Two interior points
+can be worse than either end, and `_interior_points()` adds them:
+
+* **Closest approach to the bed centre.**  A chord from (40, −30) to
+  (40, 30) has an arm radius of 50 at both ends and dips to 40 in the
+  middle — so the radial check below has to be run there too.
+* **Where the path crosses the bed's x axis.**  With `[b_projection]`
+  the tip swings by the *machine* B, which follows `cos(bed angle)`;
+  that peaks at |1| on the x axis, which for a non-radial path is an
+  interior point.
+
+Every coordinate moves linearly along a move, so interpolating the
+whole position vector to those two parameters is exact rather than a
+sampling.
 
 In the radial frame it additionally rejects a move whose corrected arm
 radius would go negative.  The transform would happily produce a point on
@@ -457,8 +474,26 @@ b_machine = b * cos(theta),   theta = atan2(y, x)   (the bed angle)
 ```
 
 so holding `B10` through a full turn of the bed sweeps the machine's B
-over 10 → 0 → −10 → 0 → 10.  `cos(theta)` is `x/|xy|`, so no
-trigonometry is involved.
+over 10 → 0 → −10 → 0 → 10.
+
+`theta` here *is* the bed angle — the coordinate `[stepper_c]` is
+driven to.  `corertheta_stepper_bed_calc_position()` in
+`kin_corertheta.c` resolves it as `atan2(y, x)` of the commanded
+position (unwrapped across ±π, which `cos` does not care about), so
+there is no second, independent source of bed angle to consult: on a
+polar machine the commanded x/y *define* where the bed has to be.
+`kin_bproject.c` therefore takes `cos(theta)` as `x/|xy|` and skips
+the trigonometry — the same number, to the last bit.  It mirrors the
+same dead-zone rule as the bed solver near the centre, where the angle
+comes from the direction of travel instead, so the two never disagree
+about which way the bed is pointing.
+
+None of that assumes a path centred on the bed origin.  The factor is
+evaluated per sample time from the position at that instant, so an
+off-centre path gets the bed angle it actually has at every point
+along itself.  What an off-centre path *does* break is any check that
+only looks at a move's endpoints — see "Reach checking" above and
+`_check_move()` below.
 
 Whether the machine reads `B` this way at all is one setting:
 `enable` in `[b_projection]`.  With it `False`, `B` is a plain
@@ -542,7 +577,12 @@ ignored, since a config that still sets them meant something else.
 
 `_check_move()` still limits `max_b_velocity`, for the case it was really
 needed for: a move that swings the bed while `B` is held changes the
-machine's B without the g-code asking for any B travel at all.
+machine's B without the g-code asking for any B travel at all.  It
+samples the bed's x axis crossing as well as the two ends, because a
+chord that misses the bed centre reaches its largest machine B
+between them — held at `B10`, (10, −30) → (10, 30) projects to 3.16
+at both ends and runs out to the full 10 in the middle, which the
+endpoints alone report as no B travel at all.
 
 ### The band, and why it is tapered
 
