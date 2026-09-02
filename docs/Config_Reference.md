@@ -2626,51 +2626,60 @@ Holding `B10` through a full turn of the bed therefore sweeps the
 machine's B over 10 -> 0 -> -10 -> 0 -> 10. At a bed angle of zero the
 two frames coincide and `B` reaches the machine unchanged.
 
-Angles beyond `max_angle` are orientation commands rather than print
-moves - swinging the probe down, parking the head - and pass through
-untouched, so `RTCP_PROBE_ORIENT` and `G28 B` keep meaning exactly what
-they say. A hard switch there would be a discontinuity of up to
-`max_angle` degrees on the machine's B, which the step compressor cannot
-absorb, so the correction is faded out with a smoothstep over
-`taper_range` degrees above `max_angle` instead. Moves that cross the
-band are slowed to keep the machine's B inside `max_b_velocity`.
+The scaling applies at **every** angle: the ratio at a given X/Y is the
+same at `B5` as at `B50`, with no threshold anywhere. It therefore also
+scales the machine angles that orientation commands use - the probe's
+`b_offset`, the `G28 B` park angle - so **homing, probing and
+`RTCP_PROBE_ORIENT` are refused while the projection is on**, exactly as
+they are refused while RTCP is on. Run `SET_B_PROJECTION ENABLE=0` for
+them and `SET_B_PROJECTION ENABLE=1` to print; the macros in
+[example-corertheta.cfg](../config/example-corertheta.cfg) toggle the two
+transforms together.
+
+Earlier versions stopped projecting above a `max_angle` so that
+orientation angles passed through untouched. That band is gone: the
+angle it held back had to be paid out inside a few degrees of taper, so
+a ten degree g-code move could become forty degrees of head travel near
+the square-on bed angles. `max_angle` and `taper_range` are now refused
+as options rather than ignored. See [Multi_Axis.md](Multi_Axis.md).
 
 Requires the `corertheta` kinematics and `b` in the `additional_axes`
 option of `[printer]`. Composes with `[rtcp]`, which is given the angle
-the head is really turned to rather than the commanded one. When
-`[rtcp_probe]` is present, klippy checks at startup that the probe's
-`b_offset` falls outside the band - the pin would not be vertical while
-probing otherwise.
+the head is really turned to rather than the commanded one.
 
 See [Multi_Axis.md](Multi_Axis.md) and
 [multi_axis_bproject.cfg](../test/klippy/multi_axis_bproject.cfg).
 
 ```
 [b_projection]
-#max_angle: 40.0
-#   Largest |B| (in degrees) that is fully projected. Beyond it plus
-#   taper_range the commanded B reaches the machine unchanged. Setting
-#   this to 0 disables the transform. The default is 40.
-#taper_range: 5.0
-#   Width of the band (in degrees) above max_angle over which the
-#   projection is faded out, so that the machine's B stays continuous
-#   across the switch to pass-through. The default is 5.
 #max_b_velocity:
 #   Ceiling (in degrees/second) on how fast the *machine's* B may be
-#   driven. Used to slow down moves whose machine B changes faster than
-#   the commanded B - crossing the taper band, or swinging the bed while
-#   B is held. The default is the printer's max_velocity converted
-#   through the corertheta b_coupling_ratio.
+#   driven. Used to slow down a move that swings the bed while B is
+#   held, which changes the machine's B without the g-code asking for
+#   any B travel at all. The default is the printer's max_velocity
+#   converted through the corertheta b_coupling_ratio.
 #max_b_accel:
 #   Matching acceleration ceiling (in degrees/second^2). The default is
 #   to place no acceleration limit.
 #enable: True
-#   Whether the projection is active at startup. It can be toggled at
-#   runtime with SET_B_PROJECTION. The default is True.
+#   The machine-level switch for the feature. True reads B in the bed
+#   frame as above. False makes B a plain machine tilt - the head
+#   leans along the arm by exactly the angle commanded, at every bed
+#   position - and, since homing and probing already want that, no
+#   macro has to toggle anything. SET_B_PROJECTION turns the
+#   transform off and back on around those operations, and its
+#   RESTORE form returns it to the value set here, so this setting
+#   survives the macros. The default is True.
 ```
 
-The `SET_B_PROJECTION [ENABLE=0|1] [MAX_ANGLE=<deg>] [TAPER_RANGE=<deg>]`
-command toggles or retunes the transform.
+The `SET_B_PROJECTION [ENABLE=0|1] [RESTORE=1]` command turns the
+transform off and on. `RESTORE=1` returns it to the `enable` setting
+above rather than forcing it on, which is what a macro should use after
+a home or a probe - a machine configured with `enable: False` then stays
+off. The machine does not move either way, but the commanded B changes
+meaning, so the toolhead is resynced to name the angle the head is
+already at; toggle at `B0`, where the two frames coincide and nothing
+has to be converted.
 
 ### [rtcp_probe]
 

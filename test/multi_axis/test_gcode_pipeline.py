@@ -172,6 +172,8 @@ class FakeToolHead:
                                   for e_index, n in enumerate(enames) if n}
     def get_position(self):
         return list(self.commanded_pos)
+    def set_position(self, newpos, homing_axes=""):
+        self.commanded_pos[:] = list(newpos)
     def get_extra_axes(self):
         return [None, None, None] + self.extra_axes
     def get_rotary_axes(self):
@@ -1013,16 +1015,15 @@ class TestStepperWrapping(unittest.TestCase):
                              ['bproject', 'rtcp', None])
 
 
-def make_bprojection(printer, toolhead, max_angle=40., taper_range=5.,
-                     max_b_velocity=60.):
+def make_bprojection(printer, toolhead, max_b_velocity=60.,
+                     config_enabled=True):
     # Build the object without config or chelper, then exercise its real
     # transform, inverse and move-check logic
     bp = bproject_mod.BAxisProjection.__new__(bproject_mod.BAxisProjection)
     bp.printer = printer
     bp.toolhead = toolhead
-    bp.enabled = True
-    bp.max_angle = max_angle
-    bp.taper_range = taper_range
+    bp.config_enabled = config_enabled
+    bp.enabled = config_enabled
     bp.max_b_velocity = max_b_velocity
     bp.max_b_accel = None
     bp.orig_stepper_kinematics = []
@@ -1056,29 +1057,37 @@ class TestBProjection(unittest.TestCase):
         self.assertAlmostEqual(bp.project_pos(self._pos(s, s, 10.)),
                                10. / math.sqrt(2.), places=9)
 
-    def test_orientation_angles_pass_through(self):
-        # The probe angle and the park angle are outside the band, so
-        # RTCP_PROBE_ORIENT and G28 B keep meaning what they say
+    def test_scaling_is_uniform_over_the_whole_b_range(self):
+        # The bug this pins.  There used to be a pass-through band above
+        # max_angle, so that orientation angles reached the machine
+        # untouched.  Everything the projection held back below the
+        # threshold had to be paid out inside the taper above it: at a
+        # bed angle of 76 degrees, B40 -> B50 became 40.6 degrees of head
+        # travel for a 10 degree command.  The ratio must not depend on B.
         printer, gcode, gmove, th, resp = build_env(('b',))
         bp = make_bprojection(printer, th)
-        for b in (45., -90., 60.):
-            self.assertAlmostEqual(bp.project_pos(self._pos(0., 100., b)),
-                                   b, places=9)
+        x, y = 1.85, 7.65      # the position it was reported from
+        cos_t = x / math.hypot(x, y)
+        for b in (5., 10., 25., 39.9, 40., 40.1, 45., 50., 90.):
+            for sign in (1., -1.):
+                self.assertAlmostEqual(
+                    bp.project_pos(self._pos(x, y, sign * b)),
+                    sign * b * cos_t, places=9)
 
-    def test_taper_is_continuous(self):
-        # A hard cutoff would jump the machine's B by up to max_angle in
-        # one step, which the step compressor cannot absorb
+    def test_no_gain_cliff_anywhere_in_the_b_range(self):
+        # Equivalently: d(machine B)/d(commanded B) is cos(theta)
+        # everywhere, so no small g-code move can become a large one
         printer, gcode, gmove, th, resp = build_env(('b',))
         bp = make_bprojection(printer, th)
-        prev = bp.project_pos(self._pos(0., 100., 39.))
-        b = 39.
-        while b < 46.:
-            b += 0.02
-            cur = bp.project_pos(self._pos(0., 100., b))
-            self.assertLess(abs(cur - prev), 0.5)
+        x, y = 1.85, 7.65
+        cos_t = x / math.hypot(x, y)
+        b, step = -90., 0.25
+        prev = bp.project_pos(self._pos(x, y, b))
+        while b < 90.:
+            b += step
+            cur = bp.project_pos(self._pos(x, y, b))
+            self.assertAlmostEqual((cur - prev) / step, cos_t, places=9)
             prev = cur
-        self.assertAlmostEqual(bp.project_pos(self._pos(0., 100., 42.5)),
-                               21.25, places=9)
 
     def test_disabled_is_identity(self):
         printer, gcode, gmove, th, resp = build_env(('b',))
@@ -1095,7 +1104,7 @@ class TestBProjection(unittest.TestCase):
             for deg in range(0, 360, 17):
                 th_rad = math.radians(deg)
                 x, y = 60. * math.cos(th_rad), 60. * math.sin(th_rad)
-                if abs(math.cos(th_rad)) < 0.2 and abs(b) < 45.:
+                if abs(math.cos(th_rad)) < 0.2:
                     continue    # not invertible - covered below
                 machine = self._pos(x, y, bp.project_pos(self._pos(x, y, b)))
                 back = bp.machine_to_commanded(machine, self._pos(x, y, b))
@@ -1131,65 +1140,79 @@ class TestBProjection(unittest.TestCase):
         move = th.lookahead.queue[-1]
         self.assertAlmostEqual(math.sqrt(move.max_cruise_v2), 10.)
 
-    def test_probe_angle_guard(self):
-        # The probe pin is vertical at exactly one B, and the band must
-        # not reach it or the pin gets tilted while probing
+    def test_check_disabled(self):
+        # Homing, probing and orienting command machine angles, which
+        # the projection would scale by whatever bed angle is under the
+        # arm - so they are refused rather than quietly mis-aimed
         printer, gcode, gmove, th, resp = build_env(('b',))
         bp = make_bprojection(printer, th)
-        bp.probe_b = None
-        self.assertIsNone(bp._probe_angle_error(40., 5.))
-        bp.probe_b = -45.
-        # Exactly on the boundary is a true pass-through, so allowed
-        self.assertIsNone(bp._probe_angle_error(40., 5.))
-        self.assertIsNone(bp._probe_angle_error(40., 3.))
-        # Inside the band is not
-        self.assertIsNotNone(bp._probe_angle_error(41., 5.))
-        bp.probe_b = -41.
-        self.assertIsNotNone(bp._probe_angle_error(40., 5.))
-        # A disabled transform touches nothing
-        self.assertIsNone(bp._probe_angle_error(0., 5.))
+        self.assertRaises(printer.command_error, bp.check_disabled, 'Homing')
+        bp.enabled = False
+        bp.check_disabled('Homing')
 
-    def test_probe_angle_comes_from_the_probe_not_rtcp_probe(self):
-        # [rtcp_probe] resolves its probe in its own klippy:connect
-        # handler, which may not have run yet - reaching through it here
-        # halted the printer with "'NoneType' object has no attribute
-        # 'get_b_offset'".  The angle must come off the probe object,
-        # which exists from config parse whatever the section order.
+    def test_toggling_does_not_turn_the_head(self):
+        # The head stays at the angle it is at; what changes is the
+        # commanded B that names that angle.  Toggling at a non-zero B
+        # used to leave the number alone, so the head turned on the
+        # next move.
         printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = self._bp_with_gcode(printer, gcode, th)
+        x, y, b = 1.85, 7.65, 20.
+        cos_t = x / math.hypot(x, y)
+        th.set_position(self._pos(x, y, b))
+        machine_before = bp.project_pos(th.get_position())
+        self.assertAlmostEqual(machine_before, b * cos_t, places=9)
+        gcode.run_script('SET_B_PROJECTION ENABLE=0')
+        # Same physical angle, now named directly
+        self.assertAlmostEqual(th.get_position()[5], b * cos_t, places=9)
+        self.assertAlmostEqual(bp.project_pos(th.get_position()),
+                               machine_before, places=9)
+        gcode.run_script('SET_B_PROJECTION ENABLE=1')
+        self.assertAlmostEqual(th.get_position()[5], b, places=6)
+        self.assertAlmostEqual(bp.project_pos(th.get_position()),
+                               machine_before, places=6)
 
-        class NotYetConnectedRTCPProbe:
-            probe = None
-            def get_probe_b_position(self):
-                return self.probe.get_b_offset()   # would raise
-
-        class FakeProbe:
-            @staticmethod
-            def get_b_offset():
-                return -45.
-
-        printer.add_object('rtcp_probe', NotYetConnectedRTCPProbe())
-        printer.add_object('probe', FakeProbe())
-        printer.add_object('toolhead', th)
-        bp = make_bprojection(printer, th, max_angle=40., taper_range=3.)
-        bp.toolhead = None
-        bp.probe_b = None
-        # Wrapping the steppers needs chelper; this is about where the
-        # probe angle is read from
-        bp._update_kinematics = lambda: None
-        bp._connect()
-        self.assertAlmostEqual(bp.probe_b, -45.)
-
-    def test_retune_cannot_widen_the_band_over_the_probe(self):
-        printer, gcode, gmove, th, resp = build_env(('b',))
-        bp = make_bprojection(printer, th, max_angle=40., taper_range=3.)
-        bp.probe_b = -45.
+    def _bp_with_gcode(self, printer, gcode, th, config_enabled=True):
+        bp = make_bprojection(printer, th, config_enabled=config_enabled)
         printer.add_object('b_projection', bp)
         gcode.register_command('SET_B_PROJECTION', bp.cmd_SET_B_PROJECTION)
-        self.assertRaises(gcode_mod.CommandError, gcode.run_script,
-                          "SET_B_PROJECTION MAX_ANGLE=60")
-        # ...and the rejected value was not applied
-        self.assertAlmostEqual(bp.max_angle, 40.)
+        bp._update_kinematics = lambda: None
+        return bp
 
+    def test_restore_returns_to_the_configured_setting(self):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = self._bp_with_gcode(printer, gcode, th)
+        gcode.run_script('SET_B_PROJECTION ENABLE=0')
+        self.assertFalse(bp.enabled)
+        gcode.run_script('SET_B_PROJECTION RESTORE=1')
+        self.assertTrue(bp.enabled)
+
+    def test_a_machine_configured_off_stays_off_through_the_macros(self):
+        # 'enable: False' in printer.cfg is the machine-level switch.
+        # The homing macros turn the projection off and then RESTORE
+        # it, so it must come back off - forcing ENABLE=1 there would
+        # switch the feature on behind the operator.
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        bp = self._bp_with_gcode(printer, gcode, th, config_enabled=False)
+        self.assertFalse(bp.enabled)
+        gcode.run_script('SET_B_PROJECTION ENABLE=0')
+        gcode.run_script('SET_B_PROJECTION RESTORE=1')
+        self.assertFalse(bp.enabled)
+        # ...and it is still reachable by hand for a deliberate test
+        gcode.run_script('SET_B_PROJECTION ENABLE=1')
+        self.assertTrue(bp.enabled)
+
+    def test_enable_and_restore_together_are_refused(self):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        self._bp_with_gcode(printer, gcode, th)
+        self.assertRaises(gcode_mod.CommandError, gcode.run_script,
+                          'SET_B_PROJECTION ENABLE=1 RESTORE=1')
+
+    def test_removed_band_options_are_refused(self):
+        # The band was removed rather than re-tuned, so a config that
+        # still sets max_angle means something different now
+        self.assertIn('max_angle', bproject_mod.REMOVED_OPTIONS)
+        self.assertIn('taper_range', bproject_mod.REMOVED_OPTIONS)
 
     def test_rtcp_uses_the_projected_angle(self):
         # RTCP holds the tip still for the tilt the head really makes.

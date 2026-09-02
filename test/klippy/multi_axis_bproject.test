@@ -7,16 +7,19 @@ CONFIG multi_axis_bproject.cfg
 # Report the geometry before anything moves
 RTCP_PROBE_INFO
 
-# Homing and probing run in the carriage frame, with RTCP off.  The
-# B projection stays on throughout: the park angle (-90) and the
-# probing angle (45) both sit outside its band, so neither is touched.
+# Homing, probing and orienting run in the machine frame, so both
+# transforms are off for them: the park angle (-90) and the probing
+# angle (45) are machine angles, and the projection would scale each of
+# them by whatever bed angle happened to be under the arm.
 SET_RTCP ENABLE=0
+SET_B_PROJECTION ENABLE=0
 G28 X
 G28 B
 RTCP_PROBE_ORIENT MODE=PROBE
 RTCP_PROBE_MOVE X=25 Y=0 F=50
 G28 Z
 RTCP_PROBE_ORIENT MODE=TOOL
+SET_B_PROJECTION RESTORE=1
 SET_RTCP ENABLE=1
 
 # Hold B while the bed turns underneath.  The commanded B stays at 10
@@ -39,13 +42,16 @@ G1 B10 F600
 G1 B-10 F600
 G1 B0 F600
 
-# Cross the taper band in both directions.  This is the transition
-# from a projected print angle to a pass-through orientation angle;
-# it has to be continuous, and slow enough for the gantry to follow.
+# Sweep the whole B range at a fixed bed angle.  The scaling is the same
+# at every one of these: there is no threshold at which the projection
+# stops, so no small g-code step becomes a large machine one.
 G1 X20 Y20 F3000
+G1 B20 F600
 G1 B35 F600
+G1 B40 F600
 G1 B45 F600
-G1 B35 F600
+G1 B50 F600
+G1 B40 F600
 G1 B0 F600
 
 # Printing with a held lean while the bed turns
@@ -56,15 +62,14 @@ G1 X-20 Y0 E2 F1500
 G1 X0 Y-20 E3 F1500
 G1 B0 F600
 
-# Retuning the transform re-syncs the toolhead to where it now is
+# Toggling the transform re-syncs the toolhead to where it now is
 G1 X0 Y20 F3000
 G1 B10 F600
-SET_B_PROJECTION ENABLE=0
 G1 B0 F600
-SET_B_PROJECTION ENABLE=1 MAX_ANGLE=30 TAPER_RANGE=10
+SET_B_PROJECTION ENABLE=0
 G1 B10 F600
 G1 B0 F600
-SET_B_PROJECTION ENABLE=1 MAX_ANGLE=40 TAPER_RANGE=5
+SET_B_PROJECTION ENABLE=1
 
 GET_POSITION
 M114

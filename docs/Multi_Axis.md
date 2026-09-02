@@ -328,7 +328,9 @@ why the example macros toggle there.
 The right hand column is enforced rather than advised.  `G28` refuses to
 home anything at all with compensation on, and `PROBE`, `G28 Z` through
 `probe:z_virtual_endstop` and `BED_MESH_CALIBRATE` refuse as well — see
-"Why homing and probing run with RTCP off" below.
+"Why homing and probing run with RTCP off" below.  `[b_projection]`,
+where it is configured, is off for exactly the same operations and
+refuses them the same way, so the two are toggled together.
 
 ### The transform
 
@@ -458,6 +460,16 @@ so holding `B10` through a full turn of the bed sweeps the machine's B
 over 10 → 0 → −10 → 0 → 10.  `cos(theta)` is `x/|xy|`, so no
 trigonometry is involved.
 
+Whether the machine reads `B` this way at all is one setting:
+`enable` in `[b_projection]`.  With it `False`, `B` is a plain
+machine tilt — the head leans along the arm by exactly the angle
+commanded, at every bed position — which is also the frame homing
+and probing want, so nothing has to be toggled for them.  The
+macros turn the transform off for those operations and then
+`SET_B_PROJECTION RESTORE=1` rather than forcing it on, so the
+config setting is what they come back to and a machine configured
+`False` stays that way without any macro being edited.
+
 ### Why the B axis owns this, and not the bed
 
 The obvious alternative is to make the bed axis (`[stepper_c]`) own the
@@ -493,6 +505,45 @@ It also has to live in C rather than in a Python move transform, for the
 same reason RTCP does: the bed angle changes continuously *within* a
 move, so a per-move transform would only be right at the endpoints.
 
+### Why the scaling applies at every angle
+
+It used to stop above `max_angle`.  Not every `B` is a print angle:
+`RTCP_PROBE_ORIENT MODE=PROBE` swings the head to the probe's `b_offset`
+(45 on this machine) to point the pin down, and `G28 B` parks it at -90;
+both are *machine* angles and have to arrive unscaled.  So angles at or
+beyond `max_angle + taper_range` passed straight through, smoothstepped
+over the taper band so the machine's B stayed continuous across the
+switch, and klippy refused to start if the probe's `b_offset` was not
+outside the band.
+
+Continuity was the wrong thing to aim for.  Everything the projection
+held back below the threshold - `(1 - cos(theta)) * max_angle` - had to
+be paid out inside the few degrees of taper above it, so the band was not
+a smoothed step but a very steep ramp, and its slope grew as the bed
+angle approached square-on.  At a bed angle of 76 degrees on the example
+machine, `G1 B40` -> `B50` came out as **40.6 degrees of head travel for
+a 10 degree command**, peaking at a gain of 10x; `[rtcp]` then turned
+that into 42 mm of arm and 24 mm of Z.  `max_b_velocity` can only slow
+such a move down - the excursion is the same however slowly it is taken.
+
+Nor could the band be re-tuned around it.  Keeping print moves out of it
+needs `max_angle` above the largest print angle, while the probe check
+needs `max_angle + taper_range` at or below `|b_offset|`.  With a probe
+at 45 degrees and print angles to 50, no value satisfies both.
+
+So the band is gone.  The scaling now applies at every `B`, the ratio at
+a given X/Y is the same at `B5` as at `B50`, and orientation angles take
+an explicit route instead: **homing, probing and `RTCP_PROBE_ORIENT` run
+with the projection off**, exactly as they already run with RTCP off.
+`check_disabled()` refuses each of them otherwise, and the macros in
+`config/example-corertheta.cfg` toggle the two transforms together.
+`max_angle` and `taper_range` are refused as config options rather than
+ignored, since a config that still sets them meant something else.
+
+`_check_move()` still limits `max_b_velocity`, for the case it was really
+needed for: a move that swings the bed while `B` is held changes the
+machine's B without the g-code asking for any B travel at all.
+
 ### The band, and why it is tapered
 
 Not every `B` is a print angle.  `RTCP_PROBE_ORIENT MODE=PROBE` swings
@@ -515,12 +566,13 @@ band, or swinging the bed while B is held — down to `max_b_velocity`.
 
 `calc_position()` resolves the *machine* B out of the gantry motors, so
 `calc_toolhead_pos()` maps it back through `machine_to_commanded()` after
-the RTCP inverse.  The projection is not invertible where `cos(theta)` is
-near zero — every commanded B maps to nearly the same machine B there —
-and in that case the B the toolhead already believes it is at is kept,
-which is correct whenever B did not move.  In practice every homing move
-happens at `B0`, `B±45` or `B−90`, where the transform is the identity
-and the inverse is exact.
+the RTCP inverse.  With no band the projection is a plain scaling, so the
+inverse is a plain division by `cos(theta)`.  The one place it fails is a
+bed angle square to the tilt plane — every commanded B maps to a machine
+B of zero there — and in that case the B the toolhead already believes it
+is at is kept, which is correct whenever B did not move.  In practice
+homing runs with the projection off, where the map is the identity and
+the inverse is exact.
 
 ### Scope
 
@@ -594,11 +646,19 @@ So it is not a recommendation, it is enforced.  `G28` is refused outright
 with compensation on, whatever axis it names; `PROBE`, `G28 Z` through
 `probe:z_virtual_endstop` and `BED_MESH_CALIBRATE` are refused with it on
 *and* refused with B away from the probe's `b_offset`.
-`PrinterHoming._check_rtcp_disabled()`, `rtcp.check_disabled()` and
+`PrinterHoming._check_transforms_disabled()`, `rtcp.check_disabled()` and
 `rtcp_probe.check_probe_ready()` do the refusing, and all say what to run
 instead.  The homing macros in `config/example-corertheta.cfg` each turn
 compensation off for themselves, so they work whatever state the machine
 was left in.
+
+`[b_projection]` is refused by the same three call sites, and by
+`RTCP_PROBE_ORIENT`.  Its reason is different but points the same way:
+the endstop sweep, the park angle and the angle the probe pin hangs
+vertical at are all *machine* angles, and the projection would scale
+every one of them by whatever bed angle happened to be under the arm —
+by nearly zero with the arm square to the tilt plane, so a B home would
+never reach its endstop.
 
 The catch is point 3's other half: with RTCP off the arm radius *is* the
 bed radius, so probing the centre of the bed drives the arm to radius

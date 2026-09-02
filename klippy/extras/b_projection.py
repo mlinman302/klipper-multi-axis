@@ -16,12 +16,29 @@
 #
 #     b_machine = b * cos(theta),   theta = atan2(y, x)  (the bed angle)
 #
-# so holding B at 10 degrees through a full turn of the bed sweeps the
-# machine's B over 10 -> 0 -> -10 -> 0 -> 10.  Angles beyond 'max_angle'
-# are orientation commands rather than print moves (swinging the probe
-# down, parking the head) and reach the machine untouched; the correction
-# fades out over 'taper_range' degrees above max_angle so that the
-# machine's B stays continuous across the switch.
+# So at bed angle 0 a commanded B reaches the machine untouched; directly
+# across the bed it arrives inverted; and at the two bed angles square to
+# those it collapses to zero, because there the lean being asked for is
+# perpendicular to the only plane the head can tilt in.  Holding B at 10
+# degrees through a full turn of the bed sweeps the machine's B over
+# 10 -> 0 -> -10 -> 0 -> 10.
+#
+# THE SCALING APPLIES AT EVERY ANGLE
+#
+# It used to stop above a 'max_angle', so that orientation commands -
+# swinging the probe down, parking the head - could reach the machine
+# untouched.  A threshold on |B| turned out to be the wrong place to draw
+# that line.  Everything the projection held back below the threshold,
+# (1 - cos theta) * max_angle, had to be paid out inside the few degrees
+# of taper above it; near the square-on bed angles that is almost the
+# whole commanded angle, so a ten degree g-code move became forty degrees
+# of head travel - and, with [rtcp] turning that into carriage motion,
+# tens of millimetres of arm and z with it.
+#
+# Orientation angles take an explicit route instead: homing, probing and
+# turning the head all run with the projection off, exactly as they
+# already run with RTCP off.  See check_disabled() below and
+# docs/Multi_Axis.md.
 #
 # Ownership note: the transform belongs to the B axis, not to the bed.
 # The bed motor's own position is unchanged - it still follows
@@ -32,10 +49,33 @@
 # is what makes every consumer see one consistent B - the angle the head
 # is really turned to - and lets the projection be re-evaluated at every
 # sample time, since the bed angle changes continuously *within* a move.
+import math
 import chelper, stepper
 
 # Index of the B coordinate within a toolhead position vector
 B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
+
+# kin_bproject.c switches to pass-through at max_angle + taper_range, and
+# reads a max_angle of zero as "transform disabled".  The projection now
+# applies at every angle, so the C is handed a threshold that no reachable
+# B can meet; the taper width is then never read.
+NO_BAND_ANGLE = 1e30
+NO_BAND_TAPER = 1.
+
+# Below this radius (in mm) the bed angle is not meaningfully defined.
+# Kept identical to kin_bproject.c and kin_corertheta.c.
+BED_MIN_RADIUS = 0.010
+# Below this |cos(theta)| the projection has no inverse: every commanded B
+# maps onto a machine B of nearly zero.
+COS_EPSILON = 1e-6
+
+# Options that configured the pass-through band.  It was removed rather
+# than re-tuned - see the note at the top of this file - so a config that
+# still sets them means something different now.
+REMOVED_OPTIONS = {
+    'max_angle': "the projection applies at every B",
+    'taper_range': "there is no band left to taper",
+}
 
 
 class BAxisProjection:
@@ -49,25 +89,34 @@ class BAxisProjection:
                 "[b_projection] models a B axis on a rotating bed and only"
                 " applies to the 'corertheta' kinematics (this printer uses"
                 " '%s')" % (kin_name,))
-        self.enabled = config.getboolean('enable', True)
-        # Largest |B| that is fully projected, and the band above it over
-        # which the projection fades out
-        self.max_angle = config.getfloat('max_angle', 40., minval=0.)
-        self.taper_range = config.getfloat('taper_range', 5., above=0.)
-        # Ceiling on how fast the *machine* B may be driven.  Crossing the
-        # taper band changes the machine's B far faster than the commanded
-        # B changes, so a move that does it has to be slowed down.  The
-        # default converts the gantry's linear speed limit through the
-        # coupling ratio, which is where the belt travel actually comes
-        # from.
+        for name, why in REMOVED_OPTIONS.items():
+            if config.get(name, None, note_valid=False) is not None:
+                raise config.error(
+                    "The [b_projection] option '%s' no longer exists - %s,"
+                    " and homing, probing and RTCP_PROBE_ORIENT run with"
+                    " SET_B_PROJECTION ENABLE=0 instead.  See the"
+                    " [b_projection] section of docs/Multi_Axis.md"
+                    % (name, why))
+        # Whether this machine uses the bed-frame interpretation of B at
+        # all.  This is the machine-level switch: SET_B_PROJECTION turns
+        # the transform off and back on around homing and probing, and
+        # RESTORE returns it to the value set here, so a config that says
+        # False stays False through the macros rather than being switched
+        # back on by the first HOME_ALL.
+        self.config_enabled = config.getboolean('enable', True)
+        self.enabled = self.config_enabled
+        # Ceiling on how fast the *machine* B may be driven.  A move that
+        # swings the bed while B is held changes the machine's B without
+        # the g-code asking for any B travel at all, so it has to be
+        # slowed down.  The default converts the gantry's linear speed
+        # limit through the coupling ratio, which is where the belt travel
+        # actually comes from.
         self.max_b_velocity = config.getfloat('max_b_velocity', None,
                                               above=0.)
         self.max_b_accel = config.getfloat('max_b_accel', None, above=0.)
         self.orig_stepper_kinematics = []
         # The wrapper installed on each stepper, keyed by stepper name
         self.bproject_stepper_kinematics = {}
-        # B angle at which the probe pin hangs vertical, once known
-        self.probe_b = None
         # [rtcp] wraps the steppers in its own klippy:connect handler and
         # this wrapper has to end up outside it, so make sure the rtcp
         # object - and therefore its handler - is created first
@@ -90,37 +139,8 @@ class BAxisProjection:
             kin = self.toolhead.get_kinematics()
             b_ratio = abs(getattr(kin, 'b_coeff', 1.)) or 1.
             self.max_b_velocity = self.toolhead.max_velocity / b_ratio
-        # The probe is used at exactly one B angle, and the pin will not
-        # be vertical there unless that angle reaches the machine
-        # untouched - so it has to sit outside the band.  Read the angle
-        # off the probe object, which exists from config parse, rather
-        # than through [rtcp_probe], which resolves its probe in its own
-        # klippy:connect handler - that may not have run yet, and whether
-        # it has depends on the order of the config sections.
-        if self.printer.lookup_object('rtcp_probe', None) is not None:
-            probe = self.printer.lookup_object('probe', None)
-            get_b_offset = getattr(probe, 'get_b_offset', None)
-            if get_b_offset is not None:
-                self.probe_b = get_b_offset()
-        err = self._probe_angle_error(self.max_angle, self.taper_range)
-        if err is not None:
-            raise self.printer.config_error(err)
         self.toolhead.register_move_check(self._check_move)
         self._update_kinematics()
-
-    def _probe_angle_error(self, max_angle, taper_range):
-        # Returns a message if the band would swallow the probing angle,
-        # else None.  The caller raises the error kind that suits it.
-        if self.probe_b is None or max_angle <= 0.:
-            return None
-        band = max_angle + taper_range
-        if abs(self.probe_b) >= band:
-            return None
-        return ("[b_projection] would tilt the probing angle: the probe pin"
-                " is vertical at B=%.3f, which is inside the projected band"
-                " of +/-%.3f.  Lower max_angle + taper_range below it, or"
-                " move the probe angle out of the band."
-                % (self.probe_b, band))
 
     ######################################################################
     # Stepper wrapping
@@ -163,23 +183,35 @@ class BAxisProjection:
         motion_queuing.check_step_generation_scan_windows()
 
     def get_params(self):
-        # A disabled projection is a zero max_angle, which makes the
-        # transform the identity and drops the steppers' dependency on x/y
+        # What kin_bproject.c is handed.  A disabled projection is a zero
+        # max_angle, which makes the transform the identity and drops the
+        # steppers' dependency on x/y.
         if not self.enabled:
-            return 0., self.taper_range
-        return self.max_angle, self.taper_range
+            return 0., NO_BAND_TAPER
+        return NO_BAND_ANGLE, NO_BAND_TAPER
 
     ######################################################################
     # Coordinate transforms
     ######################################################################
+    def cos_bed_angle(self, x, y):
+        # cos(theta) at a position, matching bproject_cos_bed_angle() in
+        # kin_bproject.c for a position that is not moving.  Inside the
+        # dead zone at the centre the C resolves the angle from the
+        # direction of travel; a static position has none, and there the
+        # bed angle has no effect on anything, so leave B alone.
+        r2 = x * x + y * y
+        if r2 < BED_MIN_RADIUS * BED_MIN_RADIUS:
+            return 1.
+        return x / math.sqrt(r2)
+
     def project(self, b, x, y):
         # Machine B for a commanded B at bed position x/y.  The C helper
         # is the one the steppers run, so calling it keeps the host side
         # and the step generation in exact agreement.
-        max_angle, taper_range = self.get_params()
-        if max_angle <= 0.:
+        if not self.enabled:
             return b
         ffi_main, ffi_lib = chelper.get_ffi()
+        max_angle, taper_range = self.get_params()
         return ffi_lib.bproject_project_b(b, x, y, max_angle, taper_range)
 
     def project_pos(self, pos):
@@ -194,51 +226,21 @@ class BAxisProjection:
     def machine_to_commanded(self, pos, fallback_pos=None):
         # Inverse of the above - used when reading a position back out of
         # the steppers (after homing) so B is reported in the frame g-code
-        # uses.  The mapping is not one to one: where the bed angle puts
-        # cos(theta) near zero every commanded B collapses onto nearly the
-        # same machine B, and inside the taper band a negative cos(theta)
-        # gives two preimages.  So collect every solution and take the one
-        # nearest where the toolhead already believes B is - which is the
-        # right answer whenever B did not move, and B only moves on a G28
-        # B, which happens at the park angle where the map is the
-        # identity.
+        # uses.  The projection is a plain scaling by cos(theta), so the
+        # inverse is a division by it.  The one place that fails is a bed
+        # angle square to the machine's tilt plane, where every commanded
+        # B maps onto a machine B of zero and there is nothing to recover;
+        # keep what the toolhead already believes B is there.  Homing runs
+        # with the projection off, so in practice this is the identity.
         res = list(pos)
-        max_angle, taper_range = self.get_params()
-        if max_angle <= 0.:
+        if not self.enabled:
             return res
-        b_m, x, y = pos[B_POS_INDEX], pos[0], pos[1]
-        none_angle = max_angle + taper_range
-        if abs(b_m) >= none_angle:
-            # Outside the band the transform is the identity
-            return res
-        ref = b_m if fallback_pos is None else fallback_pos[B_POS_INDEX]
-        roots = []
-        steps = 400
-        prev_b = -none_angle
-        prev_h = self.project(prev_b, x, y) - b_m
-        for i in range(1, steps + 1):
-            cand = -none_angle + 2. * none_angle * i / steps
-            h = self.project(cand, x, y) - b_m
-            if h == 0.:
-                roots.append(cand)
-            elif (prev_h < 0.) != (h < 0.):
-                lo, hi, h_lo = prev_b, cand, prev_h
-                for _ in range(60):
-                    mid = .5 * (lo + hi)
-                    h_mid = self.project(mid, x, y) - b_m
-                    if (h_mid < 0.) == (h_lo < 0.):
-                        lo, h_lo = mid, h_mid
-                    else:
-                        hi = mid
-                roots.append(.5 * (lo + hi))
-            prev_b, prev_h = cand, h
-        if not roots:
-            # Only reachable if the machine B is not one this transform can
-            # produce at all - keep what the toolhead already has
+        cos_t = self.cos_bed_angle(pos[0], pos[1])
+        if abs(cos_t) < COS_EPSILON:
             if fallback_pos is not None:
                 res[B_POS_INDEX] = fallback_pos[B_POS_INDEX]
             return res
-        res[B_POS_INDEX] = min(roots, key=lambda c: abs(c - ref))
+        res[B_POS_INDEX] = pos[B_POS_INDEX] / cos_t
         return res
 
     ######################################################################
@@ -246,11 +248,10 @@ class BAxisProjection:
     ######################################################################
     def _check_move(self, move):
         # The commanded B and the machine B do not move at the same rate:
-        # a move that crosses the taper band, or that swings the bed while
-        # B is held, can change the machine's B far more than the g-code
-        # asked for.  Slow such a move down so the gantry can follow.
-        max_angle, _ = self.get_params()
-        if max_angle <= 0. or not move.move_d:
+        # a move that swings the bed while B is held changes the machine's
+        # B without the g-code asking for any B travel at all.  Slow such
+        # a move down so the gantry can follow.
+        if not self.enabled or not move.move_d:
             return
         b_start = self.project_pos(move.start_pos)
         b_end = self.project_pos(move.end_pos)
@@ -265,42 +266,69 @@ class BAxisProjection:
         move.limit_speed(limit_v, limit_a)
 
     ######################################################################
+    # Enforcement
+    ######################################################################
+    def check_disabled(self, what):
+        # Homing, probing and turning the head all command a *machine* B -
+        # the endstop sweep, the angle the probe pin hangs vertical at,
+        # the park angle - and with the projection on, every one of them
+        # would be scaled by whatever bed angle happened to be under the
+        # arm.  They run in the machine frame, the same way they already
+        # run with RTCP off.
+        if self.enabled:
+            raise self.printer.command_error(
+                "%s must run with the bed-frame B projection off - run"
+                " SET_B_PROJECTION ENABLE=0 first (and SET_B_PROJECTION"
+                " ENABLE=1 afterwards to print)" % (what,))
+
+    ######################################################################
     # Status and commands
     ######################################################################
     def get_status(self, eventtime=None):
         return {'enabled': self.enabled,
-                'max_angle': self.max_angle,
-                'taper_range': self.taper_range,
+                'configured_enable': self.config_enabled,
                 'max_b_velocity': self.max_b_velocity,
                 'axis': 'B'}
 
-    cmd_SET_B_PROJECTION_help = "Enable/disable or retune the B projection"
+    def set_enabled(self, enabled):
+        if enabled == self.enabled:
+            return
+        # Toggling must not turn the head.  It stays at the angle it is
+        # at, but the commanded B that names that angle changes, so
+        # convert it across before switching and hand the result back as
+        # the new toolhead position - the same thing SET_RTCP does with
+        # the carriage position.  commanded_to_machine() runs in the old
+        # mode and machine_to_commanded() in the new one.  At B=0 the two
+        # frames coincide and this is a no-op, which is why the example
+        # macros toggle there.
+        pos = self.toolhead.get_position()
+        machine_pos = self.commanded_to_machine(pos)
+        self.enabled = enabled
+        self._update_kinematics()
+        self.toolhead.set_position(self.machine_to_commanded(machine_pos, pos))
+
+    cmd_SET_B_PROJECTION_help = \
+        "Turn the bed-frame B projection off for homing or probing" \
+        " (ENABLE=0), or back to the [b_projection] enable setting" \
+        " (RESTORE=1)"
     def cmd_SET_B_PROJECTION(self, gcmd):
         enable = gcmd.get_int('ENABLE', None, minval=0, maxval=1)
-        max_angle = gcmd.get_float('MAX_ANGLE', None, minval=0.)
-        taper_range = gcmd.get_float('TAPER_RANGE', None, above=0.)
-        # Check before applying - a wider band could swallow the angle the
-        # probe pin is vertical at
-        err = self._probe_angle_error(
-            self.max_angle if max_angle is None else max_angle,
-            self.taper_range if taper_range is None else taper_range)
-        if err is not None:
-            raise gcmd.error(err)
+        restore = gcmd.get_int('RESTORE', None, minval=0, maxval=1)
+        if enable is not None and restore:
+            raise gcmd.error(
+                "SET_B_PROJECTION takes ENABLE or RESTORE, not both")
+        if restore:
+            # Back to whatever the config asked for.  A macro that turned
+            # the projection off for a home or a probe uses this rather
+            # than ENABLE=1, so that a machine configured with
+            # 'enable: False' is not switched on behind the operator.
+            enable = self.config_enabled
         if enable is not None:
-            self.enabled = bool(enable)
-        if max_angle is not None:
-            self.max_angle = max_angle
-        if taper_range is not None:
-            self.taper_range = taper_range
-        if (enable is not None or max_angle is not None
-                or taper_range is not None):
-            # Changing the transform turns the head under a fixed
-            # commanded B, so resync the toolhead to where it now is
-            self._update_kinematics()
-            self.toolhead.set_position(self.toolhead.get_position())
+            self.set_enabled(bool(enable))
         gcmd.respond_info(
-            "b_projection: enabled=%s max_angle=%.6f taper_range=%.6f"
-            % (self.enabled, self.max_angle, self.taper_range))
+            "b_projection: enabled=%s (config enable: %s)"
+            " max_b_velocity=%.3f"
+            % (self.enabled, self.config_enabled, self.max_b_velocity))
 
 
 def load_config(config):

@@ -227,9 +227,19 @@ class RTCPProbe:
     ######################################################################
     # probe_transform interface (see klippy/extras/probe.py)
     ######################################################################
+    def _check_transforms_disabled(self, what):
+        # Both transforms between g-code and the machine have to be off:
+        # [rtcp] so the toolhead position is the carriage, [b_projection]
+        # so a commanded B is the angle the head actually turns to rather
+        # than that angle scaled by the bed angle under the arm.
+        self.rtcp.check_disabled(what)
+        b_project = self.printer.lookup_object('b_projection', None)
+        if b_project is not None:
+            b_project.check_disabled(what)
+
     def check_probe_ready(self):
-        # Probing works in the carriage frame and at one B angle only
-        self.rtcp.check_disabled("Probing")
+        # Probing works in the machine frame and at one B angle only
+        self._check_transforms_disabled("Probing")
         if not self.check_b_angle:
             return
         b_angle = self._current_b()
@@ -308,6 +318,12 @@ class RTCPProbe:
             raise gcmd.error("MODE must be PROBE, TOOL or B")
         if not self._b_is_homed():
             raise gcmd.error("Must home B before orienting the head")
+        # The angles this command turns to - the probe angle, the nozzle
+        # angle - are machine angles, so the bed-frame projection has to
+        # be off or they arrive scaled by the bed angle under the arm
+        b_project = self.printer.lookup_object('b_projection', None)
+        if b_project is not None:
+            b_project.check_disabled("Orienting the head")
         if self.rtcp.enabled:
             # With RTCP on a B move is also an X/Z move, so it needs those
             # axes homed - and orienting is something that happens before
