@@ -40,7 +40,7 @@
 # get_axis_rail() below.
 import logging, math
 import stepper
-from .polar import distance_to_center
+from .polar import limit_centre_speed
 from .rotary_axis import parse_additional_axes
 
 
@@ -112,6 +112,12 @@ class CoreRThetaKinematics:
             'max_z_accel', self.max_accel, above=0., maxval=self.max_accel)
         self.v_rad_max = config.getfloat(
             'max_angular_velocity', above=0., default=0)
+        # The bed angle is derived from x/y, so it is singular on the line
+        # x = y = 0 - the tool tip travelling through [0, 0, N] asks the
+        # bed for a half turn in no time at all.  This module owns the
+        # limits and the refusals; it is loaded unconditionally so that
+        # the check cannot be left out of a config by accident.
+        self.printer.load_object(config, 'polar_singularity')
         self.limit_z = (1.0, -1.0)
         self.limit_xy2 = -1.
         max_r = rail_r.get_range()[1]
@@ -238,19 +244,14 @@ class CoreRThetaKinematics:
             z_ratio = move.move_d / abs(move.axes_d[2])
             move.limit_speed(self.max_z_velocity * z_ratio,
                              self.max_z_accel * z_ratio)
-        # Slow down near center
-        if move.axes_d[0] or move.axes_d[1]:
-            if self.v_rad_max == 0:
-                return
-            min_dist = distance_to_center(move.start_pos[0:2],
-                                          move.end_pos[0:2])
-            if min_dist == 0:
-                return
-            v_angular = math.sqrt(move.max_cruise_v2) / min_dist
-            if self.v_rad_max < v_angular:
-                scale_radius = self.v_rad_max / v_angular
-                move.limit_speed(self.max_velocity * scale_radius,
-                                 self.max_accel * scale_radius)
+        # Slow down near center.  A move whose closest approach to the
+        # centre was zero used to return here without being limited at
+        # all - the one move that most needs the limit was the one move
+        # that escaped it.  See the geometry notes at the top of polar.py.
+        # [polar_singularity], loaded above, adds the angular acceleration
+        # limit and refuses the moves no feedrate can rescue.
+        if self.v_rad_max and (move.axes_d[0] or move.axes_d[1]):
+            limit_centre_speed(move, self.v_rad_max)
     def get_status(self, eventtime):
         xy_home = "xy" if self.limit_xy2 >= 0. else ""
         z_home = "z" if self.limit_z[0] <= self.limit_z[1] else ""

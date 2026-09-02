@@ -267,14 +267,17 @@ alongside the linear axes.
 | `test/multi_axis/run_c_tests.sh` | any host with a C compiler | Shared time base, core r-theta coefficients, RTCP geometry, the bed-frame B projection, 3-axis regression, benchmark |
 | `test/multi_axis/test_gcode_pipeline.py` | any host with Python + cffi | Real `gcode.py`, `gcode_move.py`, `Move`, `LookAheadQueue`, `RotaryAxis` |
 | `test/multi_axis/test_rtcp_probe.py` | any host with Python + cffi | Tilting-head probe geometry, the radial probe transform, its config checks |
+| `test/multi_axis/test_polar_singularity.py` | any host with Python | Bed centre geometry, the angular rate limits, what is refused and what is legal on the axis |
 | `test/klippy/multi_axis.test` | Linux (`scripts/test_klippy.py`) | Uncoupled A/C axes: config load, homing, step generation |
 | `test/klippy/multi_axis_rtheta.test` | Linux (`scripts/test_klippy.py`) | Coupled core r-theta stage |
 | `test/klippy/multi_axis_rtcp.test` | Linux (`scripts/test_klippy.py`) | RTCP on a B axis tilting head |
 | `test/klippy/multi_axis_rtcp_probe.test` | Linux (`scripts/test_klippy.py`) | Probing and round-bed mesh with the probe on the tilting head |
 | `test/klippy/multi_axis_bproject.test` | Linux (`scripts/test_klippy.py`) | Bed-frame B projection: held leans through a bed turn, the taper band, `SET_B_PROJECTION` |
+| `test/klippy/polar_singularity.test` | Linux (`scripts/test_klippy.py`) | Bed centre: chords near the axis, and the feedrates they are held to |
+| `test/klippy/polar_singularity_refuse.test` | Linux (`scripts/test_klippy.py`) | Bed centre: a move straight across the axis is refused |
 
 ```bash
-bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py     && python test/multi_axis/test_rtcp_probe.py
+bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py     && python test/multi_axis/test_rtcp_probe.py     && python test/multi_axis/test_polar_singularity.py
 ```
 
 ## RTCP (Rotational Tool Center Point)
@@ -770,6 +773,84 @@ the touching.
   ordinary z offset — run it with RTCP off and the probe oriented, as
   everything else in this section.
 
+## The bed centre singularity (`[polar_singularity]`)
+
+On a rotating-bed machine the bed angle is not a commanded axis.  It is
+derived — `theta = atan2(y, x)`, evaluated per sample in
+`klippy/chelper/kin_corertheta.c` — and that derivation has no value at
+all on the line `x = y = 0`.  A tool tip travelling through `[0, 0, N]`
+is therefore a singularity: an arbitrarily small step across the centre
+is a half turn of the bed, asked for in the instant the sign flips.
+
+It is not an edge case that only bites exactly on the axis.  A move is a
+straight line, so everything follows from two numbers: the perpendicular
+offset of the line of travel from the centre, which is constant along the
+move, and `r_min`, the closest the path comes to the centre.  Then
+
+```
+theta_dot  = v * offset / r^2          peaks at v * offset / r_min^2
+theta_ddot = -2 * v^2 * offset * u / r^4  +  a * offset / r^2
+```
+
+The bed's angular velocity diverges as `1/r` and its angular acceleration
+as `1/r^2`.  The second is the one that bites: it is why a near miss that
+passes a feedrate check can still overrun the step compressor on the
+`[stepper_c]` queue, and why *both* limits land on the feedrate rather
+than on the move's acceleration.
+
+`klippy/kinematics/polar.py` carries the geometry, `[polar_singularity]`
+turns it into limits.  A move that passes near the centre is slowed to
+`max_angular_velocity * r_min`; one that would have to run slower than
+`min_velocity` is refused, and so is one that crosses the axis outright.
+
+### What is on the axis and still legal
+
+The classification keys on the swept angle, not on the radius alone.
+Three moves sit at `r_min = 0` and never turn the bed:
+
+* `G1 X0 Y0 Z50` → `Z10` — straight down the axis.  This is the `N` in
+  `[0, 0, N]`.
+* `G1 X0 Y0` → `X10 Y0` — departing along a ray.  The homing sweep of
+  `[stepper_r]` is exactly this, which is why it may start from a radius
+  of zero.
+* A rotation-only move with the tip on the axis.
+
+All three have a perpendicular offset of zero, which is what
+`path_geometry()` reports and what makes them cost nothing.
+
+### Which frame is singular
+
+The test is on the **g-code** x/y, not on the machine position — which is
+not obvious, given how much else here is in the machine frame.  With
+`[rtcp]` on, the tool tip is what g-code commands and the carriages take
+up the difference, but in the radial frame that correction scales x and y
+*together*: it changes the arm radius and leaves the bed angle exactly
+where it was.  So the bed angle, and everything above, depends only on the
+commanded tip position.
+
+What does live in the machine frame is the arm's own travel near the
+centre, where a small change of tip position becomes a large change of
+radius, and where `radius + dh(b)` can ask for an arm on the far side of
+the middle.  `[rtcp]` range checks that in its own move check — see
+"Reach checking" above.
+
+### What it does not do yet
+
+Nothing routes a path around the centre.  A move that crosses the axis is
+rejected rather than rerouted, because rerouting costs either a path
+deviation or an arm radius that can go negative, and both are decisions
+for the machine's owner rather than something to do silently underneath
+them.
+
+Nor is the bed angle *scheduled* while the tip is on the axis.  Inside a
+disc where the angle stops being determined by position it becomes a free
+degree of freedom, and something has to choose it: today
+`kin_corertheta.c` resolves such a sample from the direction of travel,
+which is right for the homing sweep it was written for and is a half turn
+commanded in one sample for anything else.  That is why a move that comes
+to rest on the axis and then leaves along a different ray is still not
+something to rely on.
+
 ## Deliberate limitations (current stage)
 
 * **Rotation does not affect the feedrate.**  `G1 X10 A360` takes exactly
@@ -802,3 +883,11 @@ the touching.
   too.
 * **Multi-rotation RTCP** (A and C as well as B), if a future head needs
   it — see "Scope" above.
+* **Schedule the bed angle through the centre.**  Inside the disc where
+  the bed angle stops being determined by position it is a free degree of
+  freedom that nothing currently owns — see "The bed centre singularity"
+  above.  Giving it an owner is what makes a path across the axis
+  possible at all: either routed around the centre at a bounded radius,
+  or driven straight through it on a signed arm radius with the bed angle
+  held, which needs `position_min` below zero on `[stepper_r]` and a
+  branch carried on the move through to the `corertheta` solvers.

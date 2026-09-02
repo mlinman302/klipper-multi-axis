@@ -6,24 +6,163 @@
 import logging, math
 import stepper
 
+# A feedrate low enough to stand in for "as slow as this axis can go".
+# Only reached within microns of the centre of the bed.
+MIN_CENTRE_VELOCITY = 0.01
+# Passed to move.limit_speed() where only the velocity is being limited
+NO_ACCEL_LIMIT = 999999999.9
+# |u| / |offset| at which the bed's angular acceleration peaks - see
+# path_geometry() below
+ANGULAR_ACCEL_PEAK_U = 1. / math.sqrt(3.)
 
-def distance_to_center(p1, p2):
-    ab_x = p2[0]-p1[0]
-    ab_y = p2[1]-p1[1]
-    ap_x = -p1[0]
-    ap_y = -p1[1]
 
-    ab_ap_dot_product = ab_x * ap_x + ab_y * ap_y
-    ab_length = math.sqrt(ab_x ** 2 + ab_y ** 2)
+######################################################################
+# Bed centre geometry
+######################################################################
 
-    # Check if the projected point lies on the bounded line segment
-    if ab_ap_dot_product <= 0:
-        dist = math.sqrt(ap_x ** 2 + ap_y ** 2)
-    elif ab_ap_dot_product >= ab_length ** 2:
-        dist = math.sqrt(p2[0] ** 2 + p2[1] ** 2)
+# On a rotating bed machine the bed angle is not a commanded axis - it is
+# derived, theta = atan2(y, x) - so it has no value at all on the line
+# x = y = 0, and its derivatives have already run away on the approach.
+# A move is a straight line, so all of that behaviour follows from two
+# numbers: the perpendicular offset of the line of travel from the centre,
+#
+#     offset = x0*uy - y0*ux        (u the unit direction of travel)
+#
+# which is constant along the move, and the arclength u measured from the
+# foot of that perpendicular.  In terms of those,
+#
+#     r(u)^2     = offset^2 + u^2
+#     theta_dot  = v * offset / r^2
+#     theta_ddot = -2 * v^2 * offset * u / r^4  +  a * offset / r^2
+#
+# theta_dot peaks where r is smallest, at v*offset/r_min^2.  The geometric
+# part of theta_ddot peaks a little further out, at |u| = |offset|/sqrt(3),
+# where it reaches 0.65 * v^2 / offset^2; the second part is the move's own
+# acceleration carried through the same 1/r^2.
+#
+# So the bed's angular velocity diverges as 1/r and its acceleration as
+# 1/r^2 - which is why a near miss that passes a feedrate check can still
+# overrun the step compressor on the bed queue, and why both limits land on
+# the feedrate rather than on the move's acceleration.
+#
+# klippy/extras/polar_singularity.py turns these into limits and refuses
+# the moves no feedrate can rescue.
+
+def path_geometry(start_pos, end_pos):
+    # Bed centre geometry of the xy segment start_pos -> end_pos: the
+    # signed perpendicular offset of the path from the centre, the closest
+    # the path comes to the centre, and the arclengths of the two endpoints
+    # from the foot of the perpendicular.
+    x0, y0 = start_pos[0], start_pos[1]
+    dx, dy = end_pos[0] - x0, end_pos[1] - y0
+    length = math.sqrt(dx*dx + dy*dy)
+    if not length:
+        return 0., math.sqrt(x0*x0 + y0*y0), 0., 0.
+    ux, uy = dx / length, dy / length
+    offset = x0 * uy - y0 * ux
+    u_start = x0 * ux + y0 * uy
+    u_end = u_start + length
+    if u_start * u_end <= 0.:
+        # The path crosses the foot of the perpendicular, so its closest
+        # approach really is reached within the move
+        r_min = abs(offset)
     else:
-        dist = abs(ab_x * ap_y - ab_y * ap_x) / ab_length
-    return dist
+        r_min = math.sqrt(offset*offset
+                          + min(u_start*u_start, u_end*u_end))
+    return offset, r_min, u_start, u_end
+
+def swept_angle(start_pos, end_pos):
+    # Signed change in bed angle over an xy segment, in radians.  A
+    # straight line can never sweep more than half a turn, so this is just
+    # the angle between the two position vectors and needs no unwrapping.
+    # An endpoint sitting on the centre has no angle of its own and
+    # contributes nothing, which is what makes a move that departs from
+    # [0, 0, N] along a ray a zero sweep rather than an undefined one.
+    x0, y0 = start_pos[0], start_pos[1]
+    x1, y1 = end_pos[0], end_pos[1]
+    cross = x0 * y1 - y0 * x1
+    dot = x0 * x1 + y0 * y1
+    if not cross and not dot:
+        return 0.
+    return math.atan2(cross, dot)
+
+def peak_angular_velocity(velocity, offset, r_min):
+    # Largest |theta_dot| the bed sees over the move.  A radial move -
+    # including one that departs from or arrives at the centre - never
+    # turns the bed at all, and a non-zero offset keeps r_min away from
+    # zero, so this never divides by zero.
+    if not offset:
+        return 0.
+    return abs(velocity * offset) / (r_min * r_min)
+
+def peak_angular_accel(velocity, offset, u_start, u_end):
+    # Largest |theta_ddot| the geometry alone contributes over the move.
+    # Its magnitude rises with |u| to a peak at |offset|/sqrt(3) and falls
+    # away after it, so the worst point of this move is that peak clamped
+    # into the range of |u| the move actually covers.
+    if not offset:
+        return 0.
+    if u_start * u_end <= 0.:
+        u_lo = 0.
+    else:
+        u_lo = min(abs(u_start), abs(u_end))
+    u_hi = max(abs(u_start), abs(u_end))
+    u = min(max(abs(offset) * ANGULAR_ACCEL_PEAK_U, u_lo), u_hi)
+    r2 = offset*offset + u*u
+    return 2. * velocity * velocity * abs(offset) * u / (r2 * r2)
+
+def limits_for_angular_rates(offset, r_min, u_start, u_end,
+                             max_angular_v, max_angular_a):
+    # Feedrate and acceleration limits that keep the bed inside its own
+    # angular velocity and acceleration limits over this move.  Both bed
+    # limits land mostly on the feedrate: theta_dot scales with v, and the
+    # geometric part of theta_ddot with v squared.  The move's own
+    # acceleration contributes a further a*offset/r^2, which is what the
+    # second value bounds.  The two theta_ddot terms peak a little way
+    # apart along the path (at r_min and at about 1.15*r_min), so each is
+    # given the whole budget rather than half of it - close enough for a
+    # limit whose constant is empirical anyway.
+    #
+    # Either value is None where that limit does not bind.
+    if not offset:
+        return None, None
+    v_limit = a_limit = None
+    if max_angular_v:
+        v_limit = max_angular_v * r_min * r_min / abs(offset)
+    if max_angular_a:
+        a_limit = max_angular_a * r_min * r_min / abs(offset)
+        shape = peak_angular_accel(1., offset, u_start, u_end)
+        if shape:
+            v_accel = math.sqrt(max_angular_a / shape)
+            if v_limit is None or v_accel < v_limit:
+                v_limit = v_accel
+    return v_limit, a_limit
+
+def limit_centre_speed(move, max_angular_v, max_angular_a=0.):
+    # Apply the bed's angular limits to a move as a feedrate limit.  Left
+    # here rather than in the two kinematics so that both apply the same
+    # arithmetic.
+    offset, r_min, u_start, u_end = path_geometry(move.start_pos,
+                                                  move.end_pos)
+    v_limit, a_limit = limits_for_angular_rates(
+        offset, r_min, u_start, u_end, max_angular_v, max_angular_a)
+    if v_limit is None and a_limit is None:
+        return
+    # A path that passes near enough to the centre asks for a feedrate of
+    # zero.  Clamping to a floor rather than returning early is deliberate:
+    # the move that most needs limiting used to be the one move that
+    # escaped this check altogether.  [polar_singularity] is what turns
+    # such a move into an error rather than a crawl.
+    if v_limit is None:
+        v_limit = NO_ACCEL_LIMIT
+    move.limit_speed(max(v_limit, MIN_CENTRE_VELOCITY),
+                     NO_ACCEL_LIMIT if a_limit is None else a_limit)
+
+
+# distance_to_center() used to live here.  It returned the closest a
+# segment came to the centre, which is now the second value of
+# path_geometry() above - computed the same way, alongside the two other
+# numbers a limit needs.
 
 
 class PolarKinematics:
@@ -124,19 +263,14 @@ class PolarKinematics:
             z_ratio = move.move_d / abs(move.axes_d[2])
             move.limit_speed(self.max_z_velocity * z_ratio,
                              self.max_z_accel * z_ratio)
-        # Slow down near center
-        if move.axes_d[0] or move.axes_d[1]:
-            if self.v_rad_max == 0:
-                return
-            min_dist = distance_to_center(move.start_pos[0:2],
-                                              move.end_pos[0:2])
-            if min_dist == 0:
-                return
-            v_angular = math.sqrt(move.max_cruise_v2) / min_dist
-            if self.v_rad_max < v_angular:
-                scale_radius = self.v_rad_max/v_angular
-                move.limit_speed(self.max_velocity * scale_radius,
-                                 self.max_accel * scale_radius)
+        # Slow down near center.  A move whose closest approach to the
+        # centre was zero used to return here without being limited at
+        # all - the one move that most needs the limit was the one move
+        # that escaped it.  See the geometry notes at the top of this
+        # file; [polar_singularity] is what refuses the moves no feedrate
+        # can rescue.
+        if self.v_rad_max and (move.axes_d[0] or move.axes_d[1]):
+            limit_centre_speed(move, self.v_rad_max)
 
     def get_status(self, eventtime):
         xy_home = "xy" if self.limit_xy2 >= 0. else ""

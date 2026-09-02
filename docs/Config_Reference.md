@@ -618,8 +618,10 @@ see [common kinematic settings](#common-kinematic-settings) for
 available parameters.
 
 CORE R-THETA KINEMATICS ARE A WORK IN PROGRESS.  As with polar
-kinematics, moves around the 0, 0 position are known to not work
-properly.
+kinematics, the 0, 0 position is a singularity of the bed angle. Moves
+near it are slowed and moves across it are refused - see
+[[polar_singularity]](#polar_singularity) - but nothing yet routes a
+path around it.
 
 ```
 [printer]
@@ -2680,6 +2682,54 @@ off. The machine does not move either way, but the commanded B changes
 meaning, so the toolhead is resynced to name the angle the head is
 already at; toggle at `B0`, where the two frames coincide and nothing
 has to be converted.
+
+### [polar_singularity]
+
+Bed centre singularity limits for the rotating-bed kinematics. Loaded
+automatically by `corertheta`, so the section only has to appear in a
+config file to change one of the values below; `polar` may load it by
+naming the section.
+
+On a rotating-bed machine the bed angle is derived from the commanded
+`X`/`Y` rather than commanded directly, so it has no value at all on the
+line `X=0 Y=0`: a tool tip travelling through `[0, 0, N]` asks the bed
+for a half turn in the instant the sign flips. The approach is the same
+problem with a finite number attached - the bed's angular velocity
+diverges as `1/r` and its angular acceleration as `1/r²` - so this
+module limits the feedrate of a move that passes near the centre and
+refuses one that crosses it.
+
+Moves that sit on the axis without turning the bed are unaffected: a
+pure `Z` move along the axis, and a move that departs from or arrives at
+the centre along a ray, are all legal at full feedrate.
+
+A refused move names its closest approach and the rate it would have
+needed. Nothing routes a move around the centre yet - that costs either
+a path deviation or an arm radius that can go negative, and both are
+decisions for the machine's owner.
+
+See [Multi_Axis.md](Multi_Axis.md).
+
+```
+[polar_singularity]
+#max_angular_velocity:
+#   Maximum bed rotation rate, in rad/s. The default is the
+#   max_angular_velocity of the [printer] section, so a machine normally
+#   states this figure once and does not repeat it here.
+#max_angular_accel: 0
+#   Maximum bed angular acceleration, in rad/s^2. The default is 0,
+#   which leaves it unchecked. This is the limit that bites first -
+#   angular acceleration diverges as 1/r^2 where angular velocity
+#   diverges as 1/r - and it is what bounds a move's own acceleration
+#   near the centre. Note that where the velocity limit above is the
+#   binding one it already holds the angular acceleration below
+#   0.65 * max_angular_velocity^2, so a value above that figure will
+#   never limit a feedrate; it will still limit acceleration.
+#min_velocity: 0.5
+#   The feedrate (in mm/s) below which slowing down has stopped being an
+#   answer. A move that would have to run slower than this to hold the
+#   limits above is refused instead. The default is 0.5.
+```
 
 ### [rtcp_probe]
 

@@ -62,7 +62,11 @@ G1 X-20 Y0 E2 F1500
 G1 X0 Y-20 E3 F1500
 G1 B0 F600
 
-# Toggling the transform re-syncs the toolhead to where it now is
+# Toggling the transform re-syncs the toolhead to where it now is.  The
+# arm goes round to the far side rather than across it: a straight line
+# from (0, -20) to (0, 20) passes through the bed's rotation axis, where
+# the bed angle is not defined - see test/klippy/polar_singularity.test.
+G1 X20 Y0 F3000
 G1 X0 Y20 F3000
 G1 B10 F600
 G1 B0 F600
