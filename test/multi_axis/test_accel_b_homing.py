@@ -71,15 +71,20 @@ class FakeToolhead:
 class FakeAccelChip:
     data_rate = 3200
     def __init__(self, angle=0., noise=0., gain=(1., 1., 1.),
-                 offset=(0., 0., 0.), y_bias=0.):
+                 offset=(0., 0., 0.), y_bias=0., delivery_lag=0.):
         self.angle, self.noise = angle, noise
         self.gain, self.offset, self.y_bias = gain, offset, y_bias
         self.toolhead = None
         self.dropped = 0.
+        # Samples this far back from the end of the dwell have not been
+        # delivered yet - the batching and link latency of a chip on a
+        # secondary mcu, such as a USB accelerometer board
+        self.delivery_lag = delivery_lag
         self.rng = random.Random(1234)
     def start_internal_client(self):
         return FakeAccelClient(self)
     def samples_over(self, start, end):
+        end -= self.delivery_lag
         rad = math.radians(self.angle)
         base = (G * math.sin(rad), self.y_bias, G * math.cos(rad))
         res = []
@@ -318,9 +323,9 @@ class TestMeasure(unittest.TestCase):
         obj = build({'settle_time': .25, 'sample_time': .5})
         toolhead = obj.printer.lookup_object('toolhead')
         obj.measure()
-        # One dwell covering settle + window, but only the window is
-        # averaged
-        self.assertEqual(toolhead.dwells, [.75])
+        # One dwell covering settle + window + batch margin, but only the
+        # window is averaged
+        self.assertEqual(toolhead.dwells, [.25 + .5 + .3])
         self.assertEqual(obj.last_reading.count, int(3200 * .5))
     def test_overridden_sample_time_changes_the_count(self):
         obj = build()
@@ -368,6 +373,28 @@ class TestMeasure(unittest.TestCase):
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("dropping data", str(cm.exception))
+    def test_late_batches_still_cover_the_window(self):
+        # A chip on a USB or CAN attached mcu delivers its last batch
+        # after the moves have finished.  The trailing batch_margin dwell
+        # is what keeps the averaging window fully covered.
+        obj = build(chip=FakeAccelChip(angle=8., delivery_lag=.2))
+        self.assertEqual(obj.measure().count, int(3200 * .5))
+    def test_without_the_margin_the_tail_of_the_window_is_lost(self):
+        obj = build({'batch_margin': 0.},
+                    chip=FakeAccelChip(angle=8., delivery_lag=.2))
+        # 0.2 s of the 0.5 s window never arrives
+        self.assertEqual(obj.measure().count, int(3200 * .3))
+    def test_a_short_window_without_the_margin_trips_the_gate(self):
+        # The failure the margin exists to prevent: on a laggy link a
+        # short window loses enough of itself to look like data loss
+        chip = FakeAccelChip(angle=8., delivery_lag=.15)
+        obj = build({'sample_time': .2, 'batch_margin': 0.}, chip=chip)
+        with self.assertRaises(ConfigError) as cm:
+            obj.measure()
+        self.assertIn("batch_margin", str(cm.exception))
+        # ...and with the margin restored the same window is complete
+        obj = build({'sample_time': .2}, chip=chip)
+        self.assertEqual(obj.measure().count, int(3200 * .2))
     def test_the_out_of_plane_axis_is_reported(self):
         chip = FakeAccelChip(angle=0., y_bias=250.)
         obj = build(chip=chip)

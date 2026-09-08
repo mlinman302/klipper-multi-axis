@@ -65,6 +65,18 @@ import stepper
 # adxl345.FREEFALL_ACCEL.
 FREEFALL_ACCEL = 9.80665 * 1000.
 
+# The bulk sensor helpers deliver samples to the host in batches - 0.100 s
+# in adxl345.py - and a chip on a secondary mcu (a USB accelerometer board
+# such as the Fly-ADXL345-USB, or a CAN toolhead) adds a link's worth of
+# latency on top of that.  finish_measurements() waits for the moves to
+# finish, not for the sensor batches to arrive, so without a trailing
+# dwell the batch carrying the tail of the averaging window has usually
+# not been delivered yet.  Losing the tail is harmless on a long window
+# but a short one on a laggy link can drop enough samples to trip the
+# "dropping data" check.  Dwell past the window instead, so it is
+# comfortably in the past before the samples are asked for.
+DEFAULT_BATCH_MARGIN = .3
+
 # Index of the B coordinate within a toolhead position vector
 B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
 
@@ -157,6 +169,8 @@ class AccelBHoming:
         # the settle dwell is separate from the averaging window.
         self.settle_time = config.getfloat('settle_time', .25, minval=0.)
         self.sample_time = config.getfloat('sample_time', .5, minval=.05)
+        self.batch_margin = config.getfloat('batch_margin',
+                                            DEFAULT_BATCH_MARGIN, minval=0.)
         # A stationary ADXL345 at 3200 Hz shows roughly 120-180 mm/s^2 of
         # per-sample noise, so anything much above that is the head still
         # moving.  Zero disables the check.
@@ -221,7 +235,9 @@ class AccelBHoming:
         toolhead.wait_moves()
         client = self.chip.start_internal_client()
         start_time = toolhead.get_last_move_time()
-        toolhead.dwell(settle + window)
+        # The averaging window is settle..settle+window; the extra margin
+        # is only there to let the batches carrying it arrive
+        toolhead.dwell(settle + window + self.batch_margin)
         client.finish_measurements()
         # AccelQueryHelper trims to the request window but knows nothing
         # about the settle dwell, so drop that part here.  Samples are
@@ -240,7 +256,8 @@ class AccelBHoming:
         if rate and len(vectors) < .5 * rate * window:
             raise self.printer.command_error(
                 "%s: only %d of an expected %d accelerometer samples -"
-                " the connection to '%s' is dropping data"
+                " the connection to '%s' is dropping data, or is slow"
+                " enough that batch_margin needs raising"
                 % (self.name, len(vectors), int(rate * window),
                    self.chip_name))
         mean, dev = summarize(vectors)

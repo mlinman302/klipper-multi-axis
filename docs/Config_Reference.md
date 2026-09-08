@@ -2786,9 +2786,33 @@ better than accuracy - a stationary head re-measures to a few hundredths
 of a degree - which is what makes `CHECK=1` useful for catching gross
 errors such as a home that silently did not move.
 
-Klipper's `[adxl345]` support is SPI only, so the chip must be wired for
-SPI. The chip may be shared with `[resonance_tester]`; this section does
-not require any particular `axes_map`.
+This section never touches a bus, a pin or an MCU: it looks the chip up
+by name and reads it through the same interface `[resonance_tester]`
+uses. A USB accelerometer board, a CAN toolhead and a chip wired straight
+to the mainboard's SPI are therefore all configured the ordinary way, in
+the chip's own section, and `[lis2dw]`, `[mpu9250]` and `[lis3dh]` work
+in place of `[adxl345]`. The chip may be shared with
+`[resonance_tester]`; this section does not require any particular
+`axes_map`.
+
+A USB accelerometer board - the Fly-ADXL345-USB, for example - carries
+its own microcontroller running Klipper firmware, so it is configured as
+a secondary MCU and its pins are addressed through that MCU's name:
+
+```
+[mcu adxl]
+serial: /dev/serial/by-id/usb-Klipper_rp2040_XXXXXXXXXXXX-if00
+
+[adxl345]
+cs_pin: adxl:gpio9
+spi_software_sclk_pin: adxl:gpio10
+spi_software_mosi_pin: adxl:gpio11
+spi_software_miso_pin: adxl:gpio12
+
+[accel_b_homing]
+zero_vector: +z
+positive_vector: +x
+```
 
 ```
 [accel_b_homing]
@@ -2810,6 +2834,14 @@ positive_vector:
 #sample_time: 0.500
 #   How long (in seconds) to average over. The default is 0.500, which
 #   is 1600 samples at the ADXL345's default 3200 Hz.
+#batch_margin: 0.300
+#   A trailing dwell (in seconds) after the averaging window, before the
+#   samples are read back. Nothing in it is sampled: the bulk sensor
+#   helpers deliver in 0.100 s batches and a chip on a secondary mcu (a
+#   USB accelerometer board, a CAN toolhead) adds link latency on top, so
+#   without it the batch carrying the tail of the window has usually not
+#   arrived yet. Raise it if measurements report fewer samples than
+#   expected. The default is 0.300.
 #max_sample_deviation: 500.0
 #   Largest per-axis sample deviation (in mm/s^2) accepted before the
 #   measurement is rejected as "the head was still moving". A stationary

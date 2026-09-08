@@ -42,14 +42,58 @@ drive ratio into something measurable.
 
 ## Hardware
 
-The linked board is a generic ADXL345 breakout. Two things to verify
-before wiring:
+The board in use is a **Fly-ADXL345-USB**: an ADXL345 plus an onboard
+RP2040 that runs Klipper firmware and enumerates as a USB serial device.
+There is nothing to wire - the SPI link to the sensor is internal to the
+board, between the RP2040 and the ADXL345.
 
-* **Klipper's `[adxl345]` is SPI only** (`bus.MCU_SPI_from_config` in
-  `klippy/extras/adxl345.py`). The board's I2C mode cannot be used. Wire
-  CS / SCLK / SDI (MOSI) / SDO (MISO) plus power and ground.
-* **Logic level.** Confirm the board's logic is 3.3 V, or that it carries
-  level shifting, before connecting it to a 5 V MCU.
+That makes it a **secondary Klipper MCU**, not a USB sensor with a driver
+of its own. Three consequences:
+
+* **Flash it from this tree.** The RP2040 runs Klipper firmware built
+  for `rp2040`, and host and MCU should be the same version. Building it
+  from this fork rather than from stock keeps them in step.
+* **It gets an `[mcu]` section**, and `[adxl345]` addresses its pins
+  through that MCU's name. The vendor's configuration uses **software
+  SPI**, not `spi_bus`:
+
+  ```ini
+  [mcu adxl]
+  serial: /dev/serial/by-id/usb-Klipper_rp2040_XXXXXXXXXXXX-if00
+
+  [adxl345]
+  cs_pin: adxl:gpio9
+  spi_software_sclk_pin: adxl:gpio10
+  spi_software_mosi_pin: adxl:gpio11
+  spi_software_miso_pin: adxl:gpio12
+  ```
+
+* **The link adds latency**, which is the one thing in this module that
+  had to change for it - see `batch_margin` below.
+
+None of this reaches `accel_b_homing.py`. The module looks the chip up by
+name and calls `start_internal_client()`; it never touches a bus, a pin
+or an MCU. A USB board, a CAN toolhead and a chip wired straight to the
+mainboard's SPI are all the same to it, and so is a different chip
+entirely - `[lis2dw]`, `[mpu9250]` and `[lis3dh]` all expose the same
+interface and the same `data_rate` attribute.
+
+### What the USB link does change: `batch_margin`
+
+The bulk sensor helpers deliver samples to the host in batches (0.100 s
+in `adxl345.py`), and a secondary MCU adds a link's worth of latency on
+top. `finish_measurements()` waits for the *moves* to finish, not for the
+sensor batches to arrive, so the batch carrying the tail of the averaging
+window has usually not been delivered when the samples are asked for.
+
+The fix is a trailing dwell - `batch_margin`, 0.3 s by default - after
+the averaging window and before `finish_measurements()`, so the window is
+comfortably in the past by the time it is read. Losing the tail is
+harmless on a long window, but a short one on a laggy link loses enough
+of itself to trip the routine's own data-loss check: with a 0.2 s window
+and 0.15 s of delivery lag, three quarters of the window is missing. On a
+chip wired directly to the mainboard the margin costs 0.3 s and changes
+nothing else; it is not worth making the distinction in config.
 
 Mounting:
 
@@ -61,7 +105,10 @@ Mounting:
    has no way to take out a skewed mounting, so a sensor glued on two
    degrees out reads two degrees out.
 * Route the cable so a 145-degree swing does not tug it. A cable that
-  pulls on the head is a systematic angle error.
+  pulls on the head is a systematic angle error, and a USB cable is
+  stiffer than the ribbon a directly-wired sensor would use - this
+  matters more here than it would on a bench.
+* The board is bus powered, so there is no separate supply to route.
 
 The chip can be shared with `[resonance_tester]`; this module does not
 require any particular `axes_map`, so input shaping keeps whatever
@@ -199,6 +246,7 @@ positive_vector: +x           # sensor axis reading +1 g at B = +90
 #accel_chip: adxl345          # any chip exposing start_internal_client()
 #settle_time: 0.250           # dwell before sampling, s
 #sample_time: 0.500           # averaging window, s
+#batch_margin: 0.300          # trailing dwell for late batches, s
 #max_sample_deviation: 500    # mm/s^2; above this the head was moving
 #max_magnitude_error: 1500    # mm/s^2; |a| must be 1 g within this
 #check_tolerance: 5.0         # deg; default for B_MEASURE CHECK=1
@@ -274,7 +322,7 @@ measure(settle, window) -> TiltReading
   1. toolhead.wait_moves()
   2. client = chip.start_internal_client()
      t0 = toolhead.get_last_move_time()
-     toolhead.dwell(settle + window)
+     toolhead.dwell(settle + window + batch_margin)
      client.finish_measurements()
   3. keep samples with t0 + settle <= t <= t0 + settle + window
   4. reject if: no samples, count < 0.5 * expected,
@@ -302,7 +350,9 @@ Three details that matter:
   hangs on belts through a differential; it rings after a move. Sampling
   starts only after `settle_time`. `AccelQueryHelper` trims samples to
   the request window on its own, but not to a settle offset, so the
-  filtering in step 4 is explicit.
+  filtering in step 3 is explicit.
+* **And so is the trailing margin**, which is not sampled at all - it
+  exists only to let the last batches arrive. See `batch_margin` above.
 * **Rejection is loud.** A reading taken while the head is drifting is
   worse than no reading, because it silently poisons a home. The stddev
   and magnitude gates exist to convert "head still moving" into an error
@@ -538,6 +588,7 @@ of up to 145 degrees. Every routine that moves B:
 | Symptom | Message should say |
 | --- | --- |
 | No samples | the chip is not responding; try `ACCELEROMETER_QUERY` |
+| Fewer samples than expected | the link is dropping data, or is slow enough that `batch_margin` needs raising |
 | High stddev | the head was still moving; raise `settle_time` |
 | Magnitude far from 1 g | the head is moving, or the chip is misconfigured |
 | `v` varies across the sweep | `zero_vector`/`positive_vector` are wrong - here is the pair that did vary |
