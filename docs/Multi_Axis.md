@@ -800,5 +800,10 @@ the touching.
 * **Rotational limits in the kinematics classes**, so `axis_minimum` /
   `axis_maximum` and the front-end status describe the rotational axes
   too.
+* **Gravity-referenced B homing and drive-ratio calibration**, using
+  an accelerometer on the tilting head - design outline in
+  [B_Axis_Inclinometer.md](B_Axis_Inclinometer.md).  Homing B
+  becomes a measurement rather than an endstop sweep, and
+  `b_coupling_ratio` becomes measurable.
 * **Multi-rotation RTCP** (A and C as well as B), if a future head needs
   it — see "Scope" above.
