@@ -802,7 +802,7 @@ the touching.
   too.
 * **Gravity-referenced B homing and drive-ratio calibration**, using
   an accelerometer on the tilting head - design outline in
-  [B_Axis_Inclinometer.md](B_Axis_Inclinometer.md).  Homing B
+  [Accel_B_Homing.md](Accel_B_Homing.md).  Homing B
   becomes a measurement rather than an endstop sweep, and
   `b_coupling_ratio` becomes measurable.
 * **Multi-rotation RTCP** (A and C as well as B), if a future head needs

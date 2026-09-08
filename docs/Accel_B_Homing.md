@@ -1,6 +1,8 @@
 # Gravity-referenced B axis: homing and step calibration
 
-**Status: design outline. No code is implemented on this branch yet.**
+**Status: phase one is implemented** - `[accel_b_homing]` and the
+`B_MEASURE` command (`klippy/extras/accel_b_homing.py`). Phases two to
+five below are still design.
 
 This document describes how an ADXL345 mounted on the tilting head can
 
@@ -53,11 +55,11 @@ Mounting:
 
 * Rigid to the **rotating** part of the head, not the carriage. Any
   compliance in the mount is measured as head tilt.
-* The sensor's package axes need not line up with anything. The module
-  learns the mapping (see *Sensor calibration*). What matters is that
-  **two of the three sensor axes span the plane the head tilts in** - ie
-  the B rotation axis should be roughly parallel to one sensor axis. A
-  45-degree skew still works but costs sensitivity.
+* Mount it **square**: the B rotation axis parallel to one sensor axis,
+   and the other two spanning the plane the head tilts in. Which axis is
+   which does not matter - that is declared, see below - but phase one
+   has no way to take out a skewed mounting, so a sensor glued on two
+   degrees out reads two degrees out.
 * Route the cable so a 145-degree swing does not tug it. A cable that
   pulls on the head is a systematic angle error.
 
@@ -76,6 +78,10 @@ The head angle is
     phi = atan2(u - u0, w - w0)          (corrected for offsets/gains)
     B   = sign * (phi - phi_zero)
 
+That is the general form. Phase one runs it with the corrections at their
+identity values and the zero fixed to an axis direction, which is what
+the next section describes.
+
 Using **both** in-plane axes through `atan2` - rather than one axis
 through `asin` - is what makes the resolution uniform across the whole
 range. A single-axis reading goes flat near +/-90 degrees; `atan2` does
@@ -83,6 +89,37 @@ not.
 
 `v` is not wasted: it is the health check. It must stay constant across
 the sweep, and `u^2 + w^2 + v^2` must stay at 1 g.
+
+### Declaring the zero, phase one
+
+The mounting is **declared, not fitted**, and is restricted to the six
+axis-aligned directions. Two signed sensor axes say everything the
+measurement needs:
+
+    zero_vector      the sensor axis that reads +1 g at B = 0
+    positive_vector  the sensor axis that reads +1 g at B = +90
+
+An accelerometer at rest reads the specific force, which points *up*, so
+both of these are "the sensor axis pointing straight up" at their
+respective angles - and both are found by looking rather than by
+measuring anything. Park the head, run `ACCELEROMETER_QUERY`, note which
+axis reads about +9800 mm/s^2, and use the negated name if it reads about
+-9800.
+
+Then, with `w` the reading along `zero_vector` and `u` the reading along
+`positive_vector`,
+
+    B = atan2(u, w)
+
+which is 0 at B = 0 and +90 at B = +90 by construction. That is the whole
+zero reference: no `zero_angle` offset, and no separate inversion flag -
+the sign convention falls out of which direction `positive_vector` names.
+The third axis is the rotation axis, by elimination.
+
+The cost is that the zero is quantised to the six axis directions, so a
+sensor glued on a couple of degrees out is a couple of degrees out. That
+is a phase two problem: the fine offset is one more number on top of this
+reference, not a replacement for it.
 
 ### What limits accuracy
 
@@ -107,23 +144,24 @@ repeatability.
 
 ## Where the code lives
 
-    klippy/extras/b_inclinometer.py          new - the whole feature
+    klippy/extras/accel_b_homing.py          new - the whole feature
     klippy/kinematics/rotary_axis.py         small hook: home override
     config/example-corertheta.cfg            new section, HOME_B rewrite
     docs/Config_Reference.md                 new section
     docs/Multi_Axis.md                       cross-reference
-    test/multi_axis/test_b_inclinometer.py   new - pure-math unit tests
+    test/multi_axis/test_accel_b_homing.py   new - host tests
 
-Config section name `[b_inclinometer]`; the printer object is the sensor,
+Config section name `[accel_b_homing]`; the printer object is the sensor,
 and the commands it registers are named for the axis (`B_*`).
 
 The module splits into three layers, deliberately:
 
 1. **Pure functions** (module level, no printer dependency):
-   `fit_gravity_ellipse()`, `angle_from_vector()`, `unwrap()`,
-   `fit_deg_per_step()`. All the mathematics lives here so it can be unit
-   tested on a host that cannot run klippy - which, on the Windows dev
-   box, is all of them.
+   `parse_signed_axis()`, `out_of_plane_index()`, `measure_angle()`,
+   `summarize()` today, joined by `fit_gravity_ellipse()`, `unwrap()` and
+   `fit_deg_per_step()` in the later phases. All the mathematics lives
+   here so it can be unit tested on a host that cannot run klippy -
+   which, on the Windows dev box, is all of them.
 2. **The measurement primitive**: `measure()` - dwell, sample, filter,
    average, validate, return a `TiltReading`.
 3. **The routines**: homing, sensor calibration, step calibration, and
@@ -137,7 +175,7 @@ ea.home()`, so the cleanest integration is a one-method override point on
 
 ```python
 # rotary_axis.py
-def set_home_override(self, cb):      # called by b_inclinometer at connect
+def set_home_override(self, cb):      # called by accel_b_homing at connect
     self.home_override = cb
 def home(self):
     if self.home_override is not None:
@@ -152,25 +190,39 @@ without going through `G28`.
 
 ## Config surface
 
-```ini
-[b_inclinometer]
-accel_chip: adxl345           # any chip exposing start_internal_client()
-axis: b                       # which rotary axis this measures
+Phase one, as implemented:
 
-# --- sensor mounting (written by B_SENSOR_CALIBRATE / SAVE_CONFIG) ---
-plane_axes: x, z              # the two sensor axes spanning the tilt plane
-invert: False                 # True if +B decreases the measured angle
-zero_angle: 0.0               # raw phi (deg) at true B = 0
-offset_u: 0.0                 # zero-g offset, in g
+```ini
+[accel_b_homing]
+zero_vector: +z               # sensor axis reading +1 g at B = 0
+positive_vector: +x           # sensor axis reading +1 g at B = +90
+#accel_chip: adxl345          # any chip exposing start_internal_client()
+#settle_time: 0.250           # dwell before sampling, s
+#sample_time: 0.500           # averaging window, s
+#max_sample_deviation: 500    # mm/s^2; above this the head was moving
+#max_magnitude_error: 1500    # mm/s^2; |a| must be 1 g within this
+#check_tolerance: 5.0         # deg; default for B_MEASURE CHECK=1
+```
+
+Only the two vectors are required. The two gates are in mm/s^2, the units
+the chips report, and both are disabled by setting them to zero.
+
+`max_magnitude_error` defaults deliberately loose. With no gain
+calibration yet, a chip inside its +/-10 % sensitivity spec legitimately
+reads 0.9 to 1.1 g; the gate is there to catch a head that is
+accelerating or a chip that is not reporting properly, not to grade the
+sensor. `check_tolerance` is loose for the same reason - see *What phase
+one does not do* below.
+
+Phases two to five add:
+
+```ini
+# --- sensor calibration (written by B_SENSOR_CALIBRATE / SAVE_CONFIG) ---
+zero_offset: 0.0              # deg; fine offset on top of zero_vector
+offset_u: 0.0                 # zero-g offset, mm/s^2
 offset_w: 0.0
 gain_ratio: 1.0               # amplitude(w) / amplitude(u)
 level_offset: 0.0             # frame tilt vs gravity, deg (usually 0)
-
-# --- measurement ---
-settle_time: 0.250            # dwell before sampling, s
-sample_time: 0.500            # averaging window, s
-max_sample_stddev: 0.030      # g; above this the head was still moving
-max_magnitude_error: 0.050    # g; |a| must be 1 g within this
 
 # --- homing ---
 home_method: accelerometer    # accelerometer | endstop | endstop_then_accel
@@ -183,17 +235,32 @@ endstop_agreement: 3.0        # deg; endstop_then_accel disagreement limit
 min_safe_z: 40.0              # refuse to swing B below this Z
 ```
 
-`plane_axes`, `invert`, `zero_angle`, the offsets and `gain_ratio` are all
-outputs of the calibration routines, written back through
-`configfile.set()` and `SAVE_CONFIG`, exactly as `PROBE_CALIBRATE` and
-`delta_calibrate` do.
+`zero_offset`, the offsets and `gain_ratio` are outputs of the
+calibration routines, written back through `configfile.set()` and
+`SAVE_CONFIG`, exactly as `PROBE_CALIBRATE` and `delta_calibrate` do.
+`zero_vector` and `positive_vector` are not: they are the coarse frame
+the fitted numbers sit on top of, and they stay hand-declared.
+
+### What phase one does not do
+
+The reading is **uncorrected**. An ADXL345 has a zero-g offset of up to
++/-150 mg and an inter-axis gain tolerance of about +/-10 %, which
+together are worth several degrees of absolute error. Until the offset
+and gain fit of phase two lands, treat `B_MEASURE` as a diagnostic, not
+as a calibrated angle.
+
+Repeatability is a different matter, and is already good: a stationary
+head re-measures to a few hundredths of a degree. That is why the noise
+gates are tight while the absolute tolerances are loose, and it is what
+makes `B_MEASURE CHECK=1` useful as a gross-error detector - a home that
+silently did not move is tens of degrees out, not tenths.
 
 ## G-code surface
 
 | Command | Does |
 | --- | --- |
-| `B_MEASURE` | Report measured B, the raw vector, the noise stats, and the error against commanded B. Read-only, safe any time the head is still. |
-| `B_MEASURE CHECK=1 TOLERANCE=0.5` | As above, but raise an error if measured and commanded B disagree. For `PRINT_START` and layer macros - it catches belt slip and a silently failed home. |
+| `B_MEASURE [SETTLE=] [SAMPLE_TIME=]` | *(implemented)* Report measured B, the raw vector, the in-plane and out-of-plane components, the noise stats, and the error against commanded B. Read-only, safe any time the head is still. |
+| `B_MEASURE CHECK=1 [TOLERANCE=]` | *(implemented)* As above, but raise an error if measured and commanded B disagree. For `PRINT_START` and layer macros - it catches belt slip and a silently failed home. Requires B homed, since an unhomed B has no commanded angle to compare against. |
 | `B_HOME` | Set B from the measurement (also what `G28 B` calls). |
 | `B_SET_ZERO` | Declare the current physical pose to be B = 0. Run it with the head referenced mechanically - square against the bed, or with the probe pin hanging vertical. |
 | `B_SENSOR_CALIBRATE [START=] [END=] [STEPS=]` | Sweep the arc, fit offsets and gain, report conditioning. |
@@ -204,23 +271,32 @@ outputs of the calibration routines, written back through
 
 ```
 measure(settle, window) -> TiltReading
-  1. rtcp.check_disabled("B measurement")
-     b_projection.check_disabled("B measurement")
-  2. toolhead.wait_moves()
-  3. t0 = toolhead.get_last_move_time()
-     client = chip.start_internal_client()
+  1. toolhead.wait_moves()
+  2. client = chip.start_internal_client()
+     t0 = toolhead.get_last_move_time()
      toolhead.dwell(settle + window)
      client.finish_measurements()
-  4. keep samples with t0 + settle <= t <= t0 + settle + window
-  5. reject if: no samples, count < 0.5 * expected,
-                stddev(any axis) > max_sample_stddev,
+  3. keep samples with t0 + settle <= t <= t0 + settle + window
+  4. reject if: no samples, count < 0.5 * expected,
+                stddev(any axis) > max_sample_deviation,
                 | |a| - 1g | > max_magnitude_error
-  6. mean -> (u, w, v); apply offsets and gain_ratio;
-     phi = atan2(...); B = sign * (phi - zero_angle) - level_offset
-  7. return B, phi, raw mean, stddev, sample count
+  5. mean -> (u, w, v); B = atan2(u, w)
+     (phase two: apply offsets, gain_ratio, zero_offset, level_offset)
+  6. return B, raw mean, stddev, in-plane and out-of-plane parts, count
 ```
 
-Two details that matter:
+Three details that matter:
+
+* **Neither transform has to be off.** The design started out refusing to
+  measure with `[rtcp]` or `[b_projection]` enabled, following what
+  `homing.py` does. That turned out to be unnecessary and it cost the
+  most useful application - a mid-print sanity check. `[rtcp]` moves x
+  and z, never B, so it does not affect this at all. `[b_projection]`
+  does change the meaning of the commanded B, so the comparison converts:
+  `project_pos()` maps the commanded bed-frame angle onto the plane the
+  head can tilt in, which is exactly the angle the sensor sees. The
+  measurement itself never needed either transform off - it reads a
+  physical head angle - and only the comparison did.
 
 * **The settle window is separate from the averaging window.** The head
   hangs on belts through a differential; it rings after a move. Sampling
@@ -293,24 +369,25 @@ routine picks the model the data can support:
 | --- | --- | --- |
 | >= 120 deg | full | both offsets + gain ratio |
 | 60-120 deg | reduced | both offsets, gain ratio forced to 1 |
-| < 60 deg | zero only | `zero_angle` only; offsets left alone |
+| < 60 deg | zero only | `zero_offset` only; offsets left alone |
 
 The corertheta B range (-45 to 100, ie 145 degrees) supports the full
 fit, which is a happy accident worth stating: this machine can
-self-calibrate its own inclinometer.
+self-calibrate its own sensor.
 
 **Bench alternative.** The cleanest calibration is a full 360-degree
 rotation, which the head cannot do but a hand can. Recording the sensor
 while slowly turning it through a complete turn *before* mounting gives
 an unconditionally well-posed fit. If that is done, the on-machine
-routine only has to find `zero_angle`, and `B_SET_ZERO` is the whole
+routine only has to find `zero_offset`, and `B_SET_ZERO` is the whole
 procedure.
 
-`plane_axes` and `invert` are also determined here rather than
-configured: the routine sweeps, and reports which sensor axis pair varied
+The sweep also **verifies** `zero_vector` and `positive_vector`, which
+stay hand-declared: it reports which sensor axis pair actually varied
 (the in-plane pair), which stayed put (`v`), and the sign of the change
-against commanded B. Getting these wrong by hand is the most likely setup
-mistake, so the routine should just work them out and print them.
+against commanded B. Getting those two flags wrong is the most likely
+setup mistake, so the routine should say plainly when the data disagrees
+with what was declared.
 
 ## Algorithm: B step calibration
 
@@ -409,7 +486,7 @@ The residual pattern is the real diagnostic value of this routine:
 | Residual shape | Means |
 | --- | --- |
 | flat, small | ratio is right |
-| linear trend not removed by the fit | wrong `zero_angle`, not a ratio problem |
+| linear trend not removed by the fit | wrong zero reference, not a ratio problem |
 | one cycle per pulley revolution | pulley eccentricity or a bent shaft |
 | step at the direction reversal | backlash - the `RETURN=1` number |
 | growing toward one end | belt tension or a binding mount |
@@ -417,25 +494,29 @@ The residual pattern is the real diagnostic value of this routine:
 
 ## Interaction with the rest of the fork
 
-* **`[rtcp]` and `[b_projection]` must both be off** for every routine
-  here, for exactly the reasons `homing.py` already documents: with RTCP
-  on, a B move is also an X/Z move, and with the projection on, a
-  commanded B is scaled by whatever bed angle the arm is over. The module
-  reuses `check_disabled()` on both objects and produces the same class
-  of error message.
 * **The measured B is the machine B** - the angle the head is really
   turned to - which is exactly the quantity `[rtcp]` consumes and the
-  quantity `[bltouch] b_offset` is expressed in. No frame conversion is
-  needed anywhere.
+  quantity `[bltouch] b_offset` is expressed in.
+* **Measuring needs no transform off.** `B_MEASURE` reads a physical
+  angle, so it works in any mode; the *comparison* against the commanded
+  angle converts through `b_projection.project_pos()`. See "the
+  measurement primitive" above.
+* **Every routine that moves B does need both off**, for exactly the
+  reasons `homing.py` already documents: with RTCP on, a B move is also
+  an X/Z move, and with the projection on, a commanded B is scaled by
+  whatever bed angle the arm is over. Those routines reuse
+  `check_disabled()` on both objects and produce the same class of error
+  message.
 * **`invert_b_direction` stays the one place rotation sense is set.** If
-  the sensor disagrees with the machine's sign convention, that is what
-  `invert` in this section records - and the calibration routine reports
-  it rather than asking. The kinematics' own inversion is untouched.
+  the sensor disagrees with the machine's sign convention, that is
+  recorded by negating `positive_vector` here - and phase two's sweep
+  reports when the two disagree. The kinematics' own inversion is
+  untouched.
 * **This closes an open verification item.** Whether a positive B really
   tilts the nozzle outboard is still unverified on the machine.
   `B_MEASURE` answers it directly, without RTCP in the loop: command a
   positive B with the transforms off and read which way the head actually
-  went.
+  went.  This is available now.
 
 ## Safety
 
@@ -459,7 +540,7 @@ of up to 145 degrees. Every routine that moves B:
 | No samples | the chip is not responding; try `ACCELEROMETER_QUERY` |
 | High stddev | the head was still moving; raise `settle_time` |
 | Magnitude far from 1 g | the head is moving, or the chip is misconfigured |
-| `v` varies across the sweep | `plane_axes` is wrong - here is the pair that did vary |
+| `v` varies across the sweep | `zero_vector`/`positive_vector` are wrong - here is the pair that did vary |
 | In-plane radius well below 1 g | the B axis is not in the fitted plane - remount or re-run the sweep |
 | Refine loop will not converge | `b_coupling_ratio` is wrong - run `B_STEP_CALIBRATE` |
 | Endstop and sensor disagree | the stall home did not move the axis (the known `G4 P2000` failure) |
@@ -469,28 +550,36 @@ of up to 145 degrees. Every routine that moves B:
 
 The dev box cannot run klippy, so the test split follows the code split:
 
-* **Host, pytest, `test/multi_axis/test_b_inclinometer.py`** - everything
-  in layer 1. Synthesise `(u, w)` points from a known angle sequence,
-  inject known offsets, gain mismatch and gaussian noise, and assert the
-  ellipse fit recovers them; assert the angle unwrap survives a sweep
-  through +/-180; assert `fit_deg_per_step` recovers a known slope and
-  that the ratio conversions are self-inverse. This is where the real
-  test coverage is, and none of it needs a printer.
-* **`test/klippy/`** - a `multi_axis_b_incl.cfg` plus `.test` for config
-  parsing, command registration, and the refusals (transforms on, axis
-  out of range, Z too low). Sensor data cannot be simulated in that
-  harness, so the measurement path itself is not covered there.
+* **Host, `test/multi_axis/test_accel_b_homing.py`** (32 tests, run it
+  with `python test/multi_axis/test_accel_b_homing.py`).  It drives the
+  *real* module against a stubbed printer and a synthetic accelerometer,
+  following `test_rtcp_probe.py`, so the whole of phase one is covered on
+  a host that cannot run klippy - config validation, the sample window
+  and its settle offset, every rejection path, the angle at the reference
+  poses, noise averaging, and the `B_MEASURE` report and its
+  `b_projection`-aware comparison.
+  Later phases add the fits: synthesise `(u, w)` points with known
+  offsets, gain mismatch and gaussian noise and assert the ellipse fit
+  recovers them; assert the angle unwrap survives a sweep through
+  +/-180; assert `fit_deg_per_step` recovers a known slope.
+* **`test/klippy/`** - a `multi_axis_accel_b.cfg` plus `.test` for config
+  parsing through the real config machinery, and for the refusals the
+  later phases add. Sensor data cannot be simulated in that harness, so
+  the measurement path itself stays covered by the host test.
 * **On the machine** - the acceptance runs, in order:
   1. `ACCELEROMETER_QUERY` returns a plausible 1 g vector.
-  2. `B_SENSOR_CALIBRATE` over the full range; the reported in-plane
+  2. `B_MEASURE` with the head parked at B = 0 reads near zero, and the
+     out-of-plane component is small - if not, the two vector flags are
+     wrong, and the reported vector says what they should be.
+  3. `B_SENSOR_CALIBRATE` over the full range; the reported in-plane
      radius is within a few percent of 1 g and `v` is flat.
-  3. `B_MEASURE` repeated ten times without moving - spread under 0.05
+  4. `B_MEASURE` repeated ten times without moving - spread under 0.05
      degrees.
-  4. `B_MEASURE` after commanding several angles - measured tracks
+  5. `B_MEASURE` after commanding several angles - measured tracks
      commanded to within the ratio error.
-  5. `B_STEP_CALIBRATE`; compare the fitted ratio against the nominal
+  6. `B_STEP_CALIBRATE`; compare the fitted ratio against the nominal
      1.0, and check the residual shape against the table above.
-  6. `home_method: endstop_then_accel` for a while, watching for the
+  7. `home_method: endstop_then_accel` for a while, watching for the
      disagreement error - it should fire on exactly the back-to-back
      homes that fail today.
 
@@ -498,9 +587,9 @@ The dev box cannot run klippy, so the test split follows the code split:
 
 Each phase is independently useful and independently shippable.
 
-1. **Read-only.** `[b_inclinometer]`, the measurement primitive,
-   `B_MEASURE`. Nothing moves; the head can be turned by hand. This alone
-   answers the outstanding rotation-sense question.
+1. **Read-only** - *done*. `[accel_b_homing]`, the measurement
+   primitive, `B_MEASURE`. Nothing moves; the head can be turned by hand.
+   This alone answers the outstanding rotation-sense question.
 2. **Sensor calibration.** `B_SENSOR_CALIBRATE`, `B_SET_ZERO`, the
    ellipse fit, `SAVE_CONFIG` write-back. After this the measurement is
    trustworthy in absolute terms.
@@ -531,6 +620,9 @@ Each phase is independently useful and independently shippable.
 * **Backlash compensation, or just reporting?** The `RETURN=1` sweep
   measures it. Acting on it is a separate feature and probably belongs in
   the kinematics, not here.
-* **Naming.** `[b_inclinometer]` describes the sensor honestly, but the
-  section also owns the step calibration, which is not an inclinometer
-  concern. `[b_accel]` and `[b_calibrate]` are the alternatives.
+* **A finer zero than the six axis directions.** Phase one quantises the
+  zero reference to +/-x/y/z, so a sensor glued on a degree or two out is
+  a degree or two out. `zero_offset` in phase two is the fix, but it
+  needs a physical reference to be set against - a machinist's square on
+  the nozzle face, or the probe pin hanging vertical. Which of those to
+  standardise on is not settled.

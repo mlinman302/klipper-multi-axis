@@ -2758,6 +2758,88 @@ options were removed: the first two are now the probe section's
 `b_offset`, and the third is fixed by the B rotation convention above.
 klippy reports an error naming the replacement.
 
+### [accel_b_homing]
+
+Gravity-referenced measurement of the B (tool tilt) axis, using an
+accelerometer mounted on the *rotating* part of the tilting head. An
+accelerometer at rest reads the gravity vector, and a gravity vector in
+the head's own frame is the head's tilt - absolutely, with no reference
+to where the axis has travelled since it was homed.
+
+This is phase one of [Accel_B_Homing.md](Accel_B_Homing.md): it measures
+and reports. It does not yet home anything, and it moves nothing.
+
+Which way is "B = 0" is declared with two signed sensor axes, restricted
+to the six axis-aligned directions. An accelerometer at rest reads the
+specific force, which points *up*, so both of them name the sensor axis
+that points straight up at the angle in question. Find them by looking:
+park the head, run `ACCELEROMETER_QUERY`, and note which axis reads about
++9800 mm/s^2 (use the negated name if it reads about -9800). The
+remaining axis is the rotation axis, and is reported back as a health
+check rather than configured.
+
+The reading is uncorrected in this phase. An ADXL345 has a zero-g offset
+of up to +/-150 mg and an inter-axis gain tolerance of about +/-10 %,
+together worth several degrees of absolute error, so treat the angle as a
+diagnostic rather than as a calibrated measurement. Repeatability is much
+better than accuracy - a stationary head re-measures to a few hundredths
+of a degree - which is what makes `CHECK=1` useful for catching gross
+errors such as a home that silently did not move.
+
+Klipper's `[adxl345]` support is SPI only, so the chip must be wired for
+SPI. The chip may be shared with `[resonance_tester]`; this section does
+not require any particular `axes_map`.
+
+```
+[accel_b_homing]
+zero_vector:
+#   The signed sensor axis (+x, -x, +y, -y, +z or -z) that reads +1 g
+#   with the head at B=0. This parameter must be provided.
+positive_vector:
+#   The signed sensor axis that reads +1 g with the head at B=+90 - the
+#   direction the sensor's "up" swings toward as B increases. It must
+#   name a different axis than zero_vector. This parameter must be
+#   provided.
+#accel_chip: adxl345
+#   The accelerometer to read. The default is "adxl345".
+#settle_time: 0.250
+#   How long (in seconds) to dwell after any motion before sampling
+#   starts. The head hangs on belts and rings after a move, so this is
+#   deliberately separate from the averaging window. The default is
+#   0.250.
+#sample_time: 0.500
+#   How long (in seconds) to average over. The default is 0.500, which
+#   is 1600 samples at the ADXL345's default 3200 Hz.
+#max_sample_deviation: 500.0
+#   Largest per-axis sample deviation (in mm/s^2) accepted before the
+#   measurement is rejected as "the head was still moving". A stationary
+#   ADXL345 at 3200 Hz shows roughly 120-180. Set to 0 to disable the
+#   check. The default is 500.
+#max_magnitude_error: 1500.0
+#   How far (in mm/s^2) the measured vector magnitude may sit from
+#   gravity (9806.65) before the measurement is rejected. The default is
+#   deliberately loose, because a chip inside its +/-10 % sensitivity
+#   spec legitimately reads 0.9 to 1.1 g and nothing corrects for that
+#   yet. Set to 0 to disable the check. The default is 1500.
+#check_tolerance: 5.0
+#   Default TOLERANCE (in degrees) for B_MEASURE CHECK=1. The default is
+#   5.0 - loose, for the reasons above.
+```
+
+`B_MEASURE [SETTLE=<s>] [SAMPLE_TIME=<s>] [CHECK=0|1] [TOLERANCE=<deg>]`
+reports the measured angle, the averaged acceleration vector and its
+magnitude, the in-plane and out-of-plane components, and the per-axis
+sample deviation. When B is homed it also reports the commanded angle and
+the error against it; `CHECK=1` turns a disagreement larger than
+`TOLERANCE` into an error, which is what makes it usable in
+`PRINT_START`.
+
+Measuring works with `[rtcp]` and `[b_projection]` enabled - it reads a
+physical angle, so no frame has to be switched off. The comparison
+against the commanded angle accounts for `[b_projection]`, whose
+commanded B is a bed-frame angle rather than the angle the head is really
+turned to.
+
 ### Coupled rotational axes ([carriage] on a/b/c)
 
 With `kinematics: generic_cartesian`, a carriage may be placed on a
