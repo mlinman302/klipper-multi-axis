@@ -106,6 +106,8 @@ class FakeBus:
         return self.mcu
     def get_oid(self):
         return 99
+    def get_i2c_address(self):
+        return 105
     def get_command_queue(self):
         return None
     def spi_transfer(self, data, minclock=0):
@@ -278,6 +280,19 @@ class TestFrameGeometry(unittest.TestCase):
 ######################################################################
 # Register construction
 ######################################################################
+
+class TestBusErrors(unittest.TestCase):
+    def test_a_failed_i2c_read_raises_a_named_error(self):
+        # bus.py returns None from i2c_read once it has shut the printer
+        # down over a NACK; the driver must not crash on it
+        chip = build({'cs_pin': None})
+        chip.mcu.is_fileoutput = lambda: False
+        chip.bus.i2c_read = lambda regs, count: None
+        with self.assertRaises(ConfigError) as cm:
+            chip.read_reg(bmi160.REG_CHIPID)
+        self.assertIn("register 0x00", str(cm.exception))
+        self.assertIn("address 105", str(cm.exception))
+
 
 class TestRegisters(unittest.TestCase):
     def test_the_default_accel_conf_matches_the_old_driver(self):

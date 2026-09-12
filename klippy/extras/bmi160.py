@@ -376,6 +376,14 @@ class BMI160:
             response = bytearray(params['response'])
             return response[1]
         params = self.bus.i2c_read([reg], 1)
+        if params is None:
+            # bus.py has already shut the printer down with the bus error
+            # (a NACK, on a Linux host, is any failed transfer).  Unwind
+            # with a message naming the chip rather than a TypeError.
+            raise self.printer.command_error(
+                "bmi160 '%s': i2c read of register 0x%02x failed - the"
+                " chip did not answer at address %d" % (
+                    self.name, reg, self.bus.get_i2c_address()))
         return bytearray(params['response'])[0]
     def set_reg(self, reg, val, minclock=0):
         if self.bus_type == 'spi':
