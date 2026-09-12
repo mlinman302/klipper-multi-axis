@@ -209,6 +209,18 @@ def summarize(vectors):
 def magnitude(vector):
     return math.sqrt(sum([c * c for c in vector]))
 
+def overflows_during(client):
+    # Every Klipper accelerometer reports a running count of possible
+    # fifo overflows in each batch it delivers.  An increase across the
+    # batches a client received means frames were lost while it was
+    # listening - and because the bulk sensor helpers timestamp samples
+    # by *counting* them, lost frames also leave the surviving ones
+    # mistimed, which a fused angle integrates straight into its answer.
+    counts = [m.get('overflows', 0) for m in getattr(client, 'msgs', [])]
+    if len(counts) < 2:
+        return 0
+    return counts[-1] - counts[0]
+
 def wrap180(angle):
     # An angle difference, brought into (-180, 180]
     return -((180. - angle) % 360. - 180.)
@@ -397,9 +409,20 @@ class AccelBHoming:
         # The averaging window is settle..settle+window; the extra margin
         # is only there to let the batches carrying it arrive
         toolhead.dwell(settle + window + self.batch_margin)
-        for c in (imu_client, client, gyro_client):
-            if c is not None:
-                c.finish_measurements()
+        clients = [c for c in (imu_client, client, gyro_client)
+                   if c is not None]
+        for c in clients:
+            c.finish_measurements()
+        lost = max([overflows_during(c) for c in clients])
+        if lost:
+            raise self.printer.command_error(
+                "%s: '%s' reported %d possible fifo overflows during the"
+                " measurement - the link to the chip cannot keep up with"
+                " its data rate, so samples were lost and the rest are"
+                " mistimed.  Lower the chip's rate, or on i2c raise the bus"
+                " speed (on a Raspberry Pi host that is"
+                " dtparam=i2c_arm_baudrate in config.txt; i2c_speed is"
+                " ignored there)" % (self.name, self.chip_name, lost))
         # AccelQueryHelper trims to the request window but knows nothing
         # about the settle dwell, so drop that part here.  Samples are
         # (print_time, x, y, z); index rather than name the fields, so

@@ -2061,7 +2061,10 @@ gyroscope is for.
 #   Output data rate in Hz - one of 100, 200, 400, 800 or 1600. Both
 #   sensors run at this rate: the accelerometer is not permitted above
 #   1600 Hz, and the headerless FIFO mode this driver uses requires
-#   every enabled sensor to share a rate. The default is 1600.
+#   every enabled sensor to share a rate. The default is 1600, which
+#   needs a fast bus: on I2C it takes about half of a 400 kHz bus and
+#   cannot work at 100 kHz. A window average such as B_MEASURE loses
+#   nothing at a lower rate.
 #accel_range: 2
 #   Accelerometer full scale in g - one of 2, 4, 8 or 16. The chip is
 #   16 bit at every range, so this is a straight resolution-for-
@@ -2079,6 +2082,27 @@ gyroscope is for.
 #   it is the seam the Z tap module of Accel_Z_Tap.md plugs into. The
 #   default is accel_z.
 ```
+
+On a Raspberry Pi (or other Linux host) reading the chip through a
+`[mcu rpi]` host MCU, `i2c_speed` is ignored: the bus speed is the
+kernel's, set with `dtparam=i2c_arm_baudrate=400000` in `config.txt`, and
+a Pi defaults to 100 kHz. Use `rate: 400` or lower on I2C unless the bus
+is known to be at 400 kHz and the host has headroom:
+
+```
+[mcu rpi]
+serial: /tmp/klipper_host_mcu
+
+[bmi160]
+i2c_mcu: rpi
+i2c_bus: i2c.1
+rate: 400
+```
+
+The driver reports a possible FIFO overflow whenever the chip's FIFO is
+too full to take another frame - in the headerless mode used here the
+chip overwrites old frames without any other indication - and
+`[accel_b_homing]` refuses a measurement during which that happened.
 
 `BMI160_QUERY [CHIP=<name>]` reports the current acceleration and
 rotation rate. Use it, rather than `ACCELEROMETER_QUERY`, when deriving
@@ -2983,7 +3007,9 @@ vector and its magnitude, the in-plane and out-of-plane components, and
 the per-axis sample deviation. With a gyroscope it also reports the
 measured rotation rate, and both the fused and accelerometer-only angles
 with the difference between them; `FUSION=0` measures without the
-gyroscope for that one command, which is the direct way to compare. When B is homed it also reports the commanded angle and
+gyroscope for that one command, which is the direct way to compare.
+A measurement during which the chip reports possible FIFO overflows is
+refused, since lost samples also leave the remaining ones mistimed. When B is homed it also reports the commanded angle and
 the error against it; `CHECK=1` turns a disagreement larger than
 `TOLERANCE` into an error, which is what makes it usable in
 `PRINT_START`.

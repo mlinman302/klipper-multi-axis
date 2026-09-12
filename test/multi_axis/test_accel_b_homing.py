@@ -71,8 +71,12 @@ class FakeToolhead:
 class FakeAccelChip:
     data_rate = 3200
     def __init__(self, angle=0., noise=0., gain=(1., 1., 1.),
-                 offset=(0., 0., 0.), y_bias=0., delivery_lag=0.):
+                 offset=(0., 0., 0.), y_bias=0., delivery_lag=0.,
+                 overflows=0):
         self.angle, self.noise = angle, noise
+        # Possible fifo overflows the chip reports during a capture, as
+        # the running count carried in each bulk batch
+        self.overflows = overflows
         self.gain, self.offset, self.y_bias = gain, offset, y_bias
         self.toolhead = None
         self.dropped = 0.
@@ -116,6 +120,9 @@ class FakeAccelClient:
         self.end = None
     def finish_measurements(self):
         self.end = self.chip.toolhead.get_last_move_time()
+    @property
+    def msgs(self):
+        return [{'overflows': 0}, {'overflows': self.chip.overflows}]
     def get_samples(self):
         return self.chip.samples_over(self.start, self.end)
 
@@ -536,6 +543,28 @@ class TestCommand(unittest.TestCase):
 ######################################################################
 # The gyroscope motion gate
 ######################################################################
+
+class TestOverflows(unittest.TestCase):
+    def test_overflows_during_reads_the_increase(self):
+        class Client:
+            msgs = [{'overflows': 3}, {'overflows': 3}, {'overflows': 5}]
+        self.assertEqual(abh.overflows_during(Client()), 2)
+        Client.msgs = [{'overflows': 4}]
+        self.assertEqual(abh.overflows_during(Client()), 0)
+        self.assertEqual(abh.overflows_during(object()), 0)
+    def test_a_measurement_that_lost_frames_is_refused(self):
+        for chip in (FakeAccelChip(overflows=2),
+                     FakeIMUChip(overflows=2)):
+            obj = build(chip=chip)
+            with self.assertRaises(ConfigError) as cm:
+                obj.measure()
+            self.assertIn("2 possible fifo overflows", str(cm.exception))
+            self.assertIn("i2c_arm_baudrate", str(cm.exception))
+    def test_the_unfused_gyroscope_stream_is_checked_too(self):
+        obj = build({'fusion': False}, chip=FakeIMUChip(overflows=1))
+        with self.assertRaises(ConfigError):
+            obj.measure()
+
 
 class TestMotionGate(unittest.TestCase):
     def test_a_chip_without_a_gyroscope_skips_the_gate(self):

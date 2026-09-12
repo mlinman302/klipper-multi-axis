@@ -110,7 +110,7 @@ angular impulse as well as a linear one, and that impulse appears in the
 gyro against a background that is genuinely zero-mean.
 
 Whether the angular channel is *better* than the filtered linear one is a
-measurement, not an argument, and phase 4 below captures both. The point
+measurement, not an argument, and phase 5 below captures both. The point
 here is that the BMI160 makes it a free comparison: the two channels
 arrive interleaved in one FIFO, on one timebase, from one chip.
 
@@ -231,7 +231,8 @@ Four layers, and the seams between them are the architecture:
 ```
   src/sensor_bmi160.c         drains the chip FIFO into bulk messages;
                               optionally decodes one channel per frame
-                              and feeds trigger_analog          (MCU)
+                              and feeds trigger_analog          (MCU -
+                              klipper_mcu on the Pi, on this machine)
         |                            |
         | sensor_bulk_data           | trsync_do_trigger
         v                            v
@@ -252,6 +253,168 @@ by name and reads it through the same small interface
 `[resonance_tester]` uses, exactly as it does today with the ADXL345 -
 which is why swapping the chip is a config change rather than a code
 change for that module.
+
+## This machine: the BMI160 on the Pi Zero W's I2C1
+
+Everything above is chip architecture. This section is what it means on
+the corertheta machine, where the BMI160 is wired to **I2C1 of the
+Raspberry Pi Zero W that runs klippy** - not to a USB sensor board, which
+is what earlier revisions of these documents assumed.
+
+### The topology
+
+```
+  BMI160 --I2C1--> Pi Zero W kernel (i2c-bcm2835, /dev/i2c-1)
+                       |
+                   klipper_mcu        Linux-process MCU, [mcu rpi],
+                       |              SCHED_FIFO realtime priority
+                       | pty /tmp/klipper_host_mcu
+                       v
+                    klippy            same Pi, same single ARMv6 core,
+                       |              shared with Moonraker
+                       | USB
+                       v
+                    LPC1769           [mcu], all the steppers
+```
+
+I2C1 is GPIO2 (SDA, header pin 3) and GPIO3 (SCL, header pin 5), with
+1.8 kOhm pull-ups to 3.3 V already on the Pi. The host facts - Pi Zero W
+Rev 1.1, one core, ~430 MB, Raspbian bookworm, LPC1769 main MCU, no
+`[mcu rpi]` configured yet - were read from the machine's Moonraker API
+on 2026-09-12. The kernel's I2C bus speed could not be read remotely and
+has to be checked on the Pi.
+
+`sensor_bmi160.c` needs no port for this: it is ordinary Klipper MCU
+code, and the Linux process target already provides I2C. What changes is
+the budget.
+
+### The bus is the bottleneck, and its speed is not a Klipper setting
+
+Klipper's Linux I2C driver ignores `i2c_speed`. The bus rate belongs to
+the kernel, and a Raspberry Pi's default is **100 kHz**.
+
+Draining one 48-byte FIFO block costs one length read and one data read,
+about 510 bits on the wire including addressing, acks and the repeated
+start. The combined stream delivers one block per four frames, so:
+
+| `rate` | blocks/s | bus time at 100 kHz | bus time at 400 kHz |
+| --- | --- | --- | --- |
+| 1600 Hz | 400 | 204 % - impossible | 51 % |
+| 800 Hz | 200 | 102 % - impossible | 26 % |
+| 400 Hz | 100 | 51 % | 13 % |
+| 200 Hz | 50 | 26 % | 6 % |
+
+Those are wire-time lower bounds. Real transfers add syscall, interrupt
+and scheduling overhead on a single ARMv6 core, so treat anything above
+about a third of the bus as a risk rather than a plan. **The driver's
+default `rate: 1600` cannot work on a stock Pi.**
+
+### `rate: 400` costs the B measurement nothing
+
+It is tempting to read a lower rate as a less precise measurement. For a
+window average it is not. With the chip's normal-mode digital filter,
+bandwidth scales with the output data rate, so the samples stay
+band-limited below Nyquist and the noise on a mean over a window of
+length T is set by the noise density and T alone - about
+`density / sqrt(2 T)`. At the datasheet's 180 ug/sqrt(Hz) over the
+default half second that is roughly 0.18 mg, or about 0.01 degrees of
+tilt, **at any rate**. More samples of a narrower-band signal are not
+more information.
+
+And the lower rate buys margin everywhere it is short:
+
+* **FIFO headroom.** 85 frames is 53 ms at 1600 Hz and 212 ms at 400 Hz:
+  four times as long for klipper_mcu to be late before frames are lost.
+* **Host CPU.** 100 bulk messages a second into klippy instead of 400, on
+  the one core that is also planning motion.
+* **The gyro gate's noise floor.** `max_rotation_rate` tests a mean of
+  per-sample magnitudes, which does depend on bandwidth. Estimating the
+  gyro's normal-mode bandwidth at about 0.4 x ODR, a parked head reads
+  roughly 0.14 deg/s at 400 Hz against 0.28 deg/s at 1600 Hz - both under
+  the 1.0 default, but the lower rate leaves the gate more room.
+* **Fusion.** `fusion_tau` is 0.2 s; a 2.5 ms step is still eighty
+  samples per time constant.
+
+So this machine runs `rate: 400` with the bus at 400 kHz - 13 % bus
+duty, leaving the headroom for later.
+
+### Lost frames are now loud
+
+The overflow check the driver inherited could never fire. It compared the
+FIFO's byte count against 1024, but the counter saturates at the FIFO
+size rather than exceeding it, and the skip frame the chip uses to report
+lost frames exists only in header mode, which this driver does not use.
+A bus that could not keep up would therefore have silently overwritten
+frames - and because Klipper timestamps bulk samples by *counting* them,
+the frames that survived would have been mistimed too, which a fused
+angle integrates directly into its answer.
+
+`sensor_bmi160.c` now reports a possible overflow whenever the FIFO is
+too full to accept another whole frame, and `[accel_b_homing]` refuses a
+measurement during which the overflow count rose, naming the bus speed
+and `rate` as the things to change. The refusal reads the overflow count
+every Klipper accelerometer puts in its batches, so it protects an
+`[adxl345]` too.
+
+### What shuts the printer down
+
+An I2C transfer that fails on klipper_mcu - a NACK, or a glitch that
+looks like one - is a Klipper **shutdown**, of the whole printer, not an
+error on the measurement. Two things bound the exposure:
+
+* The chip is only read while a client is measuring. Configuration opens
+  `/dev/i2c-1` without touching the bus, and the polling timer is stopped
+  between measurements, so a print that never calls `B_MEASURE` never
+  exercises the link.
+* I2C is a board-level bus. If the BMI160 is on the moving head and the
+  Pi is not, the wires run past the stepper cables; keep that run short
+  and away from motor leads, and treat an intermittent `I2C NACK`
+  shutdown as a wiring problem before a software one.
+
+### Bringing it up
+
+Nothing here has been done on the machine yet. In order:
+
+1. **Enable I2C1 at 400 kHz.** On bookworm the file is
+   `/boot/firmware/config.txt`:
+
+   ```
+   dtparam=i2c_arm=on
+   dtparam=i2c_arm_baudrate=400000
+   ```
+
+   and reboot.
+
+2. **Find the chip.** `sudo apt install i2c-tools`, then `i2cdetect -y 1`
+   should show `69` (SA0 high - the driver's default) or `68` (SA0 to
+   ground - set `i2c_address: 104`). Breakout boards differ.
+
+3. **Build klipper_mcu from this branch.** The host MCU must understand
+   this branch's `config_bmi160`, which gained a `bytes_per_frame`
+   argument; a klipper_mcu built from anything older is refused at
+   connect. Use a separate config and output directory, so the LPC1769
+   build configuration in `.config` is left alone:
+
+   ```
+   cd ~/klipper
+   make KCONFIG_CONFIG=config.rpi OUT=out_rpi/ menuconfig    # Linux process
+   sudo systemctl stop klipper
+   make KCONFIG_CONFIG=config.rpi OUT=out_rpi/ flash
+   sudo cp scripts/klipper-mcu.service /etc/systemd/system/
+   sudo systemctl enable --now klipper-mcu
+   sudo systemctl start klipper
+   ```
+
+   Expect the build to be slow on an ARMv6 core. The LPC1769 does not
+   need reflashing for any of this.
+
+4. **Configure it** - see the `[mcu rpi]` and `[bmi160]` sections of
+   `config/example-corertheta.cfg`.
+
+5. **Check the budget before trusting a reading.** `BMI160_QUERY`, then
+   `B_MEASURE` a few times with the head parked. Any "possible fifo
+   overflows" refusal means the bus is not at the speed step 1 set, or
+   the Pi is too loaded; lower `rate` before anything else.
 
 ## The sensor layer
 
@@ -413,8 +576,66 @@ changes three things about it.
   `trigger_analog` detector, is the only path.
 * **There is a second channel to try.** Angular rate, per job 3.
 * **The sample rate is 1600 Hz, not 3200 Hz.** Per the trade above, this
-  is the one place the change could genuinely hurt, and phase 4 measures
+  is the one place the change could genuinely hurt, and phase 5 measures
   it rather than guessing.
+
+### On this machine: the detector runs in a Linux process
+
+[Accel_Z_Tap.md](Accel_Z_Tap.md) put the detector on a USB board's
+RP2040. Here it is klipper_mcu on the Pi Zero W, and the Z steppers are on
+the LPC1769. That splits the latency into two parts that do very
+different damage, and the distinction is the whole analysis.
+
+**Detection delay biases the Z datum.** `trigger_analog_update()` stamps
+a trigger with the MCU clock at the moment it *processes* the sample,
+and homing reads the stepper position back at that time. So everything
+between the chip sampling the contact and klipper_mcu processing that
+sample shifts the recorded Z: the frame's age in the FIFO (up to one
+poll interval, four frames), the I2C read, and the chip's own filter
+delay. The constant part calibrates out, as for any probe at a fixed
+speed. The *variable* part is the frame's age, roughly uniform over the
+poll interval, and it goes straight into repeatability:
+
+| `rate` | poll interval | sample-age scatter (1 sigma) | at 2 mm/s | at 5 mm/s |
+| --- | --- | --- | --- | --- |
+| 400 Hz | 10 ms | 2.9 ms | 6 um | 14 um |
+| 1600 Hz | 2.5 ms | 0.7 ms | 1.4 um | 3.6 um |
+
+On top of that, at 400 Hz the chip's own filter narrows to roughly
+160 Hz, which may soften the contact transient enough to make detection
+later and less consistent. Phase 5 has to measure that; it cannot be
+computed.
+
+**Relay delay only causes overshoot.** The trigger then travels
+klipper_mcu -> pty -> klippy's serial thread, which forwards it in C
+(`trdispatch`, no Python) -> USB -> LPC1769. That time does not move the
+recorded position; it moves the nozzle further into the bed. At a slow
+final tap speed it is harmless as a distance. Its real risk is Klipper's
+25 ms trsync liveness timeout: a single loaded core that delays
+klipper_mcu's periodic status by that long aborts the home with
+"Communication timeout during homing".
+
+So the Z tap is feasible on this hardware, but the I2C bus that makes
+400 Hz the right rate for B is the thing that caps the tap's
+repeatability. The levers, cheapest first:
+
+* **Tap slowly.** A fast approach and a slow final tap scales both the
+  scatter and the overshoot down with speed.
+* **Back-date the trigger.** The firmware knows how many frames were
+  still queued behind the one that triggered, so it could stamp the
+  trigger with that frame's sample time instead of the processing time,
+  removing most of the scatter in the table above. This is a change to
+  the `trigger_analog` interface, not a tuning knob.
+* **Wire the BMI160 to SPI0 instead.** The driver already supports SPI,
+  whose megahertz clock removes the bus limit entirely and makes 1600 Hz
+  cheap - for both B and Z, since the B measurement does not care. This
+  is a hardware change, and phase 5 is where to decide whether it is
+  needed.
+
+Moving the chip to the LPC1769's own I2C, which would avoid the
+cross-MCU relay, is not a way out: Klipper's LPC176x I2C driver is fixed
+at 100 kHz, which caps `rate` at 400 Hz again and adds a long I2C run to
+the mainboard.
 
 ## Migrating from the ADXL345
 
@@ -430,12 +651,21 @@ spi_software_sclk_pin: adxl:gpio10
 spi_software_mosi_pin: adxl:gpio11
 spi_software_miso_pin: adxl:gpio12
 
-# after
+# after - on SPI, for example on a USB sensor board
 [bmi160]
 cs_pin: imu:gpio9
 spi_software_sclk_pin: imu:gpio10
 spi_software_mosi_pin: imu:gpio11
 spi_software_miso_pin: imu:gpio12
+
+# after - on this machine: I2C1 of the Raspberry Pi running klippy
+[mcu rpi]
+serial: /tmp/klipper_host_mcu
+
+[bmi160]
+i2c_mcu: rpi
+i2c_bus: i2c.1
+rate: 400
 ```
 
 Three things do change, and are worth knowing before the swap:
@@ -458,11 +688,14 @@ measurement at 3200 Hz.
 
 ## Phases
 
+0. **Bring-up on the Pi.** The five steps under "Bringing it up": bus at
+   400 kHz, chip found, klipper_mcu from this branch, config, and a
+   clean run of `B_MEASURE` with no overflow refusals.
 1. **Sensor layer.** Combined accel+gyro FIFO, all three streams
    exposed to the host (accelerometer, gyroscope, and the combined one
    fusion reads), configurable range and rate, pseudovector-correct
-   `axes_map`, FOC commands, the `trigger_analog` attach point.
-   *Implemented.*
+   `axes_map`, FOC commands, the `trigger_analog` attach point, and
+   overflow detection that works in headerless mode. *Implemented.*
 2. **The fused measurement and the motion gate.** The complementary
    filter, the derived gyroscope axis and sign, `max_rotation_rate` and
    `max_fusion_disagreement` in `[accel_b_homing]`. All skipped when the
@@ -477,7 +710,9 @@ measurement at 3200 Hz.
 5. **Z tap phase 0.** Capture contact signatures on both channels, at
    several speeds, with the machine also captured moving in air. The
    deliverable is the contact-to-background ratio, the band that
-   maximises it, and a verdict on whether 1600 Hz is enough.
+   maximises it, and - on this machine - a verdict on whether 400 Hz over
+   I2C is enough or the chip has to move to SPI. Measure the tap scatter
+   at two speeds: its slope is the detection jitter above.
 6. **`[accel_z_tap]`.** The detector, the endstop, the probe session.
 
 ## Testing
@@ -510,10 +745,16 @@ threshold number in the config. Those are machine measurements.
 
 ## Open questions
 
-* Is the contact transient visible at 1600 Hz? (Phase 4. This is the
-  question the whole Z path rests on.)
+* Is the contact transient visible at 1600 Hz - and at the 400 Hz this
+  machine's I2C bus allows? (Phase 5. This is the question the whole Z
+  path rests on.)
+* Is the Pi Zero W's kernel I2C really at 400 kHz once configured, and
+  does klipper_mcu keep the FIFO drained while klippy is busy? Phase 0
+  answers the first with the overflow check and the second by trying.
+* Does the I2C run between the head and the Pi survive the stepper
+  cables? An intermittent `I2C NACK` shutdown is the symptom.
 * Angular or linear channel for tap detection - or both, ANDed?
-  (Phase 4.)
+  (Phase 5.)
 * How large is the gyro's zero-rate offset after FOC, and how much does
   it drift over a print's worth of temperature change? This sets
   `max_rotation_rate`, and it decides whether FOC belongs at connect time

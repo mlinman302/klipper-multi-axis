@@ -29,6 +29,7 @@
 // carry exactly MAX_BULK_MSG_SIZE (51) / frame_size whole frames:
 // 51/6 = 8 frames and 51/12 = 4 frames, both of which are 48 bytes.
 #define BYTES_PER_BLOCK 48
+#define BMI_FIFO_SIZE 1024
 
 struct bmi160 {
     struct timer timer;
@@ -133,8 +134,15 @@ bmi160_reschedule_timer(struct bmi160 *ax)
 static void
 update_fifo_status(struct bmi160 *ax, uint16_t fifo_bytes)
 {
-    // BMI160 FIFO can hold up to 1024 bytes
-    if (fifo_bytes > 1024)
+    // The fifo is full once another whole frame no longer fits.  A full
+    // fifo overwrites its oldest frames, and in headerless mode it does
+    // so silently - the skip frame that reports lost frames only exists
+    // in header mode, and the byte counter saturates rather than
+    // exceeding the fifo size.  Losing frames would corrupt the host's
+    // timestamps, which are assigned by counting, so a full fifo is
+    // reported as a possible overflow.  A slow bus (such as a Linux
+    // host's i2c at its default 100kHz) makes this likely.
+    if (fifo_bytes > BMI_FIFO_SIZE - ax->bytes_per_frame)
         ax->sb.possible_overflows++;
     ax->fifo_bytes_pending = fifo_bytes;
 }
