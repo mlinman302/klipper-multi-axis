@@ -16,7 +16,10 @@
 # stores sensor data in data-register order, and the gyro registers at
 # 0x0C precede the accel registers at 0x12).  The two halves of a frame
 # are therefore simultaneous by construction, which is the whole reason
-# to put both sensors in one chip - see docs/BMI160_IMU.md.
+# to put both sensors in one chip: fusing a rate with an angle needs the
+# two to have been measured at the same instant, and here that is a
+# property of the hardware rather than something the host arranges.
+# See docs/BMI160_IMU.md.
 #
 # Headerless mode requires every enabled sensor to run at the same output
 # data rate, and the accelerometer stops at 1600 Hz, so 1600 Hz bounds
@@ -101,11 +104,38 @@ FOC_TIME = .300
 Gyro_Measurement = collections.namedtuple(
     'Gyro_Measurement', ('time', 'gyro_x', 'gyro_y', 'gyro_z'))
 
+IMU_Measurement = collections.namedtuple(
+    'IMU_Measurement', ('time', 'gyro_x', 'gyro_y', 'gyro_z',
+                        'accel_x', 'accel_y', 'accel_z'))
+
 # Which 16-bit channel of a frame the mcu-side tap detector watches.  The
 # value is a byte offset into the frame, so it depends on whether the
 # gyroscope is in the FIFO - see get_trigger_frame_offset().
 TAP_CHANNELS = ('accel_x', 'accel_y', 'accel_z',
                 'gyro_x', 'gyro_y', 'gyro_z')
+
+
+######################################################################
+# Axis mapping
+######################################################################
+
+# An acceleration is a vector and a rotation rate is a pseudovector, and
+# the difference shows up in exactly one place: an axes_map that
+# *reflects* the frame rather than merely rotating it - any swap without
+# a matching negation, such as "x, z, y".  Under a reflection a
+# pseudovector picks up an extra sign that a vector does not, so the
+# mapped gyroscope has to be multiplied by the map's determinant to stay
+# consistent with the mapped accelerometer.  Nothing that reads only
+# |omega| notices; anything that fuses the two does.
+def axes_map_determinant(axes_map):
+    indices = [index for index, scale in axes_map]
+    if sorted(indices) != [0, 1, 2]:
+        return None
+    signs = [1. if scale >= 0. else -1. for index, scale in axes_map]
+    inversions = len([1 for a in range(3) for b in range(a + 1, 3)
+                      if indices[a] > indices[b]])
+    parity = -1. if inversions % 2 else 1.
+    return parity * signs[0] * signs[1] * signs[2]
 
 
 ######################################################################
@@ -178,6 +208,46 @@ class GyroQueryHelper(adxl345.AccelQueryHelper):
         write_proc.daemon = True
         write_proc.start()
 
+# The combined stream, unsplit.  One sample carries the gyroscope and
+# the accelerometer readings the chip took at the same instant, which is
+# the guarantee a sensor fusion needs - hence a client of its own rather
+# than pairing the two split views back up afterwards and hoping they
+# line up.  Its CSV is also the seven column capture format the Z tap
+# work wants.
+class IMUQueryHelper(adxl345.AccelQueryHelper):
+    def get_samples(self):
+        if not self.msgs:
+            return self.samples
+        total = sum([len(m['data']) for m in self.msgs])
+        count = 0
+        self.samples = samples = [None] * total
+        for msg in self.msgs:
+            for sample in msg['data']:
+                if sample[0] < self.request_start_time:
+                    continue
+                if sample[0] > self.request_end_time:
+                    break
+                samples[count] = IMU_Measurement(*sample)
+                count += 1
+        del samples[count:]
+        return self.samples
+    def write_to_file(self, filename):
+        def write_impl():
+            try:
+                # Try to re-nice writing process
+                os.nice(20)
+            except:
+                pass
+            f = open(filename, "w")
+            f.write("#time,gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z\n")
+            samples = self.samples or self.get_samples()
+            for s in samples:
+                f.write("%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n" % s)
+            f.close()
+        write_proc = multiprocessing.Process(target=write_impl)
+        write_proc.daemon = True
+        write_proc.start()
+
 
 ######################################################################
 # The chip
@@ -206,8 +276,20 @@ class BMI160:
         self.axes_map = adxl345.read_axes_map(config, accel_scale,
                                               accel_scale, accel_scale)
         gyro_scale = 1. / gyro_lsb_per_dps
-        self.gyro_axes_map = adxl345.read_axes_map(config, gyro_scale,
-                                                   gyro_scale, gyro_scale)
+        gyro_map = adxl345.read_axes_map(config, gyro_scale, gyro_scale,
+                                         gyro_scale)
+        # A rotation rate is a pseudovector - see axes_map_determinant()
+        determinant = axes_map_determinant(gyro_map)
+        if determinant is None and self.enable_gyro:
+            raise config.error(
+                "[%s] axes_map must name each of x, y and z exactly once"
+                " when the gyroscope is enabled: a rotation rate cannot be"
+                " mapped through an axes_map that drops or repeats an axis"
+                % (config.get_name(),))
+        self.axes_handedness = determinant
+        if determinant is not None and determinant < 0.:
+            gyro_map = [(index, -scale) for index, scale in gyro_map]
+        self.gyro_axes_map = gyro_map
         # The mcu-side tap detector watches one channel, named here
         # because the frame layout is this section's business
         self.tap_channel = config.getchoice('tap_channel',
@@ -421,6 +503,16 @@ class BMI160:
         gqh = GyroQueryHelper(self.printer)
         self.gyro_stream.add_client(gqh.handle_batch)
         return gqh
+    def start_internal_imu_client(self):
+        # The gyroscope and the accelerometer in one stream, sample by
+        # sample.  This is what a fused measurement reads.
+        if not self.enable_gyro:
+            raise self.printer.command_error(
+                "bmi160: the gyroscope is disabled in section '%s'"
+                % (self.name,))
+        iqh = IMUQueryHelper(self.printer)
+        self.batch_bulk.add_client(iqh.handle_batch)
+        return iqh
     def has_gyro(self):
         return self.enable_gyro
     def get_mcu(self):
@@ -508,7 +600,8 @@ class BMI160:
         return {'data_rate': self.data_rate, 'gyro': self.enable_gyro,
                 'accel_range': self.accel_range,
                 'gyro_range': self.gyro_range if self.enable_gyro else None,
-                'tap_channel': self.tap_channel}
+                'tap_channel': self.tap_channel,
+                'axes_handedness': self.axes_handedness}
     def _register_commands(self, config):
         # As AccelCommandHelper does: the named form always, plus the
         # CHIP-less default form when this section has no explicit name.

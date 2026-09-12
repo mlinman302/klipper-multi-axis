@@ -83,10 +83,11 @@ class FakeAccelChip:
         self.rng = random.Random(1234)
     def start_internal_client(self):
         return FakeAccelClient(self)
+    def angle_at(self, t, start):
+        # A head that is not turning.  FakeIMUChip overrides this.
+        return self.angle
     def samples_over(self, start, end):
         end -= self.delivery_lag
-        rad = math.radians(self.angle)
-        base = (G * math.sin(rad), self.y_bias, G * math.cos(rad))
         res = []
         total = int(round((end - start) * self.data_rate))
         # Losses are spread evenly across the span rather than truncating
@@ -97,6 +98,8 @@ class FakeAccelChip:
             if i % 100 >= keep:
                 continue
             t = start + (i + .5) / self.data_rate
+            rad = math.radians(self.angle_at(t, start))
+            base = (G * math.sin(rad), self.y_bias, G * math.cos(rad))
             vec = []
             for axis in range(3):
                 v = base[axis] * self.gain[axis] + self.offset[axis]
@@ -116,27 +119,60 @@ class FakeAccelClient:
     def get_samples(self):
         return self.chip.samples_over(self.start, self.end)
 
-# A BMI160-shaped chip: the same accelerometer, plus a gyroscope stream
-# turning at whatever rate the test declares.  rate is in deg/s in the
-# sensor frame, so (0, 0, 0) is a head genuinely at rest.
+# A BMI160-shaped chip, and a physically self-consistent one: if b_rate
+# is non-zero the head really is turning, so the accelerometer angle
+# sweeps at that rate *and* the gyroscope reports the rotation that
+# produces it.  Fusing an accelerometer with a gyroscope that disagrees
+# with it would prove nothing.
+#
+# These tests mount the chip as zero=+z, positive=+x, so the B rotation
+# axis is w_hat x u_hat = z_hat x x_hat = +y, and the sensor's own rate
+# about that axis is -dB/dt (see accel_b_homing.gyro_axis_coefficient).
+# That minus sign is the whole convention under test: if the module got
+# it backwards, the fused angle would run away from the accelerometer
+# instead of tracking it.
+#
+# off_axis_rate spins the chip about its zero_vector axis instead.  That
+# is real motion the gate's magnitude sees, but it does not tilt the
+# head and so must not move the measured angle.
 class FakeIMUChip(FakeAccelChip):
-    def __init__(self, rate=(0., 0., 0.), gyro_lag=0., **kwargs):
+    def __init__(self, b_rate=0., off_axis_rate=0., invert_gyro=False,
+                 gyro_lag=0., **kwargs):
         FakeAccelChip.__init__(self, **kwargs)
-        self.rate = rate
+        self.b_rate = b_rate
+        self.off_axis_rate = off_axis_rate
+        self.invert_gyro = invert_gyro
         self.gyro_lag = gyro_lag
     def has_gyro(self):
         return True
+    def angle_at(self, t, start):
+        return self.angle + self.b_rate * (t - start)
+    def gyro_vector(self):
+        rate = [0., -self.b_rate, self.off_axis_rate]
+        if self.invert_gyro:
+            rate = [-r for r in rate]
+        return tuple(rate)
     def start_internal_gyro_client(self):
         return FakeGyroClient(self)
+    def start_internal_imu_client(self):
+        return FakeIMUClient(self)
     def gyro_samples_over(self, start, end):
         end -= self.delivery_lag + self.gyro_lag
         total = int(round((end - start) * self.data_rate))
-        return [(start + (i + .5) / self.data_rate,) + tuple(self.rate)
+        return [(start + (i + .5) / self.data_rate,) + self.gyro_vector()
                 for i in range(max(0, total))]
+    def imu_samples_over(self, start, end):
+        gyro = self.gyro_vector()
+        return [(t,) + gyro + (ax, ay, az)
+                for t, ax, ay, az in self.samples_over(start, end)]
 
 class FakeGyroClient(FakeAccelClient):
     def get_samples(self):
         return self.chip.gyro_samples_over(self.start, self.end)
+
+class FakeIMUClient(FakeAccelClient):
+    def get_samples(self):
+        return self.chip.imu_samples_over(self.start, self.end)
 
 class FakeGCode:
     def __init__(self):
@@ -185,6 +221,12 @@ class FakeConfig:
         if default is Ellipsis:
             raise ConfigError("Option '%s' is not valid" % (option,))
         return None if default is None else float(default)
+    def getboolean(self, option, default=Ellipsis, **kwargs):
+        if option in self.values:
+            return bool(self.values[option])
+        if default is Ellipsis:
+            raise ConfigError("Option '%s' is not valid" % (option,))
+        return default
 
 class FakeGCmd:
     error = ConfigError
@@ -504,45 +546,250 @@ class TestMotionGate(unittest.TestCase):
         obj = build(chip=FakeIMUChip(angle=12.))
         self.assertTrue(obj.has_gyro)
         reading = obj.measure()
-        self.assertAlmostEqual(reading.angle, 12., places=6)
+        self.assertAlmostEqual(reading.angle, 12., places=4)
         self.assertAlmostEqual(reading.rotation_rate, 0.)
     def test_a_turning_head_is_rejected(self):
-        obj = build(chip=FakeIMUChip(rate=(0., 4., 0.)))
+        obj = build(chip=FakeIMUChip(b_rate=4.))
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("turning during the measurement", str(cm.exception))
     def test_the_gate_uses_the_magnitude_not_one_axis(self):
-        # 3-4-5: no single axis exceeds the default 1 deg/s gate by much,
-        # but the head is turning at 5 deg/s
-        obj = build(chip=FakeIMUChip(rate=(3., 4., 0.)))
+        # 3-4-5: the head turns about B at 4 deg/s while the whole chip
+        # also spins at 3 deg/s about the axis pointing up, which tilts
+        # nothing.  The gate should see 5.
+        obj = build({'max_sample_deviation': 0.},
+                    chip=FakeIMUChip(b_rate=4., off_axis_rate=3.))
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("5.000 deg/s", str(cm.exception))
     def test_the_gate_can_be_raised(self):
-        obj = build({'max_rotation_rate': 10.},
-                    chip=FakeIMUChip(rate=(0., 4., 0.)))
+        obj = build({'max_rotation_rate': 10., 'max_sample_deviation': 0.},
+                    chip=FakeIMUChip(b_rate=4.))
         self.assertAlmostEqual(obj.measure().rotation_rate, 4.)
     def test_zero_disables_the_gate_entirely(self):
-        obj = build({'max_rotation_rate': 0.},
-                    chip=FakeIMUChip(rate=(0., 99., 0.)))
+        obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.,
+                     'max_fusion_disagreement': 0.},
+                    chip=FakeIMUChip(b_rate=99.))
         self.assertIsNone(obj.measure().rotation_rate)
     def test_a_silent_gyroscope_is_reported(self):
-        # The accelerometer arrives but the gyroscope stream does not
-        obj = build(chip=FakeIMUChip(gyro_lag=5.))
+        # The accelerometer arrives but the gyroscope stream does not.
+        # Fusion reads one combined stream, so this is the unfused path.
+        obj = build({'fusion': False}, chip=FakeIMUChip(gyro_lag=5.))
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("no gyroscope samples", str(cm.exception))
     def test_the_rate_reaches_get_status(self):
-        obj = build(chip=FakeIMUChip(rate=(0., .25, 0.)))
+        obj = build({'max_sample_deviation': 0.},
+                    chip=FakeIMUChip(b_rate=.25))
         self.assertTrue(obj.get_status()['has_gyro'])
         self.assertIsNone(obj.get_status()['rotation_rate'])
         obj.measure()
         self.assertAlmostEqual(obj.get_status()['rotation_rate'], .25)
     def test_the_rate_is_reported_by_b_measure(self):
-        obj = build(chip=FakeIMUChip(rate=(0., .25, 0.)))
+        obj = build({'max_sample_deviation': 0.},
+                    chip=FakeIMUChip(b_rate=.25))
         gcmd = FakeGCmd()
         obj.cmd_B_MEASURE(gcmd)
         self.assertIn("rotation rate = 0.2500 deg/s", gcmd.responses[0])
+
+
+######################################################################
+# The complementary filter
+######################################################################
+
+class TestComplementaryFilter(unittest.TestCase):
+    def test_wrap180(self):
+        for raw, want in ((0., 0.), (180., 180.), (-180., 180.),
+                          (181., -179.), (-181., 179.), (540., 180.),
+                          (359., -1.), (-359., 1.)):
+            self.assertAlmostEqual(abh.wrap180(raw), want, places=9)
+    def test_a_steady_accelerometer_and_no_rate_holds_the_angle(self):
+        filt = abh.ComplementaryFilter(.2)
+        for _ in range(1000):
+            filt.update(30., 0., .001)
+        self.assertAlmostEqual(filt.angle, 30., places=6)
+    def test_it_converges_on_the_accelerometer_from_a_bad_seed(self):
+        filt = abh.ComplementaryFilter(.05)
+        filt.update(0., 0., 0.)          # seeded at 0
+        for _ in range(2000):
+            filt.update(45., 0., .001)   # accelerometer says 45
+        self.assertAlmostEqual(filt.angle, 45., places=4)
+    def test_the_gyroscope_carries_the_short_timescales(self):
+        # A rate the accelerometer does not see at all: the filter
+        # follows it for about tau and is then pulled back
+        filt = abh.ComplementaryFilter(.2)
+        filt.update(0., 0., 0.)
+        for _ in range(50):
+            filt.update(0., 10., .001)   # 10 deg/s for 50 ms
+        self.assertGreater(filt.angle, .3)
+        for _ in range(5000):
+            filt.update(0., 0., .001)
+        self.assertAlmostEqual(filt.angle, 0., places=4)
+    def test_a_consistent_ramp_is_tracked_without_lag(self):
+        # Accelerometer and gyroscope agreeing on a 20 deg/s sweep: the
+        # fused angle should sit on the accelerometer's value, not
+        # behind it
+        filt = abh.ComplementaryFilter(.2)
+        dt, rate = .001, 20.
+        angle = 0.
+        for i in range(3000):
+            angle = rate * i * dt
+            filt.update(angle, rate, dt if i else 0.)
+        self.assertAlmostEqual(filt.angle, angle, places=3)
+    def test_it_survives_the_180_degree_wrap(self):
+        filt = abh.ComplementaryFilter(.2)
+        dt, rate = .001, 60.
+        angle = 170.
+        for i in range(1000):
+            angle = abh.wrap180(170. + rate * i * dt)
+            filt.update(angle, rate, dt if i else 0.)
+        # the sweep crosses +180 partway through; the filter should come
+        # out on the far side of the wrap, tracking the last angle fed in
+        self.assertLess(filt.angle, 0.)
+        self.assertAlmostEqual(filt.angle, angle, places=3)
+    def test_a_non_positive_tau_is_refused(self):
+        for tau in (0., -1.):
+            with self.assertRaises(ValueError):
+                abh.ComplementaryFilter(tau)
+
+
+######################################################################
+# The gyroscope axis and sign, which are derived rather than configured
+######################################################################
+
+class TestGyroAxis(unittest.TestCase):
+    def test_the_reference_mounting(self):
+        # zero=+z, positive=+x  =>  rotation axis y, and dB/dt = -w_y
+        z, x = abh.parse_signed_axis('+z'), abh.parse_signed_axis('+x')
+        self.assertEqual(abh.gyro_axis_coefficient(z, x), (-1., 1))
+    def test_negating_positive_vector_flips_the_sign(self):
+        z = abh.parse_signed_axis('+z')
+        self.assertEqual(abh.gyro_axis_coefficient(
+            z, abh.parse_signed_axis('-x')), (1., 1))
+    def test_negating_zero_vector_flips_the_sign(self):
+        x = abh.parse_signed_axis('+x')
+        self.assertEqual(abh.gyro_axis_coefficient(
+            abh.parse_signed_axis('-z'), x), (1., 1))
+    def test_swapping_the_two_flips_the_sign(self):
+        z, x = abh.parse_signed_axis('+z'), abh.parse_signed_axis('+x')
+        a, _ = abh.gyro_axis_coefficient(z, x)
+        b, _ = abh.gyro_axis_coefficient(x, z)
+        self.assertEqual(a, -b)
+    def test_every_mounting_recovers_the_true_rate(self):
+        # Rotate a synthetic head about its own B axis and check that
+        # the derived coefficient turns the sensor's rate vector back
+        # into +10 deg/s, for all 24 axis-aligned mountings.
+        for zname in ('+x', '-x', '+y', '-y', '+z', '-z'):
+            for pname in ('+x', '-x', '+y', '-y', '+z', '-z'):
+                zero = abh.parse_signed_axis(zname)
+                positive = abh.parse_signed_axis(pname)
+                if zero[0] == positive[0]:
+                    continue
+                w = [0.] * 3
+                w[zero[0]] = zero[1]
+                u = [0.] * 3
+                u[positive[0]] = positive[1]
+                # the machine's B axis in sensor coords is w x u, and
+                # the sensor's own rate about it is -dB/dt
+                n = [w[1]*u[2]-w[2]*u[1], w[2]*u[0]-w[0]*u[2],
+                     w[0]*u[1]-w[1]*u[0]]
+                omega = [-10. * c for c in n]
+                coeff, index = abh.gyro_axis_coefficient(zero, positive)
+                self.assertAlmostEqual(coeff * omega[index], 10., places=9,
+                                       msg="%s / %s" % (zname, pname))
+
+
+######################################################################
+# The fused measurement
+######################################################################
+
+class TestFusion(unittest.TestCase):
+    def test_a_chip_without_a_gyroscope_does_not_fuse(self):
+        obj = build(chip=FakeAccelChip(angle=7.))
+        reading = obj.measure()
+        self.assertIsNone(reading.fused_angle)
+        self.assertAlmostEqual(reading.angle, reading.accel_angle)
+        self.assertFalse(obj.get_status()['fusion'])
+    def test_a_stationary_head_fuses_to_the_same_answer(self):
+        obj = build(chip=FakeIMUChip(angle=12.))
+        reading = obj.measure()
+        self.assertIsNotNone(reading.fused_angle)
+        self.assertAlmostEqual(reading.fused_angle, 12., places=4)
+        self.assertAlmostEqual(reading.accel_angle, 12., places=4)
+        self.assertAlmostEqual(reading.disagreement, 0., places=4)
+    def test_the_fused_angle_leads_the_accelerometer_on_a_moving_head(self):
+        # Sweeping at 4 deg/s from 0: the window runs 0.25 to 0.75 s, so
+        # the accelerometer average lands at its midpoint (2.0 deg) while
+        # the fused angle tracks to the window's end (3.0 deg).
+        obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.},
+                    chip=FakeIMUChip(b_rate=4.))
+        reading = obj.measure()
+        self.assertAlmostEqual(reading.accel_angle, 2.0, delta=.02)
+        self.assertAlmostEqual(reading.fused_angle, 3.0, delta=.02)
+        # and the authoritative angle is the fused one
+        self.assertEqual(reading.angle, reading.fused_angle)
+    def test_the_fused_angle_follows_the_sign_of_the_rotation(self):
+        for b_rate in (4., -4.):
+            obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.},
+                        chip=FakeIMUChip(b_rate=b_rate))
+            reading = obj.measure()
+            # fused sits ahead of the accelerometer average in the
+            # direction the head is actually turning
+            self.assertGreater(
+                (reading.fused_angle - reading.accel_angle) * b_rate, 0.)
+    def test_an_off_axis_spin_does_not_move_the_angle(self):
+        obj = build({'max_rotation_rate': 0.},
+                    chip=FakeIMUChip(angle=12., off_axis_rate=30.))
+        reading = obj.measure()
+        self.assertAlmostEqual(reading.fused_angle, 12., places=4)
+    def test_an_inverted_gyroscope_is_caught_when_the_head_moves_enough(self):
+        obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.,
+                     'max_magnitude_error': 0.},
+                    chip=FakeIMUChip(b_rate=40., invert_gyro=True))
+        with self.assertRaises(ConfigError) as cm:
+            obj.measure()
+        self.assertIn("gyroscope is inverted", str(cm.exception))
+    def test_an_inverted_gyroscope_is_invisible_on_a_parked_head(self):
+        # Stated as a test because it is a real limitation: with nothing
+        # to integrate, the sign cannot be checked.  That needs a
+        # deliberate move (B_GYRO_CALIBRATE, phase 3).
+        obj = build(chip=FakeIMUChip(angle=12., invert_gyro=True))
+        self.assertAlmostEqual(obj.measure().fused_angle, 12., places=4)
+    def test_fusion_can_be_turned_off_in_config(self):
+        obj = build({'fusion': False}, chip=FakeIMUChip(angle=12.))
+        reading = obj.measure()
+        self.assertIsNone(reading.fused_angle)
+        self.assertAlmostEqual(reading.angle, reading.accel_angle)
+    def test_fusion_can_be_turned_off_per_command(self):
+        obj = build(chip=FakeIMUChip(angle=12.))
+        self.assertIsNone(obj.measure(fusion=False).fused_angle)
+        self.assertIsNotNone(obj.measure(fusion=True).fused_angle)
+    def test_b_measure_reports_both_estimates(self):
+        obj = build(chip=FakeIMUChip(angle=12.))
+        gcmd = FakeGCmd()
+        obj.cmd_B_MEASURE(gcmd)
+        self.assertIn("fused 12.000 deg", gcmd.responses[0])
+        self.assertIn("accelerometer alone 12.000", gcmd.responses[0])
+    def test_b_measure_can_ask_for_the_unfused_angle(self):
+        obj = build(chip=FakeIMUChip(angle=12.))
+        gcmd = FakeGCmd({'FUSION': 0})
+        obj.cmd_B_MEASURE(gcmd)
+        self.assertNotIn("fused", gcmd.responses[0])
+    def test_a_capture_shorter_than_the_filter_needs_is_refused(self):
+        obj = build({'settle_time': 0., 'sample_time': .05,
+                     'fusion_tau': .5}, chip=FakeIMUChip(angle=12.))
+        with self.assertRaises(ConfigError) as cm:
+            obj.measure()
+        self.assertIn("fusion_tau", str(cm.exception))
+    def test_the_fusion_state_reaches_get_status(self):
+        obj = build(chip=FakeIMUChip(angle=12.))
+        status = obj.get_status()
+        self.assertTrue(status['fusion'])
+        self.assertAlmostEqual(status['fusion_tau'], .2)
+        self.assertEqual(status['rotation_axis_sign'], -1.)
+        self.assertIsNone(status['fusion_disagreement'])
+        obj.measure()
+        self.assertIsNotNone(obj.get_status()['fusion_disagreement'])
 
 
 if __name__ == '__main__':

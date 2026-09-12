@@ -2042,7 +2042,14 @@ gyroscope is for.
 #axes_map: x, y, z
 #   See the "adxl345" section for information on this parameter. One
 #   physical chip means one map, and it is applied to the gyroscope and
-#   the accelerometer alike.
+#   the accelerometer alike - but not quite identically. An angular
+#   rate is a pseudovector, so a map that *reflects* the frame (any
+#   swap without a matching negation, such as "x, z, y", and also a
+#   lone negation such as "x, -y, z") flips the gyroscope where it does
+#   not flip the accelerometer. This driver applies the map's
+#   determinant to the gyroscope for exactly that reason. A map that
+#   drops or repeats an axis cannot be corrected and is refused while
+#   the gyroscope is enabled.
 #gyro: True
 #   Whether to put the gyroscope in the FIFO alongside the
 #   accelerometer. With it enabled a FIFO frame is twelve bytes rather
@@ -2850,10 +2857,27 @@ the chip's own section, and `[adxl345]`, `[lis2dw]`, `[mpu9250]` and
 shared with `[resonance_tester]`; this section does not require any
 particular `axes_map`.
 
-With a `[bmi160]` the gyroscope also gates the measurement: a head at
-rest reads zero rotation rate, so `max_rotation_rate` below tests
-directly for the thing `max_sample_deviation` can only infer. Chips
-without a gyroscope skip the gate and behave exactly as before.
+With a `[bmi160]` the gyroscope does two things. It **gates** the
+measurement - a head at rest reads zero rotation rate, so
+`max_rotation_rate` below tests directly for the thing
+`max_sample_deviation` can only infer. And it is **fused** with the
+accelerometer through a complementary filter, which crosses the two over
+at `fusion_tau`: above it the accelerometer wins, so the angle is
+absolute and does not drift; below it the gyroscope wins, so the angle
+tracks the head through the ringing that follows a move instead of
+waiting it out. The fused angle is the one `CHECK=1` compares and the one
+`get_status()` reports, and `B_MEASURE` prints the accelerometer-only
+angle beside it so the two can be compared on the machine.
+
+Which gyroscope axis carries the rotation, and with which sign, is
+derived from `zero_vector` and `positive_vector` - there is nothing
+further to configure and nothing to guess. See
+[BMI160_IMU.md](BMI160_IMU.md), "The gyroscope's sign is not a free
+parameter", including the limits of the `max_fusion_disagreement` check
+that guards it.
+
+Chips without a gyroscope skip both the gate and the fusion, and behave
+exactly as before.
 
 A USB sensor board carries its own microcontroller running Klipper
 firmware, so it is configured as a secondary MCU and its pins are
@@ -2926,15 +2950,40 @@ positive_vector:
 #   and well below any real motion, and the right value is whatever
 #   B_MEASURE reports on a parked head plus a margin. Set to 0 to
 #   disable the check. See BMI160_IMU.md.
+#fusion: True
+#   Whether to fuse the gyroscope with the accelerometer. Ignored when
+#   the chip has no gyroscope. Turning it off reverts to averaging the
+#   accelerometer alone, which is what B_MEASURE FUSION=0 does for a
+#   single measurement. The default is True.
+#fusion_tau: 0.2
+#   Crossover time constant (in seconds) of the complementary filter.
+#   Shorter trusts the gyroscope further, which tracks a moving head
+#   better but passes more of the gyroscope's zero-rate offset through
+#   as bias (roughly offset x tau). Longer trusts the accelerometer
+#   further and settles more slowly. The measurement window must be at
+#   least three times this long or the measurement is refused. This is
+#   the knob worth tuning on the machine; the default of 0.2 is a
+#   starting point, not a result.
+#max_fusion_disagreement: 5.0
+#   How far (in degrees) the fused angle may sit from a trailing
+#   accelerometer average over the end of the same window before the
+#   measurement is refused. Both estimate the angle *now*, so this
+#   catches a gyroscope that is inverted, mis-scaled or on the wrong
+#   axis. Note what it cannot catch: on a parked head there is no
+#   rotation to integrate, so a wrong sign is invisible. Set to 0 to
+#   disable. The default is 5.0.
 #check_tolerance: 5.0
 #   Default TOLERANCE (in degrees) for B_MEASURE CHECK=1. The default is
 #   5.0 - loose, for the reasons above.
 ```
 
-`B_MEASURE [SETTLE=<s>] [SAMPLE_TIME=<s>] [CHECK=0|1] [TOLERANCE=<deg>]`
-reports the measured angle, the averaged acceleration vector and its
-magnitude, the in-plane and out-of-plane components, and the per-axis
-sample deviation. When B is homed it also reports the commanded angle and
+`B_MEASURE [SETTLE=<s>] [SAMPLE_TIME=<s>] [FUSION=0|1] [CHECK=0|1]
+[TOLERANCE=<deg>]` reports the measured angle, the averaged acceleration
+vector and its magnitude, the in-plane and out-of-plane components, and
+the per-axis sample deviation. With a gyroscope it also reports the
+measured rotation rate, and both the fused and accelerometer-only angles
+with the difference between them; `FUSION=0` measures without the
+gyroscope for that one command, which is the direct way to compare. When B is homed it also reports the commanded angle and
 the error against it; `CHECK=1` turns a disagreement larger than
 `TOLERANCE` into an error, which is what makes it usable in
 `PRINT_START`.

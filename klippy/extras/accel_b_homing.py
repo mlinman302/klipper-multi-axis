@@ -48,15 +48,53 @@
 # check: it should barely change as B turns, and the in-plane radius
 # hypot(u, w) should stay at 1 g.
 #
+# THE FUSED MEASUREMENT
+#
+# An accelerometer cannot tell a tilted head from an accelerating one.
+# A gyroscope can see the head turn but cannot say where it started, and
+# its zero-rate offset makes an integrated angle drift.  The two fail in
+# opposite directions, which is what makes them worth fusing: the
+# accelerometer is absolute but only over long times, the gyroscope is
+# exact but only over short ones.
+#
+# A complementary filter crosses them over at one time constant, tau:
+#
+#   predicted = angle + rate * dt          (gyroscope, short term)
+#   angle     = predicted + (1 - alpha) * (accel_angle - predicted)
+#   alpha     = tau / (tau + dt)           (accelerometer, long term)
+#
+# Above tau the accelerometer wins, so the result is absolute and does
+# not drift.  Below tau the gyroscope wins, so the result tracks the
+# head *through* the ringing that follows a move rather than waiting for
+# it to stop.
+#
+# THE GYROSCOPE'S SIGN IS NOT A FREE PARAMETER
+#
+# This is the part worth reading twice.  Which gyroscope axis carries
+# dB/dt, and with which sign, follows from zero_vector and
+# positive_vector alone - there is nothing extra to declare and nothing
+# to guess.  B is the angle of the world-up vector in the sensor frame,
+# measured from zero_vector toward positive_vector.  Turning the sensor
+# at omega makes world-fixed vectors appear to turn at -omega in the
+# sensor frame, and the zero->positive sense is a positive rotation
+# about (w_hat x u_hat), so
+#
+#   dB/dt = -omega . (w_hat x u_hat)
+#
+# With both vectors axis aligned, w_hat x u_hat is plus or minus the
+# third basis vector and this collapses to one signed component - which
+# is what gyro_axis_coefficient() below returns.
+#
+# One caveat lives in the chip module rather than here: an angular rate
+# is a pseudovector, so an axes_map that reflects the frame flips it.
+# bmi160.py applies the map's determinant for exactly this reason.
+#
 # THE MOTION GATE
 #
-# An accelerometer cannot tell a tilted head from an accelerating one,
-# so a measurement is only a tilt if the head was actually at rest.  The
-# accelerometer's own evidence for that is indirect - a small per-sample
-# deviation - and a head rocking slowly on its belts barely moves that
-# statistic.  When the chip is an IMU (a [bmi160]), the gyroscope
-# answers the question directly: a head at rest reads zero rate.  The
-# gate is skipped for chips with no gyroscope, so an [adxl345] keeps
+# Fusion says what the angle is; the gate says whether to trust it as a
+# *static* tilt.  A head at rest reads zero rate, so max_rotation_rate
+# tests directly for the thing max_sample_deviation can only infer.
+# Both are skipped for chips with no gyroscope, so an [adxl345] keeps
 # working exactly as before.  See docs/BMI160_IMU.md.
 #
 # WHAT THIS PHASE DOES NOT DO
@@ -91,6 +129,21 @@ DEFAULT_BATCH_MARGIN = .3
 # Index of the B coordinate within a toolhead position vector
 B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
 
+# The filter is seeded from the accelerometer and converges with time
+# constant tau, so a capture much shorter than a few tau is reporting
+# its seed rather than a fused answer.
+MIN_FUSION_SPANS = 3.
+
+# Fraction of the measurement window used for the trailing accelerometer
+# average that the fused angle is checked against.  Both estimate "the
+# angle now", so they agree when the gyroscope is wired up correctly and
+# diverge when it is not - see the disagreement check in measure().
+FUSION_TAIL_FRACTION = .2
+
+# Levi-Civita symbol, for the cross product in gyro_axis_coefficient()
+LEVI_CIVITA = {(0, 1, 2): 1., (1, 2, 0): 1., (2, 0, 1): 1.,
+               (0, 2, 1): -1., (2, 1, 0): -1., (1, 0, 2): -1.}
+
 AXIS_NAMES = ('x', 'y', 'z')
 SIGNED_AXES = {
     'x': (0, 1.), '+x': (0, 1.), '-x': (0, -1.),
@@ -100,8 +153,9 @@ SIGNED_AXES = {
 VALID_AXES = "+x, -x, +y, -y, +z or -z"
 
 TiltReading = collections.namedtuple('TiltReading', (
-    'angle', 'vector', 'deviation', 'magnitude', 'u', 'w', 'out_of_plane',
-    'count', 'rotation_rate'))
+    'angle', 'accel_angle', 'fused_angle', 'disagreement', 'vector',
+    'deviation', 'magnitude', 'u', 'w', 'out_of_plane', 'count',
+    'rotation_rate'))
 
 
 ######################################################################
@@ -155,6 +209,60 @@ def summarize(vectors):
 def magnitude(vector):
     return math.sqrt(sum([c * c for c in vector]))
 
+def wrap180(angle):
+    # An angle difference, brought into (-180, 180]
+    return -((180. - angle) % 360. - 180.)
+
+def gyro_axis_coefficient(zero_axis, positive_axis):
+    # dB/dt from the raw gyroscope, as (coefficient, sensor axis index),
+    # so that  dB/dt = coefficient * omega[index].  See the header.
+    (zero_index, zero_sign) = zero_axis
+    (positive_index, positive_sign) = positive_axis
+    rotation_index = out_of_plane_index(zero_axis, positive_axis)
+    eps = LEVI_CIVITA[(zero_index, positive_index, rotation_index)]
+    coefficient = -(math.copysign(1., zero_sign)
+                    * math.copysign(1., positive_sign) * eps)
+    return coefficient, rotation_index
+
+# Crosses an absolute-but-noisy angle over with a clean-but-drifting
+# rate at one time constant.  Written as a correction to the predicted
+# angle rather than as a weighted mean of two angles, so that a
+# measurement straddling the +/-180 wrap does not average to the
+# opposite side of the circle.
+class ComplementaryFilter:
+    def __init__(self, tau):
+        if tau <= 0.:
+            raise ValueError("fusion time constant must be positive")
+        self.tau = tau
+        self.angle = None
+    def update(self, accel_angle, rate, dt):
+        if self.angle is None or dt <= 0.:
+            # Seed from the accelerometer.  The filter converges from
+            # any starting point; starting at approximately the right
+            # answer just saves a time constant of settling.
+            self.angle = wrap180(accel_angle)
+            return self.angle
+        alpha = self.tau / (self.tau + dt)
+        predicted = self.angle + rate * dt
+        self.angle = wrap180(predicted
+                             + (1. - alpha) * wrap180(accel_angle - predicted))
+        return self.angle
+
+def fuse_samples(samples, zero_axis, positive_axis, gyro_coefficient,
+                 gyro_index, tau):
+    # samples are (time, gx, gy, gz, ax, ay, az) - one instant per
+    # sample, which is what makes fusing them legitimate
+    filt = ComplementaryFilter(tau)
+    last_time = None
+    for sample in samples:
+        accel_angle = measure_angle(tuple(sample[4:7]), zero_axis,
+                                    positive_axis)
+        rate = gyro_coefficient * sample[1 + gyro_index]
+        dt = 0. if last_time is None else sample[0] - last_time
+        filt.update(accel_angle, rate, dt)
+        last_time = sample[0]
+    return filt.angle
+
 
 ######################################################################
 # The printer object
@@ -200,6 +308,22 @@ class AccelBHoming:
         # plus a margin.  Zero disables the gate.
         self.max_rotation_rate = config.getfloat('max_rotation_rate', 1.,
                                                  minval=0.)
+        # Fusion.  tau is the crossover: shorter trusts the gyroscope
+        # further, which tracks a moving head better but lets the
+        # gyroscope's zero-rate offset through; longer trusts the
+        # accelerometer further.  It is the knob worth tuning on the
+        # machine, and the default is a starting point, not a result.
+        self.fusion = config.getboolean('fusion', True)
+        self.fusion_tau = config.getfloat('fusion_tau', .2, above=0.)
+        # How far the fused angle may sit from a trailing accelerometer
+        # average before the measurement is refused.  Both estimate the
+        # angle *now*, so this catches a gyroscope that is inverted,
+        # mis-scaled or on the wrong axis - failures that would
+        # otherwise bias every measurement silently.
+        self.max_fusion_disagreement = config.getfloat(
+            'max_fusion_disagreement', 5., minval=0.)
+        self.gyro_coefficient, self.gyro_index = gyro_axis_coefficient(
+            self.zero_axis, self.positive_axis)
         # Generous by default, because the reading is uncalibrated - see
         # the header comment.
         self.check_tolerance = config.getfloat('check_tolerance', 5.,
@@ -251,29 +375,47 @@ class AccelBHoming:
     ######################################################################
     # The measurement primitive
     ######################################################################
-    def measure(self, settle_time=None, sample_time=None):
+    def measure(self, settle_time=None, sample_time=None, fusion=None):
         settle = self.settle_time if settle_time is None else settle_time
         window = self.sample_time if sample_time is None else sample_time
         toolhead = self.toolhead
+        fuse = self.fusion if fusion is None else fusion
+        fuse = bool(fuse) and self.has_gyro
         toolhead.wait_moves()
-        client = self.chip.start_internal_client()
-        gyro_client = None
-        if self.has_gyro and self.max_rotation_rate:
-            gyro_client = self.chip.start_internal_gyro_client()
+        # Fusing reads the combined stream, where each sample carries an
+        # acceleration and a rotation rate the chip measured at the same
+        # instant.  Without fusion the two split views are enough, and
+        # the gyroscope one is only needed for the gate.
+        imu_client = client = gyro_client = None
+        if fuse:
+            imu_client = self.chip.start_internal_imu_client()
+        else:
+            client = self.chip.start_internal_client()
+            if self.has_gyro and self.max_rotation_rate:
+                gyro_client = self.chip.start_internal_gyro_client()
         start_time = toolhead.get_last_move_time()
         # The averaging window is settle..settle+window; the extra margin
         # is only there to let the batches carrying it arrive
         toolhead.dwell(settle + window + self.batch_margin)
-        client.finish_measurements()
-        if gyro_client is not None:
-            gyro_client.finish_measurements()
+        for c in (imu_client, client, gyro_client):
+            if c is not None:
+                c.finish_measurements()
         # AccelQueryHelper trims to the request window but knows nothing
         # about the settle dwell, so drop that part here.  Samples are
         # (print_time, x, y, z); index rather than name the fields, so
         # any chip exposing start_internal_client() works.
         first = start_time + settle
         last = first + window
-        vectors = [(s[1], s[2], s[3]) for s in client.get_samples()
+        if fuse:
+            imu_samples = imu_client.get_samples()
+            accel_samples = [(s[0], s[4], s[5], s[6]) for s in imu_samples]
+            gyro_samples = [(s[0], s[1], s[2], s[3]) for s in imu_samples]
+        else:
+            imu_samples = None
+            accel_samples = client.get_samples()
+            gyro_samples = (None if gyro_client is None
+                            else gyro_client.get_samples())
+        vectors = [(s[1], s[2], s[3]) for s in accel_samples
                    if first <= s[0] <= last]
         if not vectors:
             raise self.printer.command_error(
@@ -305,9 +447,8 @@ class AccelBHoming:
         # head was not turning, where everything above it is an
         # inference from how steady the gravity vector looked.
         rotation_rate = None
-        if gyro_client is not None:
-            rates = [magnitude((s[1], s[2], s[3]))
-                     for s in gyro_client.get_samples()
+        if gyro_samples is not None and self.max_rotation_rate:
+            rates = [magnitude((s[1], s[2], s[3])) for s in gyro_samples
                      if first <= s[0] <= last]
             if not rates:
                 raise self.printer.command_error(
@@ -321,8 +462,66 @@ class AccelBHoming:
                     " (%.3f deg/s > %.3f) - increase settle_time, or raise"
                     " max_rotation_rate if this is the sensor's noise floor"
                     % (self.name, rotation_rate, self.max_rotation_rate))
+        accel_angle = measure_angle(mean, self.zero_axis, self.positive_axis)
+        # The fused angle runs over the whole capture, settle included -
+        # with the gyroscope carrying the short timescales, the settle
+        # dwell stops being "wait for the head to stop" and becomes
+        # "give the filter time to converge".
+        fused_angle = disagreement = None
+        if fuse:
+            # ...but it stops at the end of the window, not the end of
+            # the capture: the trailing batch_margin is delivery slack
+            # that the user did not ask to measure, and running past it
+            # would put the fused angle and the accelerometer tail it is
+            # checked against at different instants.
+            imu_samples = [s for s in imu_samples if s[0] <= last]
+            if len(imu_samples) < 2:
+                raise self.printer.command_error(
+                    "%s: no combined imu samples in the measurement"
+                    " window - check that '%s' is responding (try"
+                    " BMI160_QUERY)" % (self.name, self.chip_name))
+            span = imu_samples[-1][0] - imu_samples[0][0]
+            if span < MIN_FUSION_SPANS * self.fusion_tau:
+                raise self.printer.command_error(
+                    "%s: the %.3f s capture is shorter than %g x fusion_tau"
+                    " (%.3f s), so the complementary filter would report"
+                    " its own starting value - raise settle_time or"
+                    " sample_time, or lower fusion_tau"
+                    % (self.name, span, MIN_FUSION_SPANS,
+                       MIN_FUSION_SPANS * self.fusion_tau))
+            fused_angle = fuse_samples(
+                imu_samples, self.zero_axis, self.positive_axis,
+                self.gyro_coefficient, self.gyro_index, self.fusion_tau)
+            # Check it against the accelerometer's own view of the *end*
+            # of the window rather than the whole of it: both estimate
+            # the angle now, so they agree when the gyroscope is right
+            # and diverge when its sign, scale or axis is wrong.  A
+            # stationary head has nothing to integrate and so proves
+            # nothing either way - that needs a deliberate move.
+            tail_start = last - FUSION_TAIL_FRACTION * window
+            tail = [(s[1], s[2], s[3]) for s in accel_samples
+                    if tail_start <= s[0] <= last]
+            if tail:
+                tail_mean, _ = summarize(tail)
+                tail_angle = measure_angle(tail_mean, self.zero_axis,
+                                           self.positive_axis)
+                disagreement = wrap180(fused_angle - tail_angle)
+                if (self.max_fusion_disagreement
+                    and abs(disagreement) > self.max_fusion_disagreement):
+                    raise self.printer.command_error(
+                        "%s: the fused angle is %.3f deg where the"
+                        " accelerometer alone reads %.3f (difference"
+                        " %+.3f, tolerance %.3f).  Either the head was"
+                        " still moving, or the gyroscope is inverted,"
+                        " mis-scaled or on the wrong axis - check"
+                        " zero_vector, positive_vector and the chip's"
+                        " axes_map."
+                        % (self.name, fused_angle, tail_angle, disagreement,
+                           self.max_fusion_disagreement))
         reading = TiltReading(
-            angle=measure_angle(mean, self.zero_axis, self.positive_axis),
+            angle=accel_angle if fused_angle is None else fused_angle,
+            accel_angle=accel_angle, fused_angle=fused_angle,
+            disagreement=disagreement,
             vector=mean, deviation=dev, magnitude=mag,
             u=project(mean, self.positive_axis),
             w=project(mean, self.zero_axis),
@@ -356,16 +555,23 @@ class AccelBHoming:
                'rotation_axis': AXIS_NAMES[self.oop_index],
                'accel_chip': self.chip_name}
         res['has_gyro'] = self.has_gyro
+        res['fusion'] = self.fusion and self.has_gyro
+        res['fusion_tau'] = self.fusion_tau
+        res['rotation_axis_sign'] = self.gyro_coefficient
         reading = self.last_reading
         res['measured_b'] = None if reading is None else reading.angle
         res['rotation_rate'] = (None if reading is None
                                 else reading.rotation_rate)
+        res['fusion_disagreement'] = (None if reading is None
+                                      else reading.disagreement)
         return res
     cmd_B_MEASURE_help = "Measure the B axis angle against gravity"
     def cmd_B_MEASURE(self, gcmd):
         settle = gcmd.get_float('SETTLE', self.settle_time, minval=0.)
         window = gcmd.get_float('SAMPLE_TIME', self.sample_time, minval=.05)
-        reading = self.measure(settle, window)
+        fusion = gcmd.get_int('FUSION', None, minval=0, maxval=1)
+        reading = self.measure(settle, window,
+                               None if fusion is None else bool(fusion))
         x, y, z = reading.vector
         dx, dy, dz = reading.deviation
         lines = [
@@ -383,6 +589,14 @@ class AccelBHoming:
         if reading.rotation_rate is not None:
             lines.append("  rotation rate = %.4f deg/s (gate %.3f)"
                          % (reading.rotation_rate, self.max_rotation_rate))
+        if reading.fused_angle is not None:
+            lines.append(
+                "  fused %.3f deg, accelerometer alone %.3f, tail"
+                " difference %+.3f (tau %.3f s)"
+                % (reading.fused_angle, reading.accel_angle,
+                   reading.disagreement
+                   if reading.disagreement is not None else float('nan'),
+                   self.fusion_tau))
         check = gcmd.get_int('CHECK', 0, minval=0, maxval=1)
         if not self.is_b_homed():
             # Report the measurement either way - it is the useful part

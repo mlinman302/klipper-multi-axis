@@ -55,11 +55,20 @@ class FakeWebhooks:
     def register_mux_endpoint(self, path, key, value, callback):
         self.endpoints[(path, value)] = callback
 
+class FakeToolhead:
+    def get_last_move_time(self):
+        return 0.
+    def wait_moves(self):
+        pass
+    def dwell(self, delay):
+        pass
+
 class FakePrinter:
     config_error = ConfigError
     command_error = ConfigError
     def __init__(self):
-        self.objects = {'gcode': FakeGCode(), 'webhooks': FakeWebhooks()}
+        self.objects = {'gcode': FakeGCode(), 'webhooks': FakeWebhooks(),
+                        'toolhead': FakeToolhead()}
     def get_reactor(self):
         return FakeReactor()
     def lookup_object(self, name, default=Ellipsis):
@@ -195,6 +204,24 @@ class TestDatasheetTables(unittest.TestCase):
         for rate, code in bmi160.DATA_RATES.items():
             self.assertEqual(rate, 100. / 2 ** (8 - code))
         self.assertEqual(max(bmi160.DATA_RATES), 1600)
+    def test_axes_map_determinant(self):
+        det = bmi160.axes_map_determinant
+        ident = [(0, 1.), (1, 1.), (2, 1.)]
+        self.assertEqual(det(ident), 1.)
+        # a cyclic permutation is a rotation
+        self.assertEqual(det([(1, 1.), (2, 1.), (0, 1.)]), 1.)
+        # a single swap is a reflection
+        self.assertEqual(det([(1, 1.), (0, 1.), (2, 1.)]), -1.)
+        # a swap with one negation is a rotation again
+        self.assertEqual(det([(1, -1.), (0, 1.), (2, 1.)]), 1.)
+        # negating one axis is a reflection
+        self.assertEqual(det([(0, 1.), (1, -1.), (2, 1.)]), -1.)
+        # negating all three is a reflection too
+        self.assertEqual(det([(0, -1.), (1, -1.), (2, -1.)]), -1.)
+        # the scale is carried in the sign, so magnitude is irrelevant
+        self.assertEqual(det([(2, 7.5), (1, -7.5), (0, 7.5)]), 1.)
+        # not a permutation at all
+        self.assertIsNone(det([(0, 1.), (0, 1.), (2, 1.)]))
     def test_the_invalid_frame_magic(self):
         # An over-read returns 0x80 in every data byte
         raw = struct.unpack("<h", bytes(bytearray([0x80, 0x80])))[0]
@@ -315,9 +342,22 @@ class TestConversion(unittest.TestCase):
         self.assertAlmostEqual(ax, G, places=2)
         self.assertAlmostEqual(az, 0.)
     def test_a_negated_axis_is_negated_in_both(self):
-        chip = build({'axes_map': 'x, -y, z'})
+        # "-x, -y, z" is a half turn about z - a real mounting, and one
+        # the gyroscope follows exactly as the accelerometer does
+        chip = build({'axes_map': '-x, -y, z'})
         out = convert(chip, [(1., 0, 1312, 0, 0, 16384, 0)])
         self.assertAlmostEqual(out[0][2], -10., places=3)
+        self.assertAlmostEqual(out[0][5], -G, places=2)
+    def test_a_left_handed_map_flips_the_gyroscope_and_not_the_accel(self):
+        # "x, -y, z" negates one axis, which is a reflection rather than
+        # a rotation.  An acceleration is a vector and follows the map;
+        # a rotation rate is a pseudovector and picks up the map's
+        # determinant as well.  Without that the fused angle would
+        # integrate the rate backwards.
+        chip = build({'axes_map': 'x, -y, z'})
+        self.assertEqual(chip.axes_handedness, -1.)
+        out = convert(chip, [(1., 0, 1312, 0, 0, 16384, 0)])
+        self.assertAlmostEqual(out[0][2], 10., places=3)
         self.assertAlmostEqual(out[0][5], -G, places=2)
     def test_the_range_sets_the_scale(self):
         chip = build({'accel_range': 16, 'gyro_range': 2000})
@@ -379,6 +419,30 @@ class TestStreamViews(unittest.TestCase):
         wh = chip.printer.lookup_object('webhooks')
         self.assertIn(("bmi160/dump_bmi160", 'bmi160'), wh.endpoints)
         self.assertNotIn(("bmi160/dump_bmi160_gyro", 'bmi160'), wh.endpoints)
+    def test_the_imu_client_keeps_both_sensors_in_one_sample(self):
+        # Registering a client starts the whole bulk helper, which needs
+        # a live mcu; the part with logic in it is the helper itself
+        client = bmi160.IMUQueryHelper(FakePrinter())
+        client.request_start_time = 0.
+        client.request_end_time = 10.
+        client.handle_batch({'data': [(1., 1., 2., 3., 4., 5., 6.)]})
+        sample = client.get_samples()[0]
+        self.assertEqual(sample.time, 1.)
+        self.assertEqual((sample.gyro_x, sample.gyro_y, sample.gyro_z),
+                         (1., 2., 3.))
+        self.assertEqual((sample.accel_x, sample.accel_y, sample.accel_z),
+                         (4., 5., 6.))
+    def test_the_imu_client_trims_to_the_request_window(self):
+        client = bmi160.IMUQueryHelper(FakePrinter())
+        client.request_start_time = 2.
+        client.request_end_time = 3.
+        client.handle_batch({'data': [(1.,) + (0.,) * 6,
+                                      (2.5,) + (1.,) * 6,
+                                      (4.,) + (0.,) * 6]})
+        self.assertEqual([s.time for s in client.get_samples()], [2.5])
+    def test_an_imu_client_is_refused_without_a_gyroscope(self):
+        with self.assertRaises(ConfigError):
+            build({'gyro': False}).start_internal_imu_client()
     def test_a_gyro_client_is_refused_when_disabled(self):
         chip = build({'gyro': False})
         self.assertFalse(chip.has_gyro())
@@ -406,6 +470,13 @@ class TestConfig(unittest.TestCase):
             build({'accel_range': 3})
         with self.assertRaises(ConfigError):
             build({'gyro_range': 100})
+    def test_a_degenerate_axes_map_is_refused_with_a_gyroscope(self):
+        with self.assertRaises(ConfigError) as cm:
+            build({'axes_map': 'x, x, z'})
+        self.assertIn("exactly once", str(cm.exception))
+        # without a gyroscope there is no pseudovector to get wrong
+        self.assertIsNone(
+            build({'gyro': False, 'axes_map': 'x, x, z'}).axes_handedness)
     def test_a_gyro_tap_channel_needs_the_gyroscope(self):
         with self.assertRaises(ConfigError) as cm:
             build({'gyro': False, 'tap_channel': 'gyro_z'})

@@ -1,14 +1,23 @@
 # Gravity-referenced B axis: homing and step calibration
 
-> **The sensor is now a BMI160 IMU.** `[accel_b_homing]`'s
-> `accel_chip` defaults to `bmi160`, and its gyroscope supplies the
-> motion gate described under `max_rotation_rate` - a direct test that
-> the head was at rest, where this document's `max_sample_deviation` can
-> only infer it. Everything below about mounting, the zero reference and
-> the measurement itself is unchanged and chip-independent. What the
-> BMI160 does change is the accuracy argument below: its fast offset
-> compensation trims the zero-g offset in hardware to 3.9 mg, so a
-> large part of the phase two offset fit is done by the chip. See
+> **The sensor is now a BMI160 IMU**, and the angle is now *fused*.
+> `[accel_b_homing]`'s `accel_chip` defaults to `bmi160`, and the
+> gyroscope is combined with the accelerometer through a complementary
+> filter: the accelerometer keeps the angle absolute over long
+> timescales, the gyroscope carries it through the ringing that follows
+> a move. The fused angle is the authoritative one; the
+> accelerometer-only angle this document describes is still computed
+> and still reported beside it. The same gyroscope supplies the motion
+> gate (`max_rotation_rate`) - a direct test that the head was at rest,
+> where `max_sample_deviation` below can only infer it.
+>
+> Everything below about mounting and the zero reference is unchanged
+> and chip-independent - and it now does more work, because which
+> gyroscope axis carries dB/dt, and with which sign, is *derived* from
+> `zero_vector` and `positive_vector` rather than separately configured.
+> The BMI160 also changes the accuracy argument below: its fast offset
+> compensation trims the zero-g offset in hardware to 3.9 mg, so a large
+> part of the phase two offset fit is done by the chip. See
 > [BMI160_IMU.md](BMI160_IMU.md).
 
 **Status: phase one is implemented** - `[accel_b_homing]` and the

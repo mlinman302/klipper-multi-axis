@@ -1,11 +1,11 @@
 # BMI160: an IMU for B homing and Z homing
 
-**Status: architecture.** The sensor layer described below is
-implemented. The consumers on top of it - the gyro motion gate in
-`[accel_b_homing]`, `B_GYRO_CALIBRATE`, and the tap detector of
-[Accel_Z_Tap.md](Accel_Z_Tap.md) - land in the phases at the end of this
-document. Nothing here has run on the machine yet; every number quoted
-from the datasheet is a datasheet number, not a measurement.
+**Status: architecture.** The sensor layer, the fused B measurement and
+the motion gate are implemented. `B_GYRO_CALIBRATE` and the tap detector
+of [Accel_Z_Tap.md](Accel_Z_Tap.md) land in the phases at the end of
+this document. Nothing here has run on the machine yet; every number
+quoted from the datasheet is a datasheet number, not a measurement, and
+`fusion_tau` in particular is a starting point rather than a result.
 
 The BMI160 replaces the ADXL345 as the head sensor for
 [Accel_B_Homing.md](Accel_B_Homing.md) and
@@ -28,10 +28,50 @@ the per-sample standard deviation of the accelerometer and calls the head
 rocking slowly on its belts at 2 Hz barely moves that statistic and
 comfortably ruins the angle.
 
-A gyroscope measures rotation rate *directly*. Four things follow, and
-they are the whole case for the chip.
+A gyroscope measures rotation rate *directly*, and the two sensors fail
+in opposite directions - the accelerometer is absolute but only over
+long times, the gyroscope is exact but only over short ones. Fusing them
+is therefore the point, not a refinement of it.
 
-### 1. A motion gate that actually tests for motion
+### 1. A fused angle: absolute *and* fast
+
+Neither sensor alone can measure a moving head's tilt. The accelerometer
+sees gravity plus whatever the head's own acceleration adds, so it is
+only trustworthy once the head has stopped ringing. The gyroscope sees
+the rotation exactly, but it cannot say where the head started and its
+zero-rate offset makes an integrated angle drift without bound.
+
+A complementary filter crosses them over at one time constant, `tau`:
+
+    predicted = angle + rate * dt          (gyroscope, short term)
+    angle     = predicted + (1 - alpha) * (accel_angle - predicted)
+    alpha     = tau / (tau + dt)
+
+Above `tau` the accelerometer wins, so the answer is absolute and does
+not drift. Below `tau` the gyroscope wins, so the answer tracks the head
+*through* the ringing that follows a move rather than waiting for it to
+stop. `[accel_b_homing]` runs this over the whole capture - settle dwell
+included - and reports the filter's final state, which turns
+`settle_time` from "wait for the head to stop" into "give the filter
+time to converge".
+
+Two details are load-bearing enough to state here.
+
+**The blend is written as a correction, not as an average.** Blending
+two angles arithmetically puts a measurement that straddles the +/-180
+wrap on the opposite side of the circle. The implementation adds
+`(1 - alpha)` of the *wrapped difference* to the prediction instead, so
+the wrap is a non-event.
+
+**The two sensors are simultaneous by construction.** A fused sample
+needs an acceleration and a rotation rate measured at the same instant.
+Here they arrive in the same twelve-byte FIFO frame, on the same sample
+clock - so `[accel_b_homing]` reads the combined stream directly rather
+than pairing up the accelerometer and gyroscope views and hoping they
+line up. An ADXL345 plus a separate gyro would have had to earn that
+guarantee; this chip gives it away.
+
+### 2. A motion gate that actually tests for motion
 
 A head at rest reads |omega| = 0. Not "small deviation" - zero, to within
 the zero-rate offset, and the zero-rate offset is a constant the chip can
@@ -40,7 +80,7 @@ Gating a B measurement on measured rotation rate replaces an inference
 with an observation, which is the same upgrade the accelerometer itself
 made over counting steps.
 
-### 2. Rotation sense and degrees-per-step, measured rather than assumed
+### 3. Rotation sense and degrees-per-step, measured rather than assumed
 
 The rotation sense of B on this machine is still unverified - see
 [Accel_B_Homing.md](Accel_B_Homing.md) on `positive_vector` being
@@ -58,7 +98,7 @@ happened. The accelerometer cannot do it: over a 10 degree move near
 B = 0 the gravity vector barely changes, which is exactly where a
 single-axis accel reading goes flat.
 
-### 3. A gravity-free channel for tap detection
+### 4. A gravity-free channel for tap detection
 
 [Accel_Z_Tap.md](Accel_Z_Tap.md) spends most of its length on one
 problem: the accelerometer's contact signal sits on top of a 1 g dc term
@@ -74,17 +114,66 @@ measurement, not an argument, and phase 4 below captures both. The point
 here is that the BMI160 makes it a free comparison: the two channels
 arrive interleaved in one FIFO, on one timebase, from one chip.
 
-### 4. Settling without waiting for it
+## The gyroscope's sign is not a free parameter
 
-`[accel_b_homing]` currently pays `settle_time` (0.25 s) plus
-`sample_time` (0.5 s) plus `batch_margin` (0.3 s) on every measurement,
-almost all of it waiting for a head on belts to stop ringing. A
-complementary filter - accelerometer for the absolute low-frequency
-angle, gyroscope for the clean short-term rate - tracks the angle
-*through* the ringing instead of waiting it out. This is the least urgent
-of the four and the most work, so it is last in the phase list, but it is
-the one that would make measuring B cheap enough to do routinely rather
-than once per home.
+This is the part worth reading twice, because it is the part most likely
+to be wrong on a machine and the part that is cheapest to get right.
+
+Fusing a rate into an angle needs to know **which gyroscope axis carries
+dB/dt, and with which sign**. That looks like a thing to add a config
+option for. It is not: it follows from `zero_vector` and
+`positive_vector`, which `[accel_b_homing]` already declares.
+
+B is the angle of the world-up vector in the sensor frame, measured from
+`zero_vector` toward `positive_vector`. Turning the sensor at omega
+makes world-fixed vectors appear to turn at *minus* omega in the sensor
+frame, and the zero-to-positive sense is a positive rotation about
+`w_hat x u_hat`, so
+
+    dB/dt = -omega . (w_hat x u_hat)
+
+Both vectors are axis aligned, so `w_hat x u_hat` is plus or minus the
+third basis vector and the whole thing collapses to one signed
+component. For the reference mounting in the example config
+(`zero_vector: +z`, `positive_vector: +x`) the rotation axis is y and
+`dB/dt = -omega_y`.
+
+There is one caveat, and it lives in the chip module rather than in the
+homing module. **An angular rate is a pseudovector.** Under an `axes_map`
+that *reflects* the frame rather than merely rotating it - any swap
+without a matching negation, such as `x, z, y`, and also a lone negation
+such as `x, -y, z` - a pseudovector picks up a sign that a vector does
+not. `bmi160.py` therefore multiplies the mapped gyroscope by the map's
+determinant. Nothing that reads only `|omega|` notices the difference;
+anything that fuses the two does, and would integrate the rate backwards
+without it. A degenerate `axes_map` that drops or repeats an axis is
+refused outright when the gyroscope is enabled.
+
+### What checks this on the machine
+
+`[accel_b_homing]` compares the fused angle against a trailing
+accelerometer average over the end of the same window. Both estimate
+"the angle now", so they agree when the gyroscope is wired up correctly
+and diverge when its sign, scale or axis is wrong;
+`max_fusion_disagreement` turns a large divergence into an error rather
+than a silent bias, and `B_MEASURE` prints the difference either way.
+
+Be clear about the limits of that check, because it is easy to
+over-trust:
+
+* On a **parked head** it proves nothing. There is no rotation to
+  integrate, so an inverted gyroscope produces exactly the same answer
+  as a correct one. The test suite states this as a test rather than
+  leaving it implied.
+* On a **moving head** the divergence from an inverted gyroscope is
+  about `2 * tau * rate`. At the default `tau` of 0.2 s that is 0.4
+  degrees per deg/s, so catching it at the default 5 degree tolerance
+  needs the head to be turning at something like 12 deg/s.
+
+The definitive check is therefore a *deliberate* move - turn B by a
+known amount and confirm the fused angle tracks it - which is exactly
+what `B_GYRO_CALIBRATE` automates in phase 3. Until that lands, do it by
+hand once during commissioning.
 
 ## The accelerometer half, on the numbers
 
@@ -258,28 +347,56 @@ takes 250 ms.
 
 ## The B homing path
 
-`[accel_b_homing]` needs one code change to use the gyroscope: the motion
-gate. The measurement itself is unchanged, because it is already
-chip-agnostic - it looks up `accel_chip` by name and calls
-`start_internal_client()`.
+`[accel_b_homing]` now produces two estimates of the angle from one
+capture, and reports both:
 
     measure():
-        wait_moves, dwell(settle)
-        average accel over sample_time    ->  B = atan2(u, w)   (as today)
-        average |omega| over sample_time  ->  reject if > max_rotation_rate
+        wait_moves, start the combined imu stream
+        dwell(settle + sample_time + batch_margin)
 
-The gate is additive and degrades cleanly: a chip with no gyroscope (an
-ADXL345, a LIS2DW) does not expose a gyro client, the gate is skipped,
-and the existing `max_sample_deviation` check remains the only defence.
-That keeps `[accel_b_homing]` working with every chip it works with
-today, which matters because the module is useful to people who do not
-have a BMI160.
+        accel_angle  = atan2(u, w) of the mean acceleration over the
+                       window                          (as before)
+        fused_angle  = complementary filter over settle+window, ending
+                       at the window's end             (new, authoritative)
+        rotation_rate = mean |omega| over the window   -> motion gate
+        disagreement  = fused_angle - trailing accel angle -> sanity check
 
-`B_GYRO_CALIBRATE` - job 2 above - is new work, not a change to an
-existing path: start a gyro client, run a commanded B move, integrate the
-on-axis rate across it, report swept angle against commanded angle. It
-moves the machine, which nothing in `[accel_b_homing]` does today, so it
-arrives with the usual homing-state and interlock questions.
+`angle` - the number `CHECK=1` compares against the commanded B, and the
+number in `get_status()` - is the fused one when a gyroscope is present.
+`accel_angle` is kept alongside it, unchanged in meaning, so the old and
+new estimators can be compared on the machine rather than trusted.
+
+The filter deliberately stops at the **end of the measurement window**
+rather than the end of the capture. The trailing `batch_margin` is
+delivery slack that the user did not ask to measure, and running the
+filter through it would leave the fused angle and the accelerometer tail
+it is checked against describing different instants.
+
+Everything degrades cleanly without a gyroscope. An `[adxl345]` or a
+`[lis2dw]` exposes no gyroscope client, so fusion and the gate are both
+skipped, `angle` is `accel_angle`, and the module behaves exactly as it
+did before. That matters: the module is useful to people who do not have
+a BMI160.
+
+### What this does not yet buy
+
+Fusion makes a *shorter* `settle_time` safe in principle - that is the
+whole point of the gyroscope carrying the short timescales - but the
+defaults are unchanged, because the right `settle_time` is a machine
+measurement. The commissioning path is: leave the defaults, run
+`B_MEASURE`, watch the fused and accelerometer-only angles agree on a
+parked head, then lower `settle_time` and watch where they start to
+disagree. `max_sample_deviation` and `max_rotation_rate` both reject a
+moving head by default and will need raising or disabling first - they
+answer "was this a static tilt?", which is a different question from
+"what is the angle?".
+
+`B_GYRO_CALIBRATE` - job 3 above - remains new work: start the stream,
+run a commanded B move, integrate the on-axis rate across it, report
+swept angle against commanded angle. It moves the machine, which nothing
+in `[accel_b_homing]` does today, so it arrives with the usual
+homing-state and interlock questions. It is also what finally verifies
+the gyroscope's sign, per the limits noted above.
 
 ## The Z homing path
 
@@ -341,22 +458,27 @@ measurement at 3200 Hz.
 
 ## Phases
 
-1. **Sensor layer.** Combined accel+gyro FIFO, both streams exposed to
-   the host, configurable range and rate, FOC commands, the
-   `trigger_analog` attach point. Host tests for frame decoding and
-   scaling. *This is what is implemented.*
-2. **The motion gate.** `max_rotation_rate` in `[accel_b_homing]`, fed by
-   a gyro client, skipped when the chip has no gyroscope.
-3. **`B_GYRO_CALIBRATE`.** Integrate rate across a commanded move; report
-   sense and scale. Settles the rotation-sense question in
-   [Accel_B_Homing.md](Accel_B_Homing.md).
-4. **Z tap phase 0.** Capture contact signatures on both channels, at
+1. **Sensor layer.** Combined accel+gyro FIFO, all three streams
+   exposed to the host (accelerometer, gyroscope, and the combined one
+   fusion reads), configurable range and rate, pseudovector-correct
+   `axes_map`, FOC commands, the `trigger_analog` attach point.
+   *Implemented.*
+2. **The fused measurement and the motion gate.** The complementary
+   filter, the derived gyroscope axis and sign, `max_rotation_rate` and
+   `max_fusion_disagreement` in `[accel_b_homing]`. All skipped when the
+   chip has no gyroscope. *Implemented.*
+3. **`B_GYRO_CALIBRATE`.** Integrate rate across a commanded move;
+   report sense and scale. Settles the rotation-sense question in
+   [Accel_B_Homing.md](Accel_B_Homing.md), and is the definitive check
+   on the gyroscope's sign.
+4. **Commissioning `fusion_tau` and `settle_time`.** Measure the head's
+   ringing, pick `tau`, and find how far `settle_time` can come down.
+   This is the phase that actually collects the benefit of phase 2.
+5. **Z tap phase 0.** Capture contact signatures on both channels, at
    several speeds, with the machine also captured moving in air. The
    deliverable is the contact-to-background ratio, the band that
    maximises it, and a verdict on whether 1600 Hz is enough.
-5. **`[accel_z_tap]`.** The detector, the endstop, the probe session.
-6. **Complementary filtering.** Job 4 - measure B without waiting for the
-   head to settle.
+6. **`[accel_z_tap]`.** The detector, the endstop, the probe session.
 
 ## Testing
 
@@ -367,13 +489,24 @@ anything needing a live printer is a machine test, not a CI test.)
 
 What the host tests cover honestly: frame decoding, the scale factors
 against the datasheet's sensitivity tables, `axes_map` application to
-both streams at once, register-value construction for each range and
-rate, and the block-arithmetic invariant that
-`MAX_BULK_MSG_SIZE // frame_size` frames fit in `BYTES_PER_BLOCK`.
+both streams at once and the determinant correction on the gyroscope,
+register-value construction for each range and rate, and the
+block-arithmetic invariant that `MAX_BULK_MSG_SIZE // frame_size` frames
+fit in `BYTES_PER_BLOCK`.
+
+For the fusion: the filter's behaviour against synthetic streams - that
+it holds a steady angle, converges from a bad seed, follows the
+gyroscope over short timescales and the accelerometer over long ones,
+tracks a consistent ramp without lag, and crosses the +/-180 wrap
+correctly. And the sign convention, checked by rotating a synthetic head
+about its own B axis and confirming that the derived coefficient
+recovers the true rate for **all twenty-four** axis-aligned mountings -
+which is the cheapest possible insurance against the one number nobody
+can eyeball.
 
 What they cannot cover: whether the chip is wired correctly, the real
-noise floor, the real zero-rate offset, and every threshold number in the
-config. Those are machine measurements.
+noise floor, the real zero-rate offset, the right `fusion_tau`, and every
+threshold number in the config. Those are machine measurements.
 
 ## Open questions
 
@@ -393,3 +526,15 @@ config. Those are machine measurements.
 * Is the BMI160's 16-bit accelerometer at 1600 Hz actually better than
   the ADXL345's 13-bit at 3200 Hz for `[resonance_tester]`? Worth one
   side-by-side `SHAPER_CALIBRATE` rather than an assumption.
+* What is the head's actual ringing frequency and decay, and therefore
+  what should `fusion_tau` be? The default of 0.2 s assumes the
+  interesting motion is faster than about 5 Hz, which is a guess.
+  Phase 4.
+* How far can `settle_time` come down before the fused and
+  accelerometer-only angles part company? That difference is the
+  measurement, and `B_MEASURE` already prints it.
+* Does the gyroscope's zero-rate offset drift enough over a print for a
+  fixed `tau` to matter? A complementary filter passes offset straight
+  through at `rate * tau`, so 0.1 deg/s of residual offset is 0.02
+  degrees of bias at the default `tau` - small, but it scales with
+  `tau` and is worth knowing before raising it.
