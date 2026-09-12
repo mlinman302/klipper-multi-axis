@@ -84,7 +84,12 @@ class CoreRThetaKinematics:
         stepper_bed = stepper.PrinterStepper(config.getsection('stepper_c'),
                                              units_in_radians=True)
         rail_r = stepper.LookupMultiRail(config.getsection('stepper_r'))
-        rail_b = stepper.LookupMultiRail(config.getsection('stepper_tilt'))
+        # B's endstop is not guessed from where it sits in the range: with
+        # homing_positive_dir unset, G28 B measures the head against
+        # gravity and homes toward the endstop from there - see
+        # rotary_axis.BaseRotaryAxis.home() and [accel_b_homing]
+        rail_b = stepper.LookupMultiRail(config.getsection('stepper_tilt'),
+                                         infer_homing_dir=False)
         rail_z = stepper.LookupMultiRail(config.getsection('stepper_z'))
         # Either gantry motor moves both R and B, so each axis' endstop
         # has to watch both of them

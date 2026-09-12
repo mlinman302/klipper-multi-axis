@@ -84,6 +84,9 @@ class DummyRotaryAxis:
 class BaseRotaryAxis:
     def _register(self):
         self.commanded_pos = 0.
+        # Picks the homing direction when the rail has no
+        # homing_positive_dir - see set_homing_direction_source()
+        self.homing_direction_source = None
         gcode = self.printer.lookup_object('gcode')
         gcode.register_mux_command('SET_ROTARY_AXIS', 'AXIS',
                                    self.gcode_id, self.cmd_SET_ROTARY_AXIS,
@@ -166,6 +169,26 @@ class BaseRotaryAxis:
         pos[self.get_position_index()] = newpos
         toolhead.set_position(pos)
         self.commanded_pos = newpos
+    def set_homing_direction_source(self, source):
+        # A rail built with infer_homing_dir=False and no
+        # homing_positive_dir has no direction until it homes.  The
+        # source measures the axis before the home and returns
+        # (positive_dir, min_sweep); it checks the result afterwards with
+        # verify_home(position_endstop).  [accel_b_homing] is one.
+        self.homing_direction_source = source
+    def _homing_direction(self, hi):
+        if hi.positive_dir is not None:
+            return hi.positive_dir, 0., None
+        source = self.homing_direction_source
+        if source is None:
+            raise self.printer.command_error(
+                "Rotary axis %s has no homing_positive_dir and nothing to"
+                " measure which way its endstop is - configure"
+                " [accel_b_homing], or set homing_positive_dir in [%s]"
+                % (self.gcode_id, self.rail.get_name()))
+        positive_dir, min_sweep = source.choose_homing_direction(
+            hi.position_endstop, self.pos_min, self.pos_max)
+        return positive_dir, min_sweep, source
     def home(self):
         # The axis is part of the main kinematic space, so homing is an
         # ordinary toolhead homing move along this axis - no private drip
@@ -178,17 +201,31 @@ class BaseRotaryAxis:
         toolhead = self.printer.lookup_object('toolhead')
         pos_index = self.get_position_index()
         hi = self.rail.get_homing_info()
+        self.is_homed = False
+        positive_dir, min_sweep, source = self._homing_direction(hi)
         homepos = [None] * len(toolhead.get_position())
         homepos[pos_index] = hi.position_endstop
         forcepos = list(homepos)
-        if hi.positive_dir:
-            forcepos[pos_index] -= 1.5 * (hi.position_endstop - self.pos_min)
+        if positive_dir:
+            sweep = 1.5 * (hi.position_endstop - self.pos_min)
         else:
-            forcepos[pos_index] += 1.5 * (self.pos_max - hi.position_endstop)
-        self.is_homed = False
+            sweep = 1.5 * (self.pos_max - hi.position_endstop)
+        # A measured start can lie further from the endstop than the
+        # range side implies (an endstop at a range limit has no travel
+        # on that side at all), and the sweep must still reach it
+        sweep = max(sweep, min_sweep)
+        if positive_dir:
+            forcepos[pos_index] -= sweep
+        else:
+            forcepos[pos_index] += sweep
         homing_state = homing.Homing(self.printer)
         homing_state.set_axes([pos_index])
         homing_state.home_rails([self.rail], forcepos, homepos)
+        if source is not None:
+            # A sensorless home that triggered instantly, or a direction
+            # picked backwards, both leave the head somewhere other than
+            # the endstop - and would otherwise be reported as homed
+            source.verify_home(hi.position_endstop)
         self.is_homed = True
 
         ### move to vertical position after homing rotary axis

@@ -664,6 +664,10 @@ gear_ratio:
 # the endstop and position_min/position_max of the B axis, in degrees.
 # Its rotation_distance is in gantry travel, as for stepper_r, since a
 # gantry motor position is a mix of the B rotation and the arm radius.
+# Unlike every other rail, homing_positive_dir is not inferred from where
+# position_endstop sits in the range. Either set it, or leave it unset and
+# configure [accel_b_homing], which measures the head before G28 B and
+# homes toward the endstop from there.
 [stepper_tilt]
 
 # The stepper_z section is used to describe the leadscrew stepper
@@ -2853,7 +2857,17 @@ the head's own frame is the head's tilt - absolutely, with no reference
 to where the axis has travelled since it was homed.
 
 This is phase one of [Accel_B_Homing.md](Accel_B_Homing.md): it measures
-and reports. It does not yet home anything, and it moves nothing.
+and reports, and it moves nothing itself. It does steer the endstop home
+of a corertheta B axis: `[stepper_tilt]` has no inferred
+`homing_positive_dir`, so when that option is unset `G28 B` measures the
+head first and homes positive if it is below `position_endstop`, negative
+if above. Within `homing_tolerance` of the endstop the side cannot be
+told apart; an endstop at a range limit is then homed toward that limit,
+and one inside the range is refused. The head is measured again after
+the home, and B is left unhomed if it is not at the endstop - which
+catches a sensorless home that triggered before the head moved, and a
+`positive_vector` that disagrees with the motors about which way is +B.
+Setting `homing_positive_dir` in `[stepper_tilt]` bypasses all of this.
 
 Which way is "B = 0" is declared with two signed sensor axes, restricted
 to the six axis-aligned directions. An accelerometer at rest reads the
@@ -2999,6 +3013,17 @@ positive_vector:
 #check_tolerance: 5.0
 #   Default TOLERANCE (in degrees) for B_MEASURE CHECK=1. The default is
 #   5.0 - loose, for the reasons above.
+#homing_tolerance: 5.0
+#   Used when G28 B picks its own direction (see above), in degrees: the
+#   band around position_endstop inside which the head's side of the
+#   endstop is treated as unknown, the extra sweep beyond the measured
+#   distance to the endstop, and the error allowed by the check after
+#   the home. It must cover the sensor's uncalibrated error. The default
+#   is 5.0.
+#verify_home: True
+#   Whether to measure the head after G28 B and refuse the home if it is
+#   not within homing_tolerance of position_endstop. The default is
+#   True.
 ```
 
 `B_MEASURE [SETTLE=<s>] [SAMPLE_TIME=<s>] [FUSION=0|1] [CHECK=0|1]

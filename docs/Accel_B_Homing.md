@@ -22,7 +22,11 @@
 
 **Status: phase one is implemented** - `[accel_b_homing]` and the
 `B_MEASURE` command (`klippy/extras/accel_b_homing.py`). Phases two to
-five below are still design.
+five below are still design. One piece of homing has landed ahead of
+them: with `homing_positive_dir` unset in `[stepper_tilt]`, `G28 B`
+measures the head to pick which way to sweep into the endstop, and
+measures it again afterwards to confirm it arrived (see `[accel_b_homing]`
+in Config_Reference.md).
 
 This document describes how an ADXL345 mounted on the tilting head can
 

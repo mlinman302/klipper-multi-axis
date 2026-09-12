@@ -36,6 +36,9 @@ class ConfigError(Exception):
 class FakeRotaryAxis:
     def __init__(self, gcode_id='B', is_homed=True):
         self.gcode_id, self.is_homed = gcode_id, is_homed
+        self.homing_direction_source = None
+    def set_homing_direction_source(self, source):
+        self.homing_direction_source = source
     def get_axis_gcode_id(self):
         return self.gcode_id
     def get_status(self, eventtime=None):
@@ -184,6 +187,9 @@ class FakeIMUClient(FakeAccelClient):
 class FakeGCode:
     def __init__(self):
         self.commands = {}
+        self.responses = []
+    def respond_info(self, msg):
+        self.responses.append(msg)
     def register_command(self, name, func, desc=None):
         self.commands[name] = func
 
@@ -819,6 +825,169 @@ class TestFusion(unittest.TestCase):
         self.assertIsNone(status['fusion_disagreement'])
         obj.measure()
         self.assertIsNotNone(obj.get_status()['fusion_disagreement'])
+
+
+######################################################################
+# Picking the B homing direction
+######################################################################
+
+class TestHomingDirection(unittest.TestCase):
+    def test_it_registers_with_the_b_axis(self):
+        obj = build()
+        b_axis = obj.printer.lookup_object('toolhead').b_axis
+        self.assertIs(b_axis.homing_direction_source, obj)
+    def test_below_the_endstop_homes_positive(self):
+        obj = build(chip=FakeIMUChip(angle=-20.))
+        positive, sweep = obj.choose_homing_direction(40., -90., 90.)
+        self.assertTrue(positive)
+        self.assertAlmostEqual(sweep, 60. + 5., places=3)
+        gcode = obj.printer.lookup_object('gcode')
+        self.assertIn("homing positive", gcode.responses[-1])
+    def test_above_the_endstop_homes_negative(self):
+        obj = build(chip=FakeIMUChip(angle=30.))
+        positive, sweep = obj.choose_homing_direction(-45., -90., 90.)
+        self.assertFalse(positive)
+        self.assertAlmostEqual(sweep, 75. + 5., places=3)
+    def test_a_negated_mounting_flips_the_direction(self):
+        # The same physical pose, declared with the opposite +B
+        obj = build({'positive_vector': '-x'}, chip=FakeIMUChip(angle=30.))
+        positive, _ = obj.choose_homing_direction(0., -90., 90.)
+        self.assertTrue(positive)
+    def test_near_a_mid_range_endstop_is_refused(self):
+        obj = build(chip=FakeIMUChip(angle=2.))
+        with self.assertRaises(ConfigError) as cm:
+            obj.choose_homing_direction(0., -90., 90.)
+        self.assertIn("cannot tell which side", str(cm.exception))
+    def test_near_an_endstop_at_a_range_limit_homes_toward_it(self):
+        obj = build(chip=FakeIMUChip(angle=-44.))
+        positive, _ = obj.choose_homing_direction(-45., -45., 100.)
+        self.assertFalse(positive)
+        obj = build(chip=FakeIMUChip(angle=98.))
+        positive, _ = obj.choose_homing_direction(100., -45., 100.)
+        self.assertTrue(positive)
+    def test_the_tolerance_is_configurable(self):
+        obj = build({'homing_tolerance': 1.}, chip=FakeIMUChip(angle=2.))
+        positive, sweep = obj.choose_homing_direction(0., -90., 90.)
+        self.assertFalse(positive)
+        self.assertAlmostEqual(sweep, 3., places=3)
+    def test_verify_passes_at_the_endstop(self):
+        obj = build(chip=FakeIMUChip(angle=-44.))
+        obj.verify_home(-45.)
+    def test_verify_fails_away_from_the_endstop(self):
+        # A sensorless home that triggered before the head moved
+        obj = build(chip=FakeIMUChip(angle=30.))
+        with self.assertRaises(ConfigError) as cm:
+            obj.verify_home(-45.)
+        self.assertIn("G4 P2000", str(cm.exception))
+    def test_verify_can_be_disabled(self):
+        obj = build({'verify_home': False}, chip=FakeIMUChip(angle=30.))
+        obj.verify_home(-45.)
+
+
+######################################################################
+# G28 B through the rotary axis
+######################################################################
+
+from kinematics import rotary_axis
+from extras import homing as homing_module
+
+class FakeHomingState:
+    calls = []
+    def __init__(self, printer):
+        pass
+    def set_axes(self, axes):
+        pass
+    def home_rails(self, rails, forcepos, homepos):
+        FakeHomingState.calls.append((forcepos, homepos))
+
+class FakeHomingInfo:
+    def __init__(self, position_endstop, positive_dir):
+        self.position_endstop = position_endstop
+        self.positive_dir = positive_dir
+
+class FakeRail:
+    def __init__(self, position_endstop, positive_dir):
+        self.hi = FakeHomingInfo(position_endstop, positive_dir)
+        self.homing_speed = 30.
+    def get_homing_info(self):
+        return self.hi
+    def get_name(self):
+        return 'stepper_tilt'
+
+class FakeHomingToolhead(FakeToolhead):
+    def move(self, pos, speed):
+        self.position = list(pos)
+
+class FakeSource:
+    def __init__(self, positive_dir, min_sweep, verify_error=None):
+        self.result = (positive_dir, min_sweep)
+        self.verify_error = verify_error
+        self.verified = []
+    def choose_homing_direction(self, position_endstop, pos_min, pos_max):
+        return self.result
+    def verify_home(self, position_endstop):
+        self.verified.append(position_endstop)
+        if self.verify_error:
+            raise ConfigError(self.verify_error)
+
+class TestRotaryAxisHome(unittest.TestCase):
+    def setUp(self):
+        FakeHomingState.calls = []
+        self.saved = homing_module.Homing
+        homing_module.Homing = FakeHomingState
+    def tearDown(self):
+        homing_module.Homing = self.saved
+    def _axis(self, position_endstop, positive_dir, source=None,
+              rng=(-90., 90.)):
+        printer = FakePrinter()
+        toolhead = FakeHomingToolhead()
+        printer.add_object('toolhead', toolhead)
+        ra = rotary_axis.BaseRotaryAxis()
+        ra.printer, ra.gcode_id = printer, 'B'
+        ra.rail = FakeRail(position_endstop, positive_dir)
+        ra.pos_min, ra.pos_max = rng
+        ra.can_home, ra.is_homed = True, False
+        ra.homing_direction_source = source
+        toolhead.extra_axes = [FakeExtruder(), None, ra]
+        return ra
+    def _forcepos(self, ra):
+        return FakeHomingState.calls[-1][0][ra.get_position_index()]
+    def test_a_configured_direction_needs_no_source(self):
+        ra = self._axis(-45., False)
+        ra.home()
+        self.assertAlmostEqual(self._forcepos(ra), -45. + 1.5 * 135.)
+        self.assertTrue(ra.is_homed)
+    def test_no_direction_and_no_source_is_an_error(self):
+        ra = self._axis(0., None)
+        with self.assertRaises(ConfigError) as cm:
+            ra.home()
+        self.assertIn("[accel_b_homing]", str(cm.exception))
+        self.assertIn("[stepper_tilt]", str(cm.exception))
+        self.assertFalse(ra.is_homed)
+    def test_the_source_picks_the_direction_and_verifies(self):
+        source = FakeSource(True, 10.)
+        ra = self._axis(0., None, source)
+        ra.home()
+        self.assertAlmostEqual(self._forcepos(ra), 0. - 1.5 * 90.)
+        homepos = FakeHomingState.calls[-1][1]
+        self.assertEqual(homepos[ra.get_position_index()], 0.)
+        self.assertEqual(source.verified, [0.])
+        self.assertTrue(ra.is_homed)
+    def test_the_sweep_reaches_a_measured_start(self):
+        # An endstop at a range limit has no travel on that side, so only
+        # the measured distance keeps a sweep toward it from being empty
+        ra = self._axis(-45., None, FakeSource(True, 12.), rng=(-45., 100.))
+        ra.home()
+        self.assertAlmostEqual(self._forcepos(ra), -45. - 12.)
+        ra = self._axis(-45., None, FakeSource(False, 12.), rng=(-45., 100.))
+        ra.home()
+        self.assertAlmostEqual(self._forcepos(ra), -45. + 1.5 * 145.)
+    def test_a_failed_verification_leaves_b_unhomed(self):
+        source = FakeSource(True, 10., verify_error="not at the endstop")
+        ra = self._axis(0., None, source)
+        with self.assertRaises(ConfigError):
+            ra.home()
+        self.assertFalse(ra.is_homed)
 
 
 if __name__ == '__main__':

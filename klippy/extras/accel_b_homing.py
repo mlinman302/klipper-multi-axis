@@ -12,7 +12,8 @@
 #
 # This module is phase one of docs/Accel_B_Homing.md: the measurement
 # primitive and the B_MEASURE command that reports it.  Nothing here
-# moves the machine, and nothing here homes anything yet.
+# moves the machine.  It does steer the endstop home: see "WHICH WAY TO
+# HOME" below.
 #
 # THE ZERO REFERENCE
 #
@@ -97,6 +98,20 @@
 # Both are skipped for chips with no gyroscope, so an [adxl345] keeps
 # working exactly as before.  See docs/BMI160_IMU.md.
 #
+# WHICH WAY TO HOME
+#
+# The corertheta B rail does not guess its homing direction from where
+# position_endstop sits in the range (see stepper.py's infer_homing_dir).
+# With homing_positive_dir unset, G28 B asks this module instead: the
+# head is measured where it rests, and homes positive if that is below
+# position_endstop, negative if above.  Within homing_tolerance of the
+# endstop the measurement cannot tell the sides apart, so an endstop at
+# a range limit is homed toward that limit and one inside the range is
+# refused.  After the home the head is measured again, and a head that
+# is not at the endstop - a sensorless home that triggered instantly, or
+# a positive_vector that disagrees with the motors about which way is
+# +B - leaves B unhomed.
+#
 # WHAT THIS PHASE DOES NOT DO
 #
 # The reading is uncorrected.  An ADXL345 has a zero-g offset of up to
@@ -107,7 +122,7 @@
 # accuracy: a stationary head re-measures to a few hundredths of a
 # degree, which is why the noise gates below are tight even though the
 # absolute tolerances are loose.
-import collections, math
+import collections, logging, math
 import stepper
 
 # 1 g in the units the accelerometer chips report (mm/s^2).  Matches
@@ -340,6 +355,13 @@ class AccelBHoming:
         # the header comment.
         self.check_tolerance = config.getfloat('check_tolerance', 5.,
                                                above=0.)
+        # Picking the B homing direction.  The tolerance is the band
+        # around position_endstop inside which the uncalibrated reading
+        # cannot say which side the head is on, the extra sweep past the
+        # measured distance, and the allowed error of the post-home check.
+        self.homing_tolerance = config.getfloat('homing_tolerance', 5.,
+                                                above=0.)
+        self.verify_home_enabled = config.getboolean('verify_home', True)
         self.chip = self.toolhead = self.b_axis = None
         self.has_gyro = False
         self.b_projection = None
@@ -383,6 +405,9 @@ class AccelBHoming:
             raise self.printer.config_error(
                 "[%s] the printer has no B axis - add 'b' to the"
                 " 'additional_axes' option of [printer]" % (self.name,))
+        set_source = getattr(self.b_axis, 'set_homing_direction_source', None)
+        if set_source is not None:
+            set_source(self)
 
     ######################################################################
     # The measurement primitive
@@ -552,6 +577,53 @@ class AccelBHoming:
             rotation_rate=rotation_rate)
         self.last_reading = reading
         return reading
+
+    ######################################################################
+    # Homing direction (called by rotary_axis.BaseRotaryAxis.home)
+    ######################################################################
+    def _respond(self, msg):
+        logging.info(msg)
+        self.printer.lookup_object('gcode').respond_info(msg)
+    def choose_homing_direction(self, position_endstop, position_min,
+                                position_max):
+        reading = self.measure()
+        angle, tol = reading.angle, self.homing_tolerance
+        distance = position_endstop - angle
+        if abs(distance) > tol:
+            positive_dir = distance > 0.
+        elif position_endstop >= position_max:
+            positive_dir = True
+        elif position_endstop <= position_min:
+            positive_dir = False
+        else:
+            raise self.printer.command_error(
+                "%s: the head measures B = %.2f deg, within %.2f of the"
+                " endstop at %.2f, so it cannot tell which side of the"
+                " endstop it is on.  Turn the head away from the endstop"
+                " by hand (M84 first) and home again, or set"
+                " homing_positive_dir in [stepper_tilt]"
+                % (self.name, angle, tol, position_endstop))
+        self._respond("%s: head at B = %.2f deg, homing %s toward the"
+                      " endstop at %.2f"
+                      % (self.name, angle,
+                         "positive" if positive_dir else "negative",
+                         position_endstop))
+        return positive_dir, abs(distance) + tol
+    def verify_home(self, position_endstop):
+        if not self.verify_home_enabled:
+            return
+        reading = self.measure()
+        error = wrap180(reading.angle - position_endstop)
+        if abs(error) > self.homing_tolerance:
+            raise self.printer.command_error(
+                "%s: B homed, but the head measures %.2f deg where the"
+                " endstop is at %.2f (error %+.2f, tolerance %.2f).  Either"
+                " the home triggered before the head moved (a sensorless"
+                " endstop needs G4 P2000 before G28 B), or positive_vector"
+                " and the motors disagree about which way is +B - check"
+                " positive_vector, then invert_b_direction in [printer]"
+                % (self.name, reading.angle, position_endstop, error,
+                   self.homing_tolerance))
 
     ######################################################################
     # Comparison against the commanded angle

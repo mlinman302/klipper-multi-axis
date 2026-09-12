@@ -351,7 +351,8 @@ def parse_step_distance(config, units_in_radians=None, note_valid=False):
 # endstops.
 class GenericPrinterRail:
     def __init__(self, config, need_position_minmax=True,
-                 default_position_endstop=None, units_in_radians=False):
+                 default_position_endstop=None, units_in_radians=False,
+                 infer_homing_dir=True):
         self.stepper_units_in_radians = units_in_radians
         self.printer = config.get_printer()
         self.name = config.get_name()
@@ -392,6 +393,12 @@ class GenericPrinterRail:
             'homing_retract_dist', 5., minval=0.)
         self.homing_positive_dir = config.getboolean(
             'homing_positive_dir', None)
+        if self.homing_positive_dir is None and not infer_homing_dir:
+            # No guess from where position_endstop sits in the range: the
+            # owner of this rail picks the direction each time it homes
+            # (the corertheta B axis asks its IMU), and get_homing_info()
+            # reports positive_dir as None until then
+            return
         if self.homing_positive_dir is None:
             axis_len = self.position_max - self.position_min
             if self.position_endstop <= self.position_min + axis_len / 4.:
@@ -481,17 +488,21 @@ class GenericPrinterRail:
             stepper.set_position(coord)
 
 def LookupRail(config, need_position_minmax=True,
-               default_position_endstop=None, units_in_radians=False):
+               default_position_endstop=None, units_in_radians=False,
+               infer_homing_dir=True):
     rail = GenericPrinterRail(config, need_position_minmax,
-                              default_position_endstop, units_in_radians)
+                              default_position_endstop, units_in_radians,
+                              infer_homing_dir)
     rail.add_stepper_from_config(config)
     return rail
 
 # Wrapper for dual stepper motor support
 def LookupMultiRail(config, need_position_minmax=True,
-                    default_position_endstop=None, units_in_radians=False):
+                    default_position_endstop=None, units_in_radians=False,
+                    infer_homing_dir=True):
     rail = LookupRail(config, need_position_minmax,
-                      default_position_endstop, units_in_radians)
+                      default_position_endstop, units_in_radians,
+                      infer_homing_dir)
     for i in range(1, 99):
         if not config.has_section(config.get_name() + str(i)):
             break
