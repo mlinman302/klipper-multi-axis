@@ -48,6 +48,17 @@
 # check: it should barely change as B turns, and the in-plane radius
 # hypot(u, w) should stay at 1 g.
 #
+# THE MOTION GATE
+#
+# An accelerometer cannot tell a tilted head from an accelerating one,
+# so a measurement is only a tilt if the head was actually at rest.  The
+# accelerometer's own evidence for that is indirect - a small per-sample
+# deviation - and a head rocking slowly on its belts barely moves that
+# statistic.  When the chip is an IMU (a [bmi160]), the gyroscope
+# answers the question directly: a head at rest reads zero rate.  The
+# gate is skipped for chips with no gyroscope, so an [adxl345] keeps
+# working exactly as before.  See docs/BMI160_IMU.md.
+#
 # WHAT THIS PHASE DOES NOT DO
 #
 # The reading is uncorrected.  An ADXL345 has a zero-g offset of up to
@@ -90,7 +101,7 @@ VALID_AXES = "+x, -x, +y, -y, +z or -z"
 
 TiltReading = collections.namedtuple('TiltReading', (
     'angle', 'vector', 'deviation', 'magnitude', 'u', 'w', 'out_of_plane',
-    'count'))
+    'count', 'rotation_rate'))
 
 
 ######################################################################
@@ -153,7 +164,7 @@ class AccelBHoming:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.name = config.get_name()
-        self.chip_name = config.get('accel_chip', 'adxl345')
+        self.chip_name = config.get('accel_chip', 'bmi160')
         self.zero_axis = self._get_axis(config, 'zero_vector')
         self.positive_axis = self._get_axis(config, 'positive_vector')
         if self.zero_axis[0] == self.positive_axis[0]:
@@ -182,11 +193,19 @@ class AccelBHoming:
         # head or a misconfigured chip, not to grade the sensor.
         self.max_magnitude_error = config.getfloat('max_magnitude_error',
                                                    1500., minval=0.)
+        # The gyroscope gate, when the chip has a gyroscope.  The
+        # default is provisional: it is meant to sit well above the
+        # sensor's own noise floor and well below any real motion, and
+        # the right value is whatever B_MEASURE reports on a parked head
+        # plus a margin.  Zero disables the gate.
+        self.max_rotation_rate = config.getfloat('max_rotation_rate', 1.,
+                                                 minval=0.)
         # Generous by default, because the reading is uncalibrated - see
         # the header comment.
         self.check_tolerance = config.getfloat('check_tolerance', 5.,
                                                above=0.)
         self.chip = self.toolhead = self.b_axis = None
+        self.has_gyro = False
         self.b_projection = None
         self.last_reading = None
         self.printer.register_event_handler("klippy:connect",
@@ -213,6 +232,10 @@ class AccelBHoming:
                 "[%s] '%s' is not an accelerometer"
                 % (self.name, self.chip_name))
         self.chip = chip
+        # An IMU offers a second stream of angular rate; a plain
+        # accelerometer does not, and the gate below is then skipped
+        self.has_gyro = (hasattr(chip, 'start_internal_gyro_client')
+                         and getattr(chip, 'has_gyro', lambda: True)())
         # The B axis is a rotary axis object, so its homed flag lives
         # there rather than in the toolhead's homed_axes
         for ea in self.toolhead.get_extra_axes():
@@ -234,11 +257,16 @@ class AccelBHoming:
         toolhead = self.toolhead
         toolhead.wait_moves()
         client = self.chip.start_internal_client()
+        gyro_client = None
+        if self.has_gyro and self.max_rotation_rate:
+            gyro_client = self.chip.start_internal_gyro_client()
         start_time = toolhead.get_last_move_time()
         # The averaging window is settle..settle+window; the extra margin
         # is only there to let the batches carrying it arrive
         toolhead.dwell(settle + window + self.batch_margin)
         client.finish_measurements()
+        if gyro_client is not None:
+            gyro_client.finish_measurements()
         # AccelQueryHelper trims to the request window but knows nothing
         # about the settle dwell, so drop that part here.  Samples are
         # (print_time, x, y, z); index rather than name the fields, so
@@ -273,12 +301,33 @@ class AccelBHoming:
                 "%s: measured %.0f mm/s^2 where gravity is %.0f - the head"
                 " is accelerating, or '%s' is not reporting correctly"
                 % (self.name, mag, FREEFALL_ACCEL, self.chip_name))
+        # The gyroscope gate.  This is a direct observation that the
+        # head was not turning, where everything above it is an
+        # inference from how steady the gravity vector looked.
+        rotation_rate = None
+        if gyro_client is not None:
+            rates = [magnitude((s[1], s[2], s[3]))
+                     for s in gyro_client.get_samples()
+                     if first <= s[0] <= last]
+            if not rates:
+                raise self.printer.command_error(
+                    "%s: no gyroscope samples in the measurement window -"
+                    " check that '%s' is responding (try BMI160_QUERY)"
+                    % (self.name, self.chip_name))
+            rotation_rate = sum(rates) / len(rates)
+            if rotation_rate > self.max_rotation_rate:
+                raise self.printer.command_error(
+                    "%s: the head was turning during the measurement"
+                    " (%.3f deg/s > %.3f) - increase settle_time, or raise"
+                    " max_rotation_rate if this is the sensor's noise floor"
+                    % (self.name, rotation_rate, self.max_rotation_rate))
         reading = TiltReading(
             angle=measure_angle(mean, self.zero_axis, self.positive_axis),
             vector=mean, deviation=dev, magnitude=mag,
             u=project(mean, self.positive_axis),
             w=project(mean, self.zero_axis),
-            out_of_plane=mean[self.oop_index], count=len(vectors))
+            out_of_plane=mean[self.oop_index], count=len(vectors),
+            rotation_rate=rotation_rate)
         self.last_reading = reading
         return reading
 
@@ -306,8 +355,11 @@ class AccelBHoming:
                'positive_vector': signed_axis_name(self.positive_axis),
                'rotation_axis': AXIS_NAMES[self.oop_index],
                'accel_chip': self.chip_name}
+        res['has_gyro'] = self.has_gyro
         reading = self.last_reading
         res['measured_b'] = None if reading is None else reading.angle
+        res['rotation_rate'] = (None if reading is None
+                                else reading.rotation_rate)
         return res
     cmd_B_MEASURE_help = "Measure the B axis angle against gravity"
     def cmd_B_MEASURE(self, gcmd):
@@ -328,6 +380,9 @@ class AccelBHoming:
                AXIS_NAMES[self.oop_index], reading.out_of_plane),
             "  sample deviation x/y/z = %.1f / %.1f / %.1f mm/s^2"
             % (dx, dy, dz)]
+        if reading.rotation_rate is not None:
+            lines.append("  rotation rate = %.4f deg/s (gate %.3f)"
+                         % (reading.rotation_rate, self.max_rotation_rate))
         check = gcmd.get_int('CHECK', 0, minval=0, maxval=1)
         if not self.is_b_homed():
             # Report the measurement either way - it is the useful part

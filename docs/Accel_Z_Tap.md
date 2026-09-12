@@ -1,5 +1,13 @@
 # Accelerometer Z homing: tapping the bed with the nozzle
 
+> **The sensor is now a BMI160 IMU**, not the ADXL345 this document
+> was written against. Three things change: Path A below is dead (see
+> [BMI160_IMU.md](BMI160_IMU.md), "The Z homing path"), the gyroscope
+> adds a second, gravity-free detection channel worth capturing in
+> phase 0, and the sample rate is 1600 Hz rather than 3200 Hz. The
+> `trigger_analog` plumbing of phase 1 is implemented in
+> `src/sensor_bmi160.c`. Path B, and everything else below, stands.
+
 **Status: design outline only.** Nothing in this document is
 implemented. It is the same kind of document
 [Accel_B_Homing.md](Accel_B_Homing.md) started as, and it assumes that

@@ -801,14 +801,19 @@ the touching.
   `axis_maximum` and the front-end status describe the rotational axes
   too.
 * **Gravity-referenced B homing and drive-ratio calibration**, using
-  an accelerometer on the tilting head - design outline in
+  an IMU on the tilting head - design outline in
   [Accel_B_Homing.md](Accel_B_Homing.md).  Homing B
   becomes a measurement rather than an endstop sweep, and
   `b_coupling_ratio` becomes measurable.
 * **Accelerometer Z homing by tapping the bed with the nozzle**, using
-  the same head-mounted accelerometer - design outline in
+  the same head-mounted IMU - design outline in
   [Accel_Z_Tap.md](Accel_Z_Tap.md).  Contact is detected on the
-  accelerometer board itself, so the nozzle becomes the Z datum and the
+  sensor board itself, so the nozzle becomes the Z datum and the
   probe's `z_offset` becomes measurable rather than assumed.
+* **The head IMU itself** - a BMI160 in place of the ADXL345, so the
+  head carries a gyroscope as well as an accelerometer.  Architecture
+  and phases in [BMI160_IMU.md](BMI160_IMU.md); the sensor layer is
+  implemented, and the gyroscope is what makes the two items above
+  measurements rather than inferences.
 * **Multi-rotation RTCP** (A and C as well as B), if a future head needs
   it — see "Scope" above.

@@ -116,6 +116,28 @@ class FakeAccelClient:
     def get_samples(self):
         return self.chip.samples_over(self.start, self.end)
 
+# A BMI160-shaped chip: the same accelerometer, plus a gyroscope stream
+# turning at whatever rate the test declares.  rate is in deg/s in the
+# sensor frame, so (0, 0, 0) is a head genuinely at rest.
+class FakeIMUChip(FakeAccelChip):
+    def __init__(self, rate=(0., 0., 0.), gyro_lag=0., **kwargs):
+        FakeAccelChip.__init__(self, **kwargs)
+        self.rate = rate
+        self.gyro_lag = gyro_lag
+    def has_gyro(self):
+        return True
+    def start_internal_gyro_client(self):
+        return FakeGyroClient(self)
+    def gyro_samples_over(self, start, end):
+        end -= self.delivery_lag + self.gyro_lag
+        total = int(round((end - start) * self.data_rate))
+        return [(start + (i + .5) / self.data_rate,) + tuple(self.rate)
+                for i in range(max(0, total))]
+
+class FakeGyroClient(FakeAccelClient):
+    def get_samples(self):
+        return self.chip.gyro_samples_over(self.start, self.end)
+
 class FakeGCode:
     def __init__(self):
         self.commands = {}
@@ -194,7 +216,7 @@ def build(config_values=None, chip=None, b_projection=None):
     printer.add_object('toolhead', toolhead)
     chip = chip if chip is not None else FakeAccelChip()
     chip.toolhead = toolhead
-    printer.add_object('adxl345', chip)
+    printer.add_object('bmi160', chip)
     if b_projection is not None:
         printer.add_object('b_projection', b_projection)
     values = dict(BASE_CONFIG)
@@ -283,7 +305,7 @@ class TestConfig(unittest.TestCase):
         printer = FakePrinter()
         toolhead = FakeToolhead()
         printer.add_object('toolhead', toolhead)
-        printer.add_object('adxl345', object())
+        printer.add_object('bmi160', object())
         abh.AccelBHoming(FakeConfig(printer, dict(BASE_CONFIG)))
         with self.assertRaises(ConfigError) as cm:
             printer.send_event("klippy:connect")
@@ -295,7 +317,7 @@ class TestConfig(unittest.TestCase):
         printer.add_object('toolhead', toolhead)
         chip = FakeAccelChip()
         chip.toolhead = toolhead
-        printer.add_object('adxl345', chip)
+        printer.add_object('bmi160', chip)
         abh.AccelBHoming(FakeConfig(printer, dict(BASE_CONFIG)))
         with self.assertRaises(ConfigError) as cm:
             printer.send_event("klippy:connect")
@@ -467,6 +489,60 @@ class TestCommand(unittest.TestCase):
         obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 60.
         out = self._run(obj, {'CHECK': 1, 'TOLERANCE': .5})
         self.assertIn("commanded B = 30.000 deg", out)
+
+
+######################################################################
+# The gyroscope motion gate
+######################################################################
+
+class TestMotionGate(unittest.TestCase):
+    def test_a_chip_without_a_gyroscope_skips_the_gate(self):
+        obj = build()
+        self.assertFalse(obj.has_gyro)
+        self.assertIsNone(obj.measure().rotation_rate)
+    def test_a_head_at_rest_passes_and_reports_its_rate(self):
+        obj = build(chip=FakeIMUChip(angle=12.))
+        self.assertTrue(obj.has_gyro)
+        reading = obj.measure()
+        self.assertAlmostEqual(reading.angle, 12., places=6)
+        self.assertAlmostEqual(reading.rotation_rate, 0.)
+    def test_a_turning_head_is_rejected(self):
+        obj = build(chip=FakeIMUChip(rate=(0., 4., 0.)))
+        with self.assertRaises(ConfigError) as cm:
+            obj.measure()
+        self.assertIn("turning during the measurement", str(cm.exception))
+    def test_the_gate_uses_the_magnitude_not_one_axis(self):
+        # 3-4-5: no single axis exceeds the default 1 deg/s gate by much,
+        # but the head is turning at 5 deg/s
+        obj = build(chip=FakeIMUChip(rate=(3., 4., 0.)))
+        with self.assertRaises(ConfigError) as cm:
+            obj.measure()
+        self.assertIn("5.000 deg/s", str(cm.exception))
+    def test_the_gate_can_be_raised(self):
+        obj = build({'max_rotation_rate': 10.},
+                    chip=FakeIMUChip(rate=(0., 4., 0.)))
+        self.assertAlmostEqual(obj.measure().rotation_rate, 4.)
+    def test_zero_disables_the_gate_entirely(self):
+        obj = build({'max_rotation_rate': 0.},
+                    chip=FakeIMUChip(rate=(0., 99., 0.)))
+        self.assertIsNone(obj.measure().rotation_rate)
+    def test_a_silent_gyroscope_is_reported(self):
+        # The accelerometer arrives but the gyroscope stream does not
+        obj = build(chip=FakeIMUChip(gyro_lag=5.))
+        with self.assertRaises(ConfigError) as cm:
+            obj.measure()
+        self.assertIn("no gyroscope samples", str(cm.exception))
+    def test_the_rate_reaches_get_status(self):
+        obj = build(chip=FakeIMUChip(rate=(0., .25, 0.)))
+        self.assertTrue(obj.get_status()['has_gyro'])
+        self.assertIsNone(obj.get_status()['rotation_rate'])
+        obj.measure()
+        self.assertAlmostEqual(obj.get_status()['rotation_rate'], .25)
+    def test_the_rate_is_reported_by_b_measure(self):
+        obj = build(chip=FakeIMUChip(rate=(0., .25, 0.)))
+        gcmd = FakeGCmd()
+        obj.cmd_B_MEASURE(gcmd)
+        self.assertIn("rotation rate = 0.2500 deg/s", gcmd.responses[0])
 
 
 if __name__ == '__main__':

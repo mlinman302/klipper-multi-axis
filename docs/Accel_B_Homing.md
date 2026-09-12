@@ -1,5 +1,16 @@
 # Gravity-referenced B axis: homing and step calibration
 
+> **The sensor is now a BMI160 IMU.** `[accel_b_homing]`'s
+> `accel_chip` defaults to `bmi160`, and its gyroscope supplies the
+> motion gate described under `max_rotation_rate` - a direct test that
+> the head was at rest, where this document's `max_sample_deviation` can
+> only infer it. Everything below about mounting, the zero reference and
+> the measurement itself is unchanged and chip-independent. What the
+> BMI160 does change is the accuracy argument below: its fast offset
+> compensation trims the zero-g offset in hardware to 3.9 mg, so a
+> large part of the phase two offset fit is done by the chip. See
+> [BMI160_IMU.md](BMI160_IMU.md).
+
 **Status: phase one is implemented** - `[accel_b_homing]` and the
 `B_MEASURE` command (`klippy/extras/accel_b_homing.py`). Phases two to
 five below are still design.

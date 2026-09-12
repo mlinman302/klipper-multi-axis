@@ -2009,7 +2009,18 @@ Support for LIS3DH accelerometers.
 
 ### [bmi160]
 
-BMI160 accelerometer. This sensor can be queried via I2C or SPI bus.
+BMI160 six-axis IMU - a three-axis accelerometer and a three-axis
+gyroscope in one package, on one bus, sharing one FIFO and one sample
+clock. It can be queried via I2C or SPI bus.
+
+Wherever an accelerometer is named by section name - `[resonance_tester]`,
+`[accel_b_homing]` - this section works in place of `[adxl345]`. The
+gyroscope is additional: it is what lets `[accel_b_homing]` confirm the
+head was actually at rest rather than infer it, and it is a second,
+gravity-free channel for tap detection. See
+[BMI160_IMU.md](BMI160_IMU.md) for the architecture and for what the
+gyroscope is for.
+
 ```
 [bmi160]
 #i2c_address:
@@ -2029,8 +2040,52 @@ BMI160 accelerometer. This sensor can be queried via I2C or SPI bus.
 #   See the "common SPI settings" section for a description of the
 #   above parameters. Only used for SPI.
 #axes_map: x, y, z
-#   See the "adxl345" section for information on this parameter.
+#   See the "adxl345" section for information on this parameter. One
+#   physical chip means one map, and it is applied to the gyroscope and
+#   the accelerometer alike.
+#gyro: True
+#   Whether to put the gyroscope in the FIFO alongside the
+#   accelerometer. With it enabled a FIFO frame is twelve bytes rather
+#   than six, which halves the number of samples per bulk message but
+#   costs nothing in sample rate. Turn it off only to save bus
+#   bandwidth on a machine that wants the accelerometer alone. The
+#   default is True.
+#rate: 1600
+#   Output data rate in Hz - one of 100, 200, 400, 800 or 1600. Both
+#   sensors run at this rate: the accelerometer is not permitted above
+#   1600 Hz, and the headerless FIFO mode this driver uses requires
+#   every enabled sensor to share a rate. The default is 1600.
+#accel_range: 2
+#   Accelerometer full scale in g - one of 2, 4, 8 or 16. The chip is
+#   16 bit at every range, so this is a straight resolution-for-
+#   headroom trade: 2 g resolves 0.061 mg per count, 16 g resolves
+#   0.49 mg. Tilt measurement wants 2; resonance testing and tap
+#   detection want the headroom of 16. The default is 2.
+#gyro_range: 250
+#   Gyroscope full scale in deg/s - one of 125, 250, 500, 1000 or 2000.
+#   The default is 250, which resolves 7.6 m deg/s per count and is far
+#   more range than a tilting head ever uses.
+#tap_channel: accel_z
+#   Which single channel the mcu-side tap detector watches, as
+#   accel_x/y/z or gyro_x/y/z. This selects a byte offset within the
+#   FIFO frame, so it is fixed at config time. Nothing reads it yet -
+#   it is the seam the Z tap module of Accel_Z_Tap.md plugs into. The
+#   default is accel_z.
 ```
+
+`BMI160_QUERY [CHIP=<name>]` reports the current acceleration and
+rotation rate. Use it, rather than `ACCELEROMETER_QUERY`, when deriving
+`axes_map` or `[accel_b_homing]`'s vectors: it shows both sensors.
+
+`BMI160_CALIBRATE [CHIP=<name>] [GYRO=0|1] [X=<g>] [Y=<g>] [Z=<g>]` runs
+the chip's own fast offset compensation. `GYRO=1` (the default) needs
+nothing but a stationary chip, because the gyroscope's target is always
+zero rate. Calibrating the accelerometer needs a known pose instead:
+`X`/`Y`/`Z` declare what each axis should be reading, so exactly one of
+them is +1 or -1 (the axis pointing up or down) and the other two are 0.
+Both results live in the chip's volatile offset registers and are lost on
+power cycle - this driver never programs the NVM behind them, which
+tolerates only 14 write cycles.
 
 **Important:** Many BMI160 modules use ambiguous pin labels. For SPI:
 - Use **SCL** for clock (not SCX)
@@ -2790,24 +2845,29 @@ This section never touches a bus, a pin or an MCU: it looks the chip up
 by name and reads it through the same interface `[resonance_tester]`
 uses. A USB accelerometer board, a CAN toolhead and a chip wired straight
 to the mainboard's SPI are therefore all configured the ordinary way, in
-the chip's own section, and `[lis2dw]`, `[mpu9250]` and `[lis3dh]` work
-in place of `[adxl345]`. The chip may be shared with
-`[resonance_tester]`; this section does not require any particular
-`axes_map`.
+the chip's own section, and `[adxl345]`, `[lis2dw]`, `[mpu9250]` and
+`[lis3dh]` work in place of the default `[bmi160]`. The chip may be
+shared with `[resonance_tester]`; this section does not require any
+particular `axes_map`.
 
-A USB accelerometer board - the Fly-ADXL345-USB, for example - carries
-its own microcontroller running Klipper firmware, so it is configured as
-a secondary MCU and its pins are addressed through that MCU's name:
+With a `[bmi160]` the gyroscope also gates the measurement: a head at
+rest reads zero rotation rate, so `max_rotation_rate` below tests
+directly for the thing `max_sample_deviation` can only infer. Chips
+without a gyroscope skip the gate and behave exactly as before.
+
+A USB sensor board carries its own microcontroller running Klipper
+firmware, so it is configured as a secondary MCU and its pins are
+addressed through that MCU's name:
 
 ```
-[mcu adxl]
+[mcu imu]
 serial: /dev/serial/by-id/usb-Klipper_rp2040_XXXXXXXXXXXX-if00
 
-[adxl345]
-cs_pin: adxl:gpio9
-spi_software_sclk_pin: adxl:gpio10
-spi_software_mosi_pin: adxl:gpio11
-spi_software_miso_pin: adxl:gpio12
+[bmi160]
+cs_pin: imu:gpio9
+spi_software_sclk_pin: imu:gpio10
+spi_software_mosi_pin: imu:gpio11
+spi_software_miso_pin: imu:gpio12
 
 [accel_b_homing]
 zero_vector: +z
@@ -2824,8 +2884,11 @@ positive_vector:
 #   direction the sensor's "up" swings toward as B increases. It must
 #   name a different axis than zero_vector. This parameter must be
 #   provided.
-#accel_chip: adxl345
-#   The accelerometer to read. The default is "adxl345".
+#accel_chip: bmi160
+#   The accelerometer to read. The default is "bmi160" - a
+#   configuration still using an ADXL345 must name it explicitly.
+#   Any chip Klipper can stream works here; an IMU additionally
+#   enables the rotation gate below.
 #settle_time: 0.250
 #   How long (in seconds) to dwell after any motion before sampling
 #   starts. The head hangs on belts and rings after a move, so this is
@@ -2853,6 +2916,16 @@ positive_vector:
 #   deliberately loose, because a chip inside its +/-10 % sensitivity
 #   spec legitimately reads 0.9 to 1.1 g and nothing corrects for that
 #   yet. Set to 0 to disable the check. The default is 1500.
+#max_rotation_rate: 1.0
+#   Largest average rotation rate (in deg/s) accepted before the
+#   measurement is rejected as "the head was turning". This is a direct
+#   observation where max_sample_deviation above is an inference, and it
+#   needs a chip with a gyroscope - with an [adxl345] there is no such
+#   stream and the check is silently skipped. The default of 1.0 is
+#   provisional: it is meant to sit well above the sensor's noise floor
+#   and well below any real motion, and the right value is whatever
+#   B_MEASURE reports on a parked head plus a margin. Set to 0 to
+#   disable the check. See BMI160_IMU.md.
 #check_tolerance: 5.0
 #   Default TOLERANCE (in degrees) for B_MEASURE CHECK=1. The default is
 #   5.0 - loose, for the reasons above.

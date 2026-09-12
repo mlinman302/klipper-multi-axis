@@ -1,6 +1,7 @@
-// Support for gathering acceleration data from BMI160 chip
+// Support for gathering data from a BMI160 accelerometer/gyroscope
 //
 // Copyright (C) 2025  Francisco Stephens <francisco.stephens.g@gmail.com>
+// Copyright (C) 2026  Klipper multi-axis contributors
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 #include <string.h> // memcpy
@@ -14,13 +15,19 @@
 #include "sensor_bulk.h" // sensor_bulk_report
 #include "spicmds.h" // spidev_transfer
 #include "i2ccmds.h" // i2cdev_s
+#include "trigger_analog.h" // trigger_analog_update
 
 #define BMI_AR_DATAX0 0x12
 #define BMI_AM_READ   0x80
 #define BMI_FIFO_STATUS 0x22
 #define BMI_FIFO_DATA 0x24
 
-#define BYTES_PER_SAMPLE 6
+// A headerless fifo frame is six bytes with only the accelerometer
+// enabled, and twelve with the gyroscope enabled as well (gyro first -
+// the fifo stores sensor data in data-register order).  Klipper's
+// FixedFreqReader timestamps by counting, so every bulk message must
+// carry exactly MAX_BULK_MSG_SIZE (51) / frame_size whole frames:
+// 51/6 = 8 frames and 51/12 = 4 frames, both of which are 48 bytes.
 #define BYTES_PER_BLOCK 48
 
 struct bmi160 {
@@ -30,8 +37,11 @@ struct bmi160 {
         struct spidev_s *spi;
         struct i2cdev_s *i2c;
     };
+    struct trigger_analog *ta;
     uint8_t bus_type;
     uint8_t flags;
+    uint8_t bytes_per_frame;
+    uint8_t frame_offset;
     uint16_t fifo_bytes_pending;
     struct sensor_bulk sb;
 };
@@ -65,6 +75,9 @@ command_config_bmi160(uint32_t *args)
     struct bmi160 *ax = oid_alloc(args[0], command_config_bmi160
                                    , sizeof(*ax));
     ax->timer.func = bmi160_event;
+    if (args[3] == 0 || BYTES_PER_BLOCK % args[3])
+        shutdown("bytes_per_frame must divide the bulk block size");
+    ax->bytes_per_frame = args[3];
 
     switch (args[2]) {
         case SPI_SERIAL:
@@ -88,7 +101,23 @@ command_config_bmi160(uint32_t *args)
     }
 }
 DECL_COMMAND(command_config_bmi160, "config_bmi160 oid=%c"
-                " bus_oid=%c bus_oid_type=%c");
+                " bus_oid=%c bus_oid_type=%c bytes_per_frame=%c");
+
+// Attach an mcu-side threshold detector to one channel of each frame.
+// frame_offset is the byte offset of the 16-bit channel to watch, so it
+// selects both the sensor and the axis - see docs/BMI160_IMU.md.
+void
+command_bmi160_attach_trigger_analog(uint32_t *args)
+{
+    struct bmi160 *ax = oid_lookup(args[0], command_config_bmi160);
+    if (args[2] + 2 > ax->bytes_per_frame)
+        shutdown("frame_offset outside of bmi160 frame");
+    ax->frame_offset = args[2];
+    ax->ta = trigger_analog_oid_lookup(args[1]);
+}
+DECL_COMMAND(command_bmi160_attach_trigger_analog,
+             "bmi160_attach_trigger_analog oid=%c trigger_analog_oid=%c"
+             " frame_offset=%c");
 
 // Helper code to reschedule the bmi160_event() timer
 static void
@@ -152,6 +181,19 @@ read_fifo_block_i2c(struct bmi160 *ax)
     i2c_shutdown_on_err(ret);
 }
 
+// Feed the watched channel of every frame in the block to the detector
+static void
+update_trigger(struct bmi160 *ax)
+{
+    uint8_t bytes_per_frame = ax->bytes_per_frame;
+    uint8_t *data = ax->sb.data;
+    uint8_t i;
+    for (i = ax->frame_offset; i < BYTES_PER_BLOCK; i += bytes_per_frame) {
+        int16_t value = (int16_t)((data[i + 1] << 8) | data[i]);
+        trigger_analog_update(ax->ta, value);
+    }
+}
+
 // Read from fifo and transmit data to host
 static void
 read_fifo_block(struct bmi160 *ax, uint8_t oid)
@@ -160,6 +202,10 @@ read_fifo_block(struct bmi160 *ax, uint8_t oid)
         read_fifo_block_spi(ax);
     else if (CONFIG_WANT_I2C && ax->bus_type == I2C_SERIAL)
         read_fifo_block_i2c(ax);
+    // Detect before reporting - the host transfer is not in the path of
+    // a homing decision
+    if (ax->ta)
+        update_trigger(ax);
     ax->sb.data_count = BYTES_PER_BLOCK;
     sensor_bulk_report(&ax->sb, oid);
     ax->fifo_bytes_pending -= BYTES_PER_BLOCK;
