@@ -19,21 +19,24 @@
 > and chip-independent - and it now does more work, because which
 > gyroscope axis carries dB/dt, and with which sign, is *derived* from
 > `zero_vector` and `positive_vector` rather than separately configured.
-> The BMI160 also changes the accuracy argument below: its fast offset
-> compensation trims the zero-g offset in hardware to 3.9 mg, so a large
-> part of the phase two offset fit is done by the chip. See
-> [BMI160_IMU.md](BMI160_IMU.md).
+> The BMI160's fast offset compensation can trim the zero-g offset in
+> hardware to 3.9 mg, but only against a pose declared exact, and only
+> until power cycle - so the offsets are fitted in software instead, by
+> `B_SENSOR_CALIBRATE`. See [BMI160_IMU.md](BMI160_IMU.md).
 
-**Status: phases one and four are implemented** - `[accel_b_homing]`,
-the `B_MEASURE` command, and homing (`klippy/extras/accel_b_homing.py`).
+**Status: phases one, two (sensor calibration) and four are
+implemented** - `[accel_b_homing]`, the `B_MEASURE` and
+`B_SENSOR_CALIBRATE` commands, and homing
+(`klippy/extras/accel_b_homing.py`).
 **B has no endstop by default.** `G28 B` measures the head, books the
 measurement as B and turns it to B = 0, measuring and correcting until
 it is there; `[stepper_tilt]`'s `position_min` and `position_max` are soft
 limits that keep the filament tube from kinking, not physical stops. See
 [Algorithm: homing](#algorithm-homing) and `[accel_b_homing]` in
-Config_Reference.md. Phases two, three and five are still design, so the
-zero the head homes to is the sensor's uncalibrated one (after
-`BMI160_CALIBRATE`, a hardware-trimmed one). A `[stepper_tilt]` that does
+Config_Reference.md. Phase two's offset and gain fit is implemented, so
+after `B_SENSOR_CALIBRATE` the head homes to gravity's vertical; its
+`B_SET_ZERO` (a fine zero against a physical reference) and phases three
+and five are still design. A `[stepper_tilt]` that does
 have an `endstop_pin` still sweeps into it, with the measurement picking
 the direction and confirming the result.
 
@@ -315,12 +318,13 @@ Phase four, as implemented:
 Only the two vectors are required. The two gates are in mm/s^2, the units
 the chips report, and both are disabled by setting them to zero.
 
-`max_magnitude_error` defaults deliberately loose. With no gain
-calibration yet, a chip inside its +/-10 % sensitivity spec legitimately
-reads 0.9 to 1.1 g; the gate is there to catch a head that is
-accelerating or a chip that is not reporting properly, not to grade the
-sensor. `check_tolerance` is loose for the same reason - see *What phase
-one does not do* below.
+`max_magnitude_error` defaults deliberately loose. The sensor
+calibration matches the two in-plane axes to each other, not to 1 g, so a
+chip inside its +/-10 % sensitivity spec still legitimately reads 0.9 to
+1.1 g; the gate is there to catch a head that is accelerating or a chip
+that is not reporting properly, not to grade the sensor.
+`check_tolerance` is loose because it must also cover an uncalibrated
+sensor - see *Accuracy before and after calibration* below.
 
 There is no `home_method` option. Which home runs follows from the rail:
 no `endstop_pin` in `[stepper_tilt]` (the default) is the measured home,
@@ -328,14 +332,19 @@ and an `endstop_pin` is the endstop sweep. The `endstop_then_accel` mode
 the design once proposed is what an endstop rail with `verify_home`
 already does.
 
-Phases two, three and five add:
+Phase two, as implemented so far:
 
 ```ini
 # --- sensor calibration (written by B_SENSOR_CALIBRATE / SAVE_CONFIG) ---
+#offset_u: 0.0                # zero-g offset along positive_vector, mm/s^2
+#offset_w: 0.0                # zero-g offset along zero_vector, mm/s^2
+#gain_ratio: 1.0              # amplitude(w) / amplitude(u), 0.8 to 1.25
+```
+
+Phases two, three and five still add:
+
+```ini
 zero_offset: 0.0              # deg; fine offset on top of zero_vector
-offset_u: 0.0                 # zero-g offset, mm/s^2
-offset_w: 0.0
-gain_ratio: 1.0               # amplitude(w) / amplitude(u)
 level_offset: 0.0             # frame tilt vs gravity, deg (usually 0)
 
 # --- safety ---
@@ -348,13 +357,17 @@ calibration routines, written back through `configfile.set()` and
 `zero_vector` and `positive_vector` are not: they are the coarse frame
 the fitted numbers sit on top of, and they stay hand-declared.
 
-### What phase one does not do
+### Accuracy before and after calibration
 
-The reading is **uncorrected**. An ADXL345 has a zero-g offset of up to
-+/-150 mg and an inter-axis gain tolerance of about +/-10 %, which
-together are worth several degrees of absolute error. Until the offset
-and gain fit of phase two lands, treat `B_MEASURE` as a diagnostic, not
-as a calibrated angle.
+Uncalibrated, the reading is **uncorrected**. An accelerometer has a
+zero-g offset of up to +/-150 mg and an inter-axis gain tolerance of
+several percent, which together are worth several degrees of absolute
+error. On the corertheta machine the first `G28 B` homed the head about
+7 degrees from a known vertical, and a ~100 mg offset along
+`positive_vector` accounted for most of it. `B_SENSOR_CALIBRATE` removes
+that; what it cannot remove is a sensor rotated on its mount, or a frame
+that is not level, since neither changes the shape of the circle it
+fits.
 
 Repeatability is a different matter, and is already good: a stationary
 head re-measures to a few hundredths of a degree. That is why the noise
@@ -370,7 +383,7 @@ silently did not move is tens of degrees out, not tenths.
 | `B_MEASURE CHECK=1 [TOLERANCE=]` | *(implemented)* As above, but raise an error if the fused angle and commanded B disagree. Refuses `FUSION=0` and a chip without a gyroscope. For `PRINT_START` and layer macros - it catches belt slip and a silently failed home. Requires B homed, since an unhomed B has no commanded angle to compare against. |
 | `G28 B` | *(implemented)* Measure B, set it, and turn the head to B = 0 - see [Algorithm: homing](#algorithm-homing). |
 | `B_SET_ZERO` | Declare the current physical pose to be B = 0. Run it with the head referenced mechanically - square against the bed, or with the probe pin hanging vertical. |
-| `B_SENSOR_CALIBRATE [START=] [END=] [STEPS=]` | Sweep the arc, fit offsets and gain, report conditioning. |
+| `B_SENSOR_CALIBRATE [START=] [END=] [STEPS=] [SETTLE=] [SAMPLE_TIME=] [GAIN=0]` | *(implemented)* Sweep the arc, fit offsets and gain, report each station and the residuals, apply the result and home B again on it. `SAVE_CONFIG` keeps it. |
 | `B_STEP_CALIBRATE [START=] [END=] [STEPS=] [RETURN=1]` | The drive ratio routine. `RETURN=1` sweeps back to measure backlash. |
 | `B_STEP_CALIBRATE MODE=QUICK ANGLE=90` | Two-point spot check. Requires a valid sensor calibration. |
 
@@ -383,14 +396,15 @@ measure(settle, window) -> TiltReading
      t0 = toolhead.get_last_move_time()
      toolhead.dwell(settle + window + batch_margin)
      client.finish_measurements()
-  3. keep samples with t0 + settle <= t <= t0 + settle + window
+  3. correct every sample by offset_u, offset_w and gain_ratio, then
+     keep samples with t0 + settle <= t <= t0 + settle + window
   4. reject if: no samples, count < 0.5 * expected,
                 stddev(any axis) > max_sample_deviation,
                 | |a| - 1g | > max_magnitude_error
   5. mean -> (u, w, v); accel_angle = atan2(u, w)
      with a gyroscope: fused_angle = complementary filter over the
      combined stream, settle included, ending at the window's end
-     (phase two: apply offsets, gain_ratio, zero_offset, level_offset)
+     (still to come: zero_offset, level_offset)
   6. return accel_angle, fused_angle, raw mean, stddev, in-plane and
      out-of-plane parts, count
 
@@ -480,8 +494,9 @@ longer than the cap, and is still checked.
 
 Nothing here needs a dwell, a stall threshold or a sweep, and the zero is
 absolute rather than relative to a switch. Its accuracy is the sensor's:
-until phase two lands, B = 0 is as vertical as `zero_vector`, the
-mounting and `BMI160_CALIBRATE` make it.
+B = 0 is as vertical as `zero_vector`, the mounting and
+`B_SENSOR_CALIBRATE` make it. Uncalibrated, a 100 mg offset along
+`positive_vector` homes the head 5.7 degrees from vertical.
 
 ### With an endstop
 
@@ -498,10 +513,14 @@ another move - B is left unhomed. This is what the design called
 The offsets and gains cannot come from the datasheet - they are
 per-device and up to 150 mg. They are fitted from data.
 
+*(Implemented, as below. `STEPS` is the number of stations, default
+13, and `START`/`END` default to the soft limits.)*
+
 ```
 B_SENSOR_CALIBRATE START=-40 END=90 STEPS=14
   for each station:
       move B, settle, measure raw mean (u, w, v)
+      (measure() corrects by the loaded calibration; undo it exactly)
   fit the axis-aligned ellipse
       (u - u0)^2 / Au^2 + (w - w0)^2 / Aw^2 = 1
   as the linear least squares problem
@@ -517,7 +536,19 @@ routine picks the model the data can support:
 | --- | --- | --- |
 | >= 120 deg | full | both offsets + gain ratio |
 | 60-120 deg | reduced | both offsets, gain ratio forced to 1 |
-| < 60 deg | zero only | `zero_offset` only; offsets left alone |
+| < 60 deg | zero only | refused for now - `zero_offset` belongs to `B_SET_ZERO` |
+
+The arc is the one the head was *measured* to turn through, not the one
+commanded, so a short drive cannot talk the routine into a fit its data
+does not support. The fit itself never uses the commanded angles, which
+is why a wrong `b_coupling_ratio` does not bias it. A fit is refused,
+changing nothing, if an offset exceeds 0.3 g, the gain ratio leaves 0.8
+to 1.25, or the in-plane radius leaves 0.8 to 1.2 g.
+
+Once a fit is accepted it is applied at once and written with
+`configfile.set()`. The head returns to B = 0, and an endstop-less B is
+homed again, since its position was booked on the old calibration; an
+endstop rail's position came from the switch and stands.
 
 The corertheta B range (-45 to 100, ie 145 degrees) supports the full
 fit, which is a happy accident worth stating: this machine can
@@ -531,11 +562,12 @@ routine only has to find `zero_offset`, and `B_SET_ZERO` is the whole
 procedure.
 
 The sweep also **verifies** `zero_vector` and `positive_vector`, which
-stay hand-declared: it reports which sensor axis pair actually varied
-(the in-plane pair), which stayed put (`v`), and the sign of the change
-against commanded B. Getting those two flags wrong is the most likely
-setup mistake, so the routine should say plainly when the data disagrees
-with what was declared.
+stay hand-declared: if an axis other than `v` varied least over the
+sweep it is refused, naming the axis that stayed put and all three
+ranges, and a head whose measured angle ran opposite to commanded B is
+refused as a `positive_vector` that disagrees with the motors. Getting
+those two flags wrong is the most likely setup mistake, so the routine
+says plainly when the data disagrees with what was declared.
 
 ## Algorithm: B step calibration
 
@@ -754,9 +786,11 @@ Each phase is independently useful and independently shippable.
 1. **Read-only** - *done*. `[accel_b_homing]`, the measurement
    primitive, `B_MEASURE`. Nothing moves; the head can be turned by hand.
    This alone answers the outstanding rotation-sense question.
-2. **Sensor calibration.** `B_SENSOR_CALIBRATE`, `B_SET_ZERO`, the
-   ellipse fit, `SAVE_CONFIG` write-back. After this the measurement is
-   trustworthy in absolute terms.
+2. **Sensor calibration** - *offset and gain fit done*.
+   `B_SENSOR_CALIBRATE`, the ellipse fit and the `SAVE_CONFIG`
+   write-back. `B_SET_ZERO` is still to come; it is what makes the
+   measurement trustworthy against the machine rather than against
+   gravity.
 3. **Step calibration.** `B_STEP_CALIBRATE`, step counting, the residual
    report, the ratio write-back. Uses only phases 1-2 and the existing
    endstop home.
@@ -764,8 +798,8 @@ Each phase is independently useful and independently shippable.
    the endstop-less `[stepper_tilt]`, the capped check move and the
    refine loop in `G28 B`, and measured direction and verification for a
    rail that keeps an endstop. It landed early because the machine has no
-   real endstop to fall back on; until phase two it homes to the
-   sensor's own zero.
+   real endstop to fall back on; until `B_SENSOR_CALIBRATE` has run it
+   homes to the sensor's own, uncalibrated, zero.
 5. **Guard rail.** `B_MEASURE CHECK=1` in `PRINT_START`, and optionally a
    periodic check between layers.
 

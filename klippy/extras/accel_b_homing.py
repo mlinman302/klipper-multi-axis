@@ -133,16 +133,38 @@
 # refused.  After the home the head is measured again, and a head that
 # is not at the endstop leaves B unhomed.
 #
-# WHAT THIS PHASE DOES NOT DO
+# SENSOR CALIBRATION
 #
-# The reading is uncorrected.  An ADXL345 has a zero-g offset of up to
-# +/-150 mg and an inter-axis gain tolerance of about +/-10 %, which
-# together are worth several degrees of absolute error - so treat the
-# number as a diagnostic, not as a calibrated angle, until the offset and
-# gain fit of phase two lands.  Repeatability is much better than
-# accuracy: a stationary head re-measures to a few hundredths of a
-# degree, which is why the noise gates below are tight even though the
-# absolute tolerances are loose.
+# An accelerometer's zero-g offset is up to +/-150 mg and its axes'
+# sensitivities differ by several percent.  Near B = 0 the angle is
+# almost entirely u / w, so an offset along u moves the zero directly:
+# 100 mg is 5.7 degrees.  Every sample is therefore corrected before
+# anything else sees it:
+#
+#   u' = u - offset_u
+#   w' = (w - offset_w) / gain_ratio
+#
+# and B = atan2(u', w').  The three numbers are fitted, not declared, by
+# B_SENSOR_CALIBRATE: it turns the head through as much of its range as
+# it has, measures the raw mean at each station, and fits the ellipse
+# the in-plane readings trace,
+#
+#   (u - offset_u)^2 + (w - offset_w)^2 / gain_ratio^2 = A^2
+#
+# as a linear least squares problem.  The fit needs only that gravity is
+# the same size in every pose - never the true angle of any station - so
+# neither the drive ratio nor a sensor glued on slightly rotated leaks
+# into it.  That also means it cannot see a rotated sensor: a rotation
+# keeps the circle a circle.  The offset along the rotation axis does
+# not enter the angle and is not fitted.
+#
+# How much the data can support depends on the arc it covers, so the
+# model is tiered: an arc of FULL_FIT_ARC or more fits both offsets and
+# the gain ratio, one of REDUCED_FIT_ARC or more fits the offsets with
+# the gain ratio held at 1, and anything shorter is refused.
+# Repeatability was always much better than accuracy - a stationary head
+# re-measures to a few hundredths of a degree - and the calibration is
+# what closes the gap.
 import collections, logging, math
 import stepper
 
@@ -186,6 +208,28 @@ MIN_DIRECTION_CHECK = 1.
 # following the motors.
 MIN_RESPONSE_RATIO = .5
 MAX_RESPONSE_RATIO = 2.
+
+# Sensor calibration.  The arc a sweep must measurably cover before each
+# model is fitted - see "SENSOR CALIBRATION" in the header - and the
+# fewest stations each needs to leave at least one degree of freedom
+# over its unknowns.
+FULL_FIT_ARC = 120.
+REDUCED_FIT_ARC = 60.
+MIN_FULL_FIT_STATIONS = 5
+MIN_REDUCED_FIT_STATIONS = 4
+# Bounds on a fit worth believing.  The datasheets allow 150 mg of
+# offset and 10 % of sensitivity error, so a fit well outside these is
+# describing a head that moved, or a mounting that is not the declared
+# one, rather than the sensor.
+MAX_FIT_OFFSET = .3 * FREEFALL_ACCEL
+MIN_GAIN_RATIO = .8
+MAX_GAIN_RATIO = 1.25
+MIN_FIT_RADIUS = .8 * FREEFALL_ACCEL
+MAX_FIT_RADIUS = 1.2 * FREEFALL_ACCEL
+# B_SENSOR_CALIBRATE measures longer and more patiently than a home: the
+# offsets it fits are worth degrees, so the noise on them should not be
+CALIBRATE_SETTLE_TIME = 1.
+CALIBRATE_SAMPLE_TIME = 1.
 
 # Levi-Civita symbol, for the cross product in gyro_axis_coefficient()
 LEVI_CIVITA = {(0, 1, 2): 1., (1, 2, 0): 1., (2, 0, 1): 1.,
@@ -239,6 +283,91 @@ def measure_angle(vector, zero_axis, positive_axis):
     w = project(vector, zero_axis)
     u = project(vector, positive_axis)
     return math.degrees(math.atan2(u, w))
+
+# The sensor calibration as (offset_u, offset_w, gain_ratio).  Both
+# directions work on sensor-frame vectors, so everything downstream of
+# the correction - the angle, the gates, the report - is unchanged.
+IDENTITY_CALIBRATION = (0., 0., 1.)
+
+def correct_vector(vector, zero_axis, positive_axis, calibration):
+    offset_u, offset_w, gain_ratio = calibration
+    (w_index, w_sign), (u_index, u_sign) = zero_axis, positive_axis
+    res = list(vector)
+    res[u_index] = vector[u_index] - u_sign * offset_u
+    res[w_index] = (vector[w_index] - w_sign * offset_w) / gain_ratio
+    return tuple(res)
+
+def raw_vector(vector, zero_axis, positive_axis, calibration):
+    # The inverse of correct_vector().  It is linear, so it recovers a raw
+    # mean from a corrected one exactly.
+    offset_u, offset_w, gain_ratio = calibration
+    (w_index, w_sign), (u_index, u_sign) = zero_axis, positive_axis
+    res = list(vector)
+    res[u_index] = vector[u_index] + u_sign * offset_u
+    res[w_index] = vector[w_index] * gain_ratio + w_sign * offset_w
+    return tuple(res)
+
+def solve_linear(matrix, rhs):
+    # Gaussian elimination with partial pivoting, for the few unknowns of
+    # the fits below - numpy is not guaranteed on the host
+    n = len(rhs)
+    rows = [list(matrix[i]) + [rhs[i]] for i in range(n)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(rows[r][col]))
+        if abs(rows[pivot][col]) < 1e-12:
+            raise ValueError("singular system")
+        rows[col], rows[pivot] = rows[pivot], rows[col]
+        for r in range(col + 1, n):
+            factor = rows[r][col] / rows[col][col]
+            for c in range(col, n + 1):
+                rows[r][c] -= factor * rows[col][c]
+    res = [0.] * n
+    for r in range(n - 1, -1, -1):
+        known = sum([rows[r][c] * res[c] for c in range(r + 1, n)])
+        res[r] = (rows[r][n] - known) / rows[r][r]
+    return res
+
+def least_squares(design, rhs):
+    # Through the normal equations - well enough conditioned here, where
+    # the columns are scaled to 1 g and there are at most four of them
+    n = len(design[0])
+    ata = [[sum([row[i] * row[j] for row in design]) for j in range(n)]
+           for i in range(n)]
+    atb = [sum([row[i] * b for row, b in zip(design, rhs)])
+           for i in range(n)]
+    return solve_linear(ata, atb)
+
+def fit_ellipse(points, fit_gain):
+    # Fits (u - u0)^2 + (w - w0)^2 / g^2 = A^2 to raw (u, w) points.
+    # With fit_gain the linear model is  u^2 + b w^2 + c u + d w + e = 0,
+    # without it b is held at 1.  Completing the squares gives
+    #   u0 = -c / 2,  w0 = -d / 2b,  A^2 = u0^2 + b w0^2 - e,  g = 1/sqrt(b)
+    # Returns (u0, w0, g, A) in the units of the points.
+    scale = FREEFALL_ACCEL
+    pts = [(u / scale, w / scale) for u, w in points]
+    if fit_gain:
+        b, c, d, e = least_squares([(w * w, u, w, 1.) for u, w in pts],
+                                   [-u * u for u, w in pts])
+        if b <= 0.:
+            raise ValueError("the points do not lie on an ellipse")
+    else:
+        b = 1.
+        c, d, e = least_squares([(u, w, 1.) for u, w in pts],
+                                [-(u * u + w * w) for u, w in pts])
+    u0, w0 = -c / 2., -d / (2. * b)
+    radius_sq = u0 * u0 + b * w0 * w0 - e
+    if radius_sq <= 0.:
+        raise ValueError("the points do not lie on an ellipse")
+    return (u0 * scale, w0 * scale, 1. / math.sqrt(b),
+            math.sqrt(radius_sq) * scale)
+
+def unwrap_angles(angles):
+    # Angles in visiting order, unwrapped so a sweep through +/-180 stays
+    # continuous
+    res = []
+    for angle in angles:
+        res.append(angle if not res else res[-1] + wrap180(angle - res[-1]))
+    return res
 
 def summarize(vectors):
     # Per-axis mean and sample standard deviation of a list of triples
@@ -410,6 +539,13 @@ class AccelBHoming:
         self.homing_tolerance = config.getfloat('homing_tolerance', 5.,
                                                 above=0.)
         self.verify_home_enabled = config.getboolean('verify_home', True)
+        # The sensor calibration, written by B_SENSOR_CALIBRATE.  The
+        # identity is the uncalibrated sensor.
+        self.calibration = (
+            config.getfloat('offset_u', 0.),
+            config.getfloat('offset_w', 0.),
+            config.getfloat('gain_ratio', 1., minval=MIN_GAIN_RATIO,
+                            maxval=MAX_GAIN_RATIO))
         self.chip = self.toolhead = self.b_axis = None
         self.has_gyro = False
         self.b_projection = None
@@ -420,6 +556,9 @@ class AccelBHoming:
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('B_MEASURE', self.cmd_B_MEASURE,
                                desc=self.cmd_B_MEASURE_help)
+        gcode.register_command('B_SENSOR_CALIBRATE',
+                               self.cmd_B_SENSOR_CALIBRATE,
+                               desc=self.cmd_B_SENSOR_CALIBRATE_help)
     def _get_axis(self, config, option):
         try:
             return parse_signed_axis(config.get(option))
@@ -505,13 +644,28 @@ class AccelBHoming:
         # any chip exposing start_internal_client() works.
         first = start_time + settle
         last = first + window
+        # The sensor calibration is applied to every sample, before the
+        # gates, the average and the fusion see any of them
+        calibration = self.calibration
+        if calibration == IDENTITY_CALIBRATION:
+            correct = None
+        else:
+            correct = lambda v: correct_vector(v, self.zero_axis,
+                                               self.positive_axis,
+                                               calibration)
         if fuse:
             imu_samples = imu_client.get_samples()
+            if correct is not None:
+                imu_samples = [tuple(s[:4]) + correct(s[4:7])
+                               for s in imu_samples]
             accel_samples = [(s[0], s[4], s[5], s[6]) for s in imu_samples]
             gyro_samples = [(s[0], s[1], s[2], s[3]) for s in imu_samples]
         else:
             imu_samples = None
             accel_samples = client.get_samples()
+            if correct is not None:
+                accel_samples = [(s[0],) + correct(s[1:4])
+                                 for s in accel_samples]
             gyro_samples = (None if gyro_client is None
                             else gyro_client.get_samples())
         vectors = [(s[1], s[2], s[3]) for s in accel_samples
@@ -787,6 +941,175 @@ class AccelBHoming:
                    self.homing_tolerance))
 
     ######################################################################
+    # Sensor calibration
+    ######################################################################
+    def sweep_sensor(self, axis, stations, settle_time, sample_time):
+        # The raw mean vector at each commanded station, in visiting
+        # order.  Unfused: the head is parked, and it is the average that
+        # is fitted.  The measurement is corrected by whatever calibration
+        # is loaded, so undo that - exactly, since it is linear.
+        res = []
+        for commanded in stations:
+            axis.move_axis(commanded)
+            reading = self.measure(settle_time, sample_time, fusion=False)
+            res.append((commanded, raw_vector(
+                reading.vector, self.zero_axis, self.positive_axis,
+                self.calibration)))
+        return res
+    def fit_sweep(self, sweep, fit_gain=True):
+        # Fits the sensor calibration to a sweep, refusing one that does
+        # not describe the declared mounting.  Returns (model, calibration,
+        # radius, residuals, arc).
+        error = self.printer.command_error
+        commanded = [c for c, v in sweep]
+        vectors = [v for c, v in sweep]
+        # The rotation axis is the one that should stay put.  If another
+        # axis varied less, the two vectors name the wrong pair, and an
+        # ellipse fitted to them would be fitted to nothing.
+        ranges = [max([v[i] for v in vectors]) - min([v[i] for v in vectors])
+                  for i in range(3)]
+        steadiest = ranges.index(min(ranges))
+        if steadiest != self.oop_index:
+            raise error(
+                "%s: over the sweep the %s axis varied least (%.0f mm/s^2)"
+                " but zero_vector and positive_vector leave %s as the"
+                " rotation axis (varied %.0f) - they do not name the two"
+                " axes the head turns through.  Axis ranges x/y/z ="
+                " %.0f / %.0f / %.0f"
+                % (self.name, AXIS_NAMES[steadiest], ranges[steadiest],
+                   AXIS_NAMES[self.oop_index], ranges[self.oop_index],
+                   ranges[0], ranges[1], ranges[2]))
+        angles = unwrap_angles([measure_angle(v, self.zero_axis,
+                                              self.positive_axis)
+                                for v in vectors])
+        turned = angles[-1] - angles[0]
+        if turned * (commanded[-1] - commanded[0]) < 0.:
+            raise error(
+                "%s: B was swept from %.1f to %.1f deg but the head turned"
+                " %+.1f - positive_vector and the motors disagree about"
+                " which way is +B" % (self.name, commanded[0], commanded[-1],
+                                      turned))
+        arc = max(angles) - min(angles)
+        if (fit_gain and arc >= FULL_FIT_ARC
+            and len(sweep) >= MIN_FULL_FIT_STATIONS):
+            model = 'full'
+        elif arc >= REDUCED_FIT_ARC and len(sweep) >= MIN_REDUCED_FIT_STATIONS:
+            model = 'offsets only'
+        else:
+            raise error(
+                "%s: the sweep covered %.1f deg over %d stations, and fitting"
+                " the offsets needs at least %.0f deg and %d stations -"
+                " widen START/END or add STEPS"
+                % (self.name, arc, len(sweep), REDUCED_FIT_ARC,
+                   MIN_REDUCED_FIT_STATIONS))
+        points = [(project(v, self.positive_axis), project(v, self.zero_axis))
+                  for v in vectors]
+        try:
+            offset_u, offset_w, gain_ratio, radius = fit_ellipse(
+                points, model == 'full')
+        except ValueError as e:
+            raise error("%s: the sensor fit failed: %s - the head was likely"
+                        " moving during the sweep" % (self.name, e))
+        problems = []
+        if max(abs(offset_u), abs(offset_w)) > MAX_FIT_OFFSET:
+            problems.append("offsets u/w of %.0f / %.0f mm/s^2 (limit %.0f)"
+                            % (offset_u, offset_w, MAX_FIT_OFFSET))
+        if not MIN_GAIN_RATIO <= gain_ratio <= MAX_GAIN_RATIO:
+            problems.append("a gain ratio of %.3f (limits %.2f to %.2f)"
+                            % (gain_ratio, MIN_GAIN_RATIO, MAX_GAIN_RATIO))
+        if not MIN_FIT_RADIUS <= radius <= MAX_FIT_RADIUS:
+            problems.append("an in-plane radius of %.0f mm/s^2 (limits %.0f"
+                            " to %.0f) - is the B rotation axis horizontal?"
+                            % (radius, MIN_FIT_RADIUS, MAX_FIT_RADIUS))
+        if problems:
+            raise error("%s: the sensor fit is not believable - it found %s."
+                        "  Nothing was changed" % (self.name,
+                                                   ", and ".join(problems)))
+        calibration = (offset_u, offset_w, gain_ratio)
+        residuals = [math.hypot(u - offset_u, (w - offset_w) / gain_ratio)
+                     - radius for u, w in points]
+        return model, calibration, radius, residuals, arc
+    def calibrate_sensor(self, axis, start, end, steps, settle_time,
+                         sample_time, fit_gain=True):
+        pos_min, pos_max = axis.get_range()
+        for name, value in (('START', start), ('END', end)):
+            if not pos_min <= value <= pos_max:
+                raise self.printer.command_error(
+                    "%s: %s=%.2f is outside the soft limits of %.2f to %.2f"
+                    % (self.name, name, value, pos_min, pos_max))
+        if abs(end - start) < REDUCED_FIT_ARC:
+            raise self.printer.command_error(
+                "%s: a sweep from %.2f to %.2f cannot be fitted - it needs to"
+                " cover at least %.0f deg" % (self.name, start, end,
+                                              REDUCED_FIT_ARC))
+        stations = [start + (end - start) * i / (steps - 1.)
+                    for i in range(steps)]
+        self._energise(axis)
+        sweep = self.sweep_sensor(axis, stations, settle_time, sample_time)
+        try:
+            model, calibration, radius, residuals, arc = self.fit_sweep(
+                sweep, fit_gain)
+        except self.printer.command_error:
+            axis.move_axis(0.)
+            raise
+        old = self.calibration
+        # How far the head that measured B = 0 before is from B = 0 now,
+        # which is how far the next home will turn it
+        vertical = [0., 0., 0.]
+        vertical[self.zero_axis[0]] = self.zero_axis[1] * FREEFALL_ACCEL
+        zero_shift = measure_angle(
+            correct_vector(raw_vector(vertical, self.zero_axis,
+                                      self.positive_axis, old),
+                           self.zero_axis, self.positive_axis, calibration),
+            self.zero_axis, self.positive_axis)
+        lines = ["%s: sensor calibration from B = %.1f to %.1f, %d stations"
+                 " covering %.1f deg - %s fit"
+                 % (self.name, start, end, steps, arc, model)]
+        for (commanded, vector), residual in zip(sweep, residuals):
+            before = measure_angle(
+                correct_vector(vector, self.zero_axis, self.positive_axis,
+                               old), self.zero_axis, self.positive_axis)
+            after = measure_angle(
+                correct_vector(vector, self.zero_axis, self.positive_axis,
+                               calibration),
+                self.zero_axis, self.positive_axis)
+            lines.append(
+                "  B %7.2f: raw u/w = %.1f / %.1f, out of plane %.1f,"
+                " measured %.2f -> %.2f deg, radius residual %+.1f"
+                % (commanded, project(vector, self.positive_axis),
+                   project(vector, self.zero_axis), vector[self.oop_index],
+                   before, after, residual))
+        rms = math.sqrt(sum([r * r for r in residuals]) / len(residuals))
+        lines += [
+            "  offset_u = %.1f mm/s^2 (was %.1f), offset_w = %.1f (was %.1f),"
+            " gain_ratio = %.5f (was %.5f)"
+            % (calibration[0], old[0], calibration[1], old[1],
+               calibration[2], old[2]),
+            "  in-plane radius %.1f mm/s^2 (%.4f g), residual rms %.1f,"
+            " max %.1f mm/s^2"
+            % (radius, radius / FREEFALL_ACCEL, rms,
+               max([abs(r) for r in residuals])),
+            "  the head that measured B = 0 before now measures %+.2f deg"
+            % (zero_shift,)]
+        self.calibration = calibration
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(self.name, 'offset_u', "%.1f" % (calibration[0],))
+        configfile.set(self.name, 'offset_w', "%.1f" % (calibration[1],))
+        configfile.set(self.name, 'gain_ratio', "%.5f" % (calibration[2],))
+        lines.append("  The calibration is in use now; run SAVE_CONFIG to"
+                     " keep it.")
+        self._respond("\n".join(lines))
+        axis.move_axis(0.)
+        if not getattr(axis, 'has_endstop', False):
+            # B was booked on the old calibration, so book it again.  (An
+            # endstop decides where B is, so a rail with one is still
+            # right - only its verification reads the sensor.)
+            self._respond("%s: homing B again on the new calibration"
+                          % (self.name,))
+            axis.home()
+        return calibration
+
+    ######################################################################
     # Comparison against the commanded angle
     ######################################################################
     def is_b_homed(self):
@@ -823,7 +1146,29 @@ class AccelBHoming:
                                 else reading.rotation_rate)
         res['fusion_disagreement'] = (None if reading is None
                                       else reading.disagreement)
+        res['offset_u'], res['offset_w'], res['gain_ratio'] = self.calibration
         return res
+    cmd_B_SENSOR_CALIBRATE_help = ("Sweep B and fit the sensor's offsets and"
+                                   " gain ratio")
+    def cmd_B_SENSOR_CALIBRATE(self, gcmd):
+        # Moves B, in the machine frame, through the stations
+        for name in ('rtcp', 'b_projection'):
+            obj = self.printer.lookup_object(name, None)
+            if obj is not None:
+                obj.check_disabled("B_SENSOR_CALIBRATE")
+        if not self.is_b_homed():
+            raise gcmd.error("%s: B_SENSOR_CALIBRATE turns the head, so B"
+                             " must be homed first (G28 B)" % (self.name,))
+        pos_min, pos_max = self.b_axis.get_range()
+        start = gcmd.get_float('START', pos_min)
+        end = gcmd.get_float('END', pos_max)
+        steps = gcmd.get_int('STEPS', 13, minval=MIN_REDUCED_FIT_STATIONS)
+        settle = gcmd.get_float('SETTLE', CALIBRATE_SETTLE_TIME, minval=0.)
+        window = gcmd.get_float('SAMPLE_TIME', CALIBRATE_SAMPLE_TIME,
+                                minval=.05)
+        fit_gain = gcmd.get_int('GAIN', 1, minval=0, maxval=1)
+        self.calibrate_sensor(self.b_axis, start, end, steps, settle, window,
+                              bool(fit_gain))
     cmd_B_MEASURE_help = "Measure the B axis angle against gravity"
     def cmd_B_MEASURE(self, gcmd):
         settle = gcmd.get_float('SETTLE', self.settle_time, minval=0.)
@@ -861,6 +1206,11 @@ class AccelBHoming:
                AXIS_NAMES[self.oop_index], reading.out_of_plane),
             "  sample deviation x/y/z = %.1f / %.1f / %.1f mm/s^2"
             % (dx, dy, dz)]
+        if self.calibration == IDENTITY_CALIBRATION:
+            lines.append("  sensor uncalibrated - run B_SENSOR_CALIBRATE")
+        else:
+            lines.append("  corrected by offset_u/offset_w = %.1f / %.1f"
+                         " mm/s^2, gain_ratio = %.5f" % self.calibration)
         if reading.rotation_rate is not None:
             lines.append("  rotation rate = %.4f deg/s (gate %.3f)"
                          % (reading.rotation_rate, self.max_rotation_rate))

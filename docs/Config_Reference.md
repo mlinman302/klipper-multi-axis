@@ -2134,7 +2134,8 @@ zero rate. Calibrating the accelerometer needs a known pose instead:
 them is +1 or -1 (the axis pointing up or down) and the other two are 0.
 Both results live in the chip's volatile offset registers and are lost on
 power cycle - this driver never programs the NVM behind them, which
-tolerates only 14 write cycles.
+tolerates only 14 write cycles. With `[accel_b_homing]`, calibrate the
+accelerometer with `B_SENSOR_CALIBRATE` instead: see that section.
 
 **Important:** Many BMI160 modules use ambiguous pin labels. For SPI:
 - Use **SCL** for clock (not SCX)
@@ -2892,7 +2893,7 @@ endstop by default, so `G28 B` is a measurement rather than a sweep:
 the filament tube from kinking - and nothing physical is ever run into.
 A head measured outside them is reported, and its first move goes to the
 nearest limit. B=0 is only as vertical as the sensor's zero: see the
-accuracy note below, and run `BMI160_CALIBRATE` first.
+calibration note below, and run `B_SENSOR_CALIBRATE` once.
 
 If `[stepper_tilt]` does have an `endstop_pin`, `G28 B` sweeps into it
 instead, and this section only steers that sweep: with
@@ -2915,13 +2916,26 @@ park the head, run `ACCELEROMETER_QUERY`, and note which axis reads about
 remaining axis is the rotation axis, and is reported back as a health
 check rather than configured.
 
-The reading is uncorrected in this phase. An ADXL345 has a zero-g offset
-of up to +/-150 mg and an inter-axis gain tolerance of about +/-10 %,
-together worth several degrees of absolute error, so treat the angle as a
-diagnostic rather than as a calibrated measurement. Repeatability is much
-better than accuracy - a stationary head re-measures to a few hundredths
-of a degree - which is what makes `CHECK=1` useful for catching gross
-errors such as a home that silently did not move.
+An uncalibrated sensor is not accurate. Accelerometers have a zero-g
+offset of up to +/-150 mg and axes whose sensitivities differ by several
+percent, and near B=0 an offset along `positive_vector` moves the zero
+directly - 100 mg is 5.7 degrees, and `G28 B` then homes the head that
+far from vertical. `B_SENSOR_CALIBRATE` fits the correction: it turns the
+head through its range, measures it at each station, and fits the
+ellipse the two in-plane axes trace, which needs only that gravity is the
+same size in every pose - not the true angle of any station. The result
+is `offset_u`, `offset_w` and `gain_ratio` below. Repeatability was
+always much better than accuracy - a stationary head re-measures to a
+few hundredths of a degree.
+
+The fit cannot see a sensor mounted slightly *rotated* about the B axis,
+or a frame that is not level: both keep the circle a circle. Those remain
+as an error of the zero against a physical reference.
+
+Do not also calibrate the accelerometer in the chip (`BMI160_CALIBRATE`
+with `X`/`Y`/`Z`). That changes the raw readings the fit was made on, and
+is lost on power cycle, which silently changes them back. `GYRO=1` alone
+is fine.
 
 This section never touches a bus, a pin or an MCU: it looks the chip up
 by name and reads it through the same interface `[resonance_tester]`
@@ -3022,8 +3036,9 @@ positive_vector:
 #   How far (in mm/s^2) the measured vector magnitude may sit from
 #   gravity (9806.65) before the measurement is rejected. The default is
 #   deliberately loose, because a chip inside its +/-10 % sensitivity
-#   spec legitimately reads 0.9 to 1.1 g and nothing corrects for that
-#   yet. Set to 0 to disable the check. The default is 1500.
+#   spec legitimately reads 0.9 to 1.1 g, and the sensor calibration
+#   below matches the two in-plane axes to each other rather than to
+#   1 g. Set to 0 to disable the check. The default is 1500.
 #max_rotation_rate: 1.0
 #   Largest average rotation rate (in deg/s) accepted before the
 #   measurement is rejected as "the head was turning". This is a direct
@@ -3080,6 +3095,17 @@ positive_vector:
 #   Only for a [stepper_tilt] with an endstop_pin: whether to measure
 #   the head after G28 B and refuse the home if it is not within
 #   homing_tolerance of position_endstop. The default is True.
+#offset_u: 0.0
+#offset_w: 0.0
+#gain_ratio: 1.0
+#   The sensor calibration, normally written by B_SENSOR_CALIBRATE and
+#   SAVE_CONFIG rather than by hand. offset_u and offset_w are the
+#   zero-g offsets (in mm/s^2) along positive_vector and zero_vector,
+#   and gain_ratio is the sensitivity along zero_vector divided by that
+#   along positive_vector; every sample is corrected as
+#   u' = u - offset_u and w' = (w - offset_w) / gain_ratio before it is
+#   used. gain_ratio must be between 0.8 and 1.25. The defaults are the
+#   uncalibrated sensor.
 ```
 
 `B_MEASURE [SETTLE=<s>] [SAMPLE_TIME=<s>] [FUSION=0|1] [CHECK=0|1]
@@ -3096,7 +3122,26 @@ A measurement during which the chip reports possible FIFO overflows is
 refused, since lost samples also leave the remaining ones mistimed. When B is homed it also reports the commanded angle and
 the error against it; `CHECK=1` turns a disagreement larger than
 `TOLERANCE` into an error, which is what makes it usable in
-`PRINT_START`.
+`PRINT_START`. It also says whether the sensor is calibrated.
+
+`B_SENSOR_CALIBRATE [START=<deg>] [END=<deg>] [STEPS=<n>] [SETTLE=<s>]
+[SAMPLE_TIME=<s>] [GAIN=0|1]` fits `offset_u`, `offset_w` and
+`gain_ratio`. B must be homed, and RTCP and the bed-frame B projection
+off; the head swings through the whole range, so make sure it clears the
+bed. It turns the head to `STEPS` evenly spaced stations from `START` to
+`END` (default: `position_min` to `position_max`, 13 stations), and at
+each one waits `SETTLE` (default 1.0) and averages for `SAMPLE_TIME`
+(default 1.0). The model is picked from the arc the head was *measured*
+to cover: 120 degrees or more fits both offsets and the gain ratio, 60 or
+more fits the offsets with `gain_ratio` held at 1 (as does `GAIN=0`), and
+less is refused. It also refuses a sweep in which an axis other than the
+rotation axis stayed steadiest (the vectors name the wrong pair), a head
+that turned the opposite way to B, and a fit with an offset above 0.3 g,
+a gain ratio outside 0.8 to 1.25 or an in-plane radius outside 0.8 to
+1.2 g - and changes nothing when it does. It reports each station, the
+fit residuals, and how far the head that measured B=0 before now is from
+B=0. The new calibration is used straight away, and an endstop-less B is
+homed again on it; run `SAVE_CONFIG` to keep it.
 
 Measuring works with `[rtcp]` and `[b_projection]` enabled - it reads a
 physical angle, so no frame has to be switched off. The comparison

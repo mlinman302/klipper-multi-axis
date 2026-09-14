@@ -590,10 +590,14 @@ The accelerometer case needs a *pose*: `foc_acc_x/y/z` each declare
 whether that axis should read -1 g, 0 g or +1 g, so the head has to be at
 a known attitude - which on this machine means B = 0, with the axes named
 by `[accel_b_homing]`'s `zero_vector`. That makes accelerometer FOC a
-deliberate calibration command rather than something to do at startup,
-and it is what finally answers the "phase two offset and gain fit" that
-[Accel_B_Homing.md](Accel_B_Homing.md) defers: a large part of it is done
-in hardware.
+deliberate calibration command rather than something to do at startup -
+and on the B axis, not the right one. It trims every axis against a pose
+declared exact, so a head a few degrees off vertical is booked as
+vertical, and it is lost on power cycle. `B_SENSOR_CALIBRATE` fits the
+offsets and gain ratio in software instead, from a sweep that needs no
+exact pose, and `SAVE_CONFIG` keeps them (see
+[Accel_B_Homing.md](Accel_B_Homing.md)). The two must not be combined:
+accelerometer FOC changes the raw readings that fit was made on.
 
 Note the chip's own warning: the offset registers have an NVM backup with
 a lifetime of at most 14 write cycles. This driver writes the volatile

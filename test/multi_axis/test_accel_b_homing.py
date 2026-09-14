@@ -910,6 +910,16 @@ class FakeMeasuredAxis:
         self.position = None
         self.is_homed = False
         self.moves = []
+        # What rotary_axis.home() hands an endstop-less rail to
+        self.has_endstop = False
+        self.homing_source = None
+        self.homes = 0
+    def get_status(self, eventtime=None):
+        return {'position': self.position, 'homed': self.is_homed}
+    def home(self):
+        self.homes += 1
+        self.is_homed = False
+        self.homing_source.home_axis(self)
     def get_range(self):
         return self.rng
     def get_drive_steppers(self):
@@ -1308,6 +1318,299 @@ class TestRotaryAxisMeasuredHome(unittest.TestCase):
         with self.assertRaises(ConfigError):
             ra.home()
         self.assertFalse(ra.is_homed)
+
+
+######################################################################
+# Sensor calibration: the correction, the fit and B_SENSOR_CALIBRATE
+######################################################################
+
+# The reference mounting reads u on +x and w on +z, so a chip offset of
+# (ox, oy, oz) and gain (gx, gy, gz) should fit to offset_u = ox,
+# offset_w = oz, gain_ratio = gz / gx and an in-plane radius of G * gx.
+def arc_points(offset_u=0., offset_w=0., gain_u=1., gain_w=1., lo=-45.,
+               hi=100., count=13, noise=0., seed=99):
+    rng = random.Random(seed)
+    res = []
+    for i in range(count):
+        rad = math.radians(lo + (hi - lo) * i / (count - 1.))
+        res.append((G * math.sin(rad) * gain_u + offset_u
+                    + rng.gauss(0., noise),
+                    G * math.cos(rad) * gain_w + offset_w
+                    + rng.gauss(0., noise)))
+    return res
+
+class TestCalibrationHelpers(unittest.TestCase):
+    MOUNTINGS = [('+z', '+x'), ('+x', '+y'), ('-y', '+z'), ('-x', '-z')]
+    def test_correct_and_raw_are_inverses(self):
+        cal = (-977., 184., 1.03)
+        vec = (1234.5, -678.9, 9001.2)
+        for zero, positive in self.MOUNTINGS:
+            z, p = abh.parse_signed_axis(zero), abh.parse_signed_axis(positive)
+            back = abh.raw_vector(abh.correct_vector(vec, z, p, cal), z, p,
+                                  cal)
+            for a, b in zip(back, vec):
+                self.assertAlmostEqual(a, b, places=6)
+    def test_the_correction_acts_along_the_declared_axes(self):
+        # +x reads u and +y reads w on the corertheta machine.  A head at
+        # true vertical with a -1000 mm/s^2 u offset is corrected to zero,
+        # and the rotation axis is left alone.
+        z, p = abh.parse_signed_axis('+x'), abh.parse_signed_axis('+y')
+        raw = (G, -1000., 55.)
+        self.assertAlmostEqual(abh.measure_angle(raw, z, p), -5.82, places=2)
+        fixed = abh.correct_vector(raw, z, p, (-1000., 0., 1.))
+        self.assertEqual(fixed[2], 55.)
+        self.assertAlmostEqual(abh.measure_angle(fixed, z, p), 0., places=9)
+    def test_a_negated_axis_takes_the_offset_in_its_own_sense(self):
+        z, p = abh.parse_signed_axis('+z'), abh.parse_signed_axis('-x')
+        # u = -x, so an offset_u of +500 is a raw x reading of -500
+        fixed = abh.correct_vector((-500., 0., G), z, p, (500., 0., 1.))
+        self.assertAlmostEqual(fixed[0], 0., places=9)
+    def test_the_full_fit_recovers_offsets_and_gain(self):
+        pts = arc_points(-980., 150., gain_u=1.02, gain_w=.97)
+        u0, w0, gain, radius = abh.fit_ellipse(pts, True)
+        self.assertAlmostEqual(u0, -980., places=4)
+        self.assertAlmostEqual(w0, 150., places=4)
+        self.assertAlmostEqual(gain, .97 / 1.02, places=9)
+        self.assertAlmostEqual(radius, G * 1.02, places=4)
+    def test_the_full_fit_survives_noise(self):
+        # 20 mm/s^2 on a mean is far noisier than a 1 s average
+        pts = arc_points(-980., 150., gain_w=1.03, noise=20.)
+        u0, w0, gain, radius = abh.fit_ellipse(pts, True)
+        self.assertAlmostEqual(u0, -980., delta=30.)
+        self.assertAlmostEqual(w0, 150., delta=60.)
+        self.assertAlmostEqual(gain, 1.03, delta=.01)
+    def test_the_reduced_fit_holds_the_gain(self):
+        pts = arc_points(-980., 150., lo=-40., hi=40., count=9)
+        u0, w0, gain, radius = abh.fit_ellipse(pts, False)
+        self.assertEqual(gain, 1.)
+        self.assertAlmostEqual(u0, -980., places=4)
+        self.assertAlmostEqual(w0, 150., places=4)
+        self.assertAlmostEqual(radius, G, places=4)
+    def test_a_line_is_not_an_ellipse(self):
+        with self.assertRaises(ValueError):
+            abh.fit_ellipse([(float(i), 2. * i) for i in range(6)], True)
+    def test_a_singular_system_is_refused(self):
+        with self.assertRaises(ValueError):
+            abh.solve_linear([[1., 2.], [2., 4.]], [1., 2.])
+    def test_unwrap_survives_the_wrap(self):
+        self.assertEqual(abh.unwrap_angles([170., -170., -150.]),
+                         [170., 190., 210.])
+        self.assertEqual(abh.unwrap_angles([]), [])
+
+class TestCorrectedMeasurement(unittest.TestCase):
+    def test_an_offset_moves_an_uncalibrated_zero(self):
+        obj = build(chip=FakeIMUChip(angle=0., offset=(-980., 0., 0.)))
+        self.assertAlmostEqual(obj.measure_vertical(), -5.71, places=2)
+    def test_the_configured_calibration_corrects_it(self):
+        for fusion in (True, False):
+            obj = build({'offset_u': -980.},
+                        chip=FakeIMUChip(angle=0., offset=(-980., 0., 0.)))
+            reading = obj.measure(fusion=fusion)
+            angle = reading.fused_angle if fusion else reading.accel_angle
+            self.assertAlmostEqual(angle, 0., places=6)
+            self.assertAlmostEqual(reading.magnitude, G, places=6)
+    def test_the_gain_ratio_corrects_an_intermediate_angle(self):
+        chip = FakeIMUChip(angle=45., gain=(1., 1., 1.05),
+                           offset=(0., 0., 70.))
+        obj = build({'offset_w': 70., 'gain_ratio': 1.05}, chip=chip)
+        self.assertAlmostEqual(obj.measure_vertical(), 45., places=6)
+    def test_status_and_report_carry_the_calibration(self):
+        obj = build()
+        self.assertEqual((obj.get_status()['offset_u'],
+                          obj.get_status()['gain_ratio']), (0., 1.))
+        gcmd = FakeGCmd()
+        obj.printer.lookup_object('gcode').commands['B_MEASURE'](gcmd)
+        self.assertIn("sensor uncalibrated", "\n".join(gcmd.responses))
+        obj = build({'offset_u': -980., 'offset_w': 12.5, 'gain_ratio': 1.01})
+        self.assertEqual(obj.get_status()['offset_w'], 12.5)
+        gcmd = FakeGCmd()
+        obj.printer.lookup_object('gcode').commands['B_MEASURE'](gcmd)
+        self.assertIn("offset_u/offset_w = -980.0 / 12.5",
+                      "\n".join(gcmd.responses))
+
+class FakeConfigfile:
+    def __init__(self):
+        self.saved = {}
+    def set(self, section, option, value):
+        self.saved[(section, option)] = value
+
+# A homed head the calibration can sweep.  The head starts where G28 B
+# on the uncalibrated sensor would have left it.
+def build_calibration(chip, ratio=1., rng=(-45., 100.), config_values=None,
+                      home=True):
+    values = {'settle_time': 0., 'sample_time': .7}
+    values.update(config_values or {})
+    obj = build(values, chip=chip)
+    obj.printer.add_object('stepper_enable', FakeStepperEnable())
+    configfile = FakeConfigfile()
+    obj.printer.add_object('configfile', configfile)
+    axis = FakeMeasuredAxis(chip, ratio, rng)
+    axis.homing_source = obj
+    if home:
+        obj.home_axis(axis)
+    else:
+        axis.position, axis.is_homed = 0., True
+    return obj, axis, configfile
+
+class TestSensorCalibration(unittest.TestCase):
+    def _calibrate(self, obj, axis, start=-45., end=100., steps=13, gain=True):
+        return obj.calibrate_sensor(axis, start, end, steps, 0., .1, gain)
+    def _responses(self, obj):
+        return "\n".join(obj.printer.lookup_object('gcode').responses)
+    def test_it_fixes_the_zero_a_home_got_wrong(self):
+        # The corertheta symptom: 100 mg of u offset homes the head to
+        # about +5.7 deg, and after calibrating it homes to vertical
+        chip = FakeIMUChip(angle=30., offset=(-980., 300., 150.),
+                           gain=(1.01, 1., .98))
+        obj, axis, configfile = build_calibration(chip)
+        self.assertAlmostEqual(chip.angle, 5.66, delta=.3)
+        cal = self._calibrate(obj, axis)
+        self.assertAlmostEqual(cal[0], -980., places=2)
+        self.assertAlmostEqual(cal[1], 150., places=2)
+        self.assertAlmostEqual(cal[2], .98 / 1.01, places=6)
+        self.assertEqual(obj.calibration, cal)
+        self.assertEqual(axis.homes, 1)
+        self.assertLess(abs(chip.angle), .25)
+        self.assertEqual(axis.moves[-1], 0.)
+        self.assertEqual(configfile.saved[('accel_b_homing', 'offset_u')],
+                         "-980.0")
+        self.assertEqual(configfile.saved[('accel_b_homing', 'gain_ratio')],
+                         "%.5f" % (.98 / 1.01,))
+        out = self._responses(obj)
+        self.assertIn("full fit", out)
+        self.assertIn("SAVE_CONFIG", out)
+        self.assertIn("measured B = 0 before now measures +5.", out)
+        # The head goes back to B = 0 before homing again, rather than
+        # being measured at the end of the sweep, beyond a soft limit
+        self.assertNotIn("outside the soft limits", out)
+    def test_the_sweep_visits_every_station_in_order(self):
+        chip = FakeIMUChip(angle=0.)
+        obj, axis, _ = build_calibration(chip, home=False)
+        self._calibrate(obj, axis, -40., 80., 7)
+        self.assertEqual(axis.moves[:7], [-40., -20., 0., 20., 40., 60., 80.])
+    def test_a_loaded_calibration_does_not_bias_the_next_one(self):
+        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.))
+        obj, axis, _ = build_calibration(chip, config_values={
+            'offset_u': 400., 'offset_w': -300., 'gain_ratio': 1.1},
+            home=False)
+        cal = self._calibrate(obj, axis)
+        self.assertAlmostEqual(cal[0], -980., places=2)
+        self.assertAlmostEqual(cal[1], 150., places=2)
+        self.assertAlmostEqual(cal[2], 1., places=6)
+    def test_a_drive_ratio_error_does_not_enter_the_fit(self):
+        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.))
+        obj, axis, _ = build_calibration(chip, ratio=.9, home=False)
+        cal = self._calibrate(obj, axis)
+        self.assertAlmostEqual(cal[0], -980., places=2)
+        self.assertAlmostEqual(cal[2], 1., places=6)
+    def test_a_medium_arc_fits_offsets_only(self):
+        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.),
+                           gain=(1., 1., 1.04))
+        obj, axis, _ = build_calibration(chip, home=False)
+        cal = self._calibrate(obj, axis, -45., 45., 9)
+        self.assertEqual(cal[2], 1.)
+        self.assertAlmostEqual(cal[0], -980., delta=5.)
+        self.assertIn("offsets only fit", self._responses(obj))
+    def test_gain_can_be_left_out(self):
+        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.))
+        obj, axis, _ = build_calibration(chip, home=False)
+        cal = self._calibrate(obj, axis, gain=False)
+        self.assertEqual(cal[2], 1.)
+        self.assertIn("offsets only fit", self._responses(obj))
+    def test_a_short_sweep_is_refused_before_moving(self):
+        obj, axis, configfile = build_calibration(FakeIMUChip(), home=False)
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis, -20., 20.)
+        self.assertIn("at least 60", str(cm.exception))
+        self.assertEqual(axis.moves, [])
+        self.assertEqual(configfile.saved, {})
+    def test_a_sweep_beyond_the_soft_limits_is_refused(self):
+        obj, axis, _ = build_calibration(FakeIMUChip(), home=False)
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis, -90., 100.)
+        self.assertIn("START=-90.00 is outside", str(cm.exception))
+        self.assertEqual(axis.moves, [])
+    def test_a_head_that_turns_less_than_commanded_is_refused(self):
+        obj, axis, configfile = build_calibration(FakeIMUChip(), ratio=.3,
+                                                  home=False)
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis)
+        self.assertIn("the sweep covered 43.5 deg", str(cm.exception))
+        self.assertEqual(axis.moves[-1], 0.)
+        self.assertEqual(obj.calibration, abh.IDENTITY_CALIBRATION)
+        self.assertEqual(configfile.saved, {})
+    def test_a_reversed_head_is_refused(self):
+        obj, axis, _ = build_calibration(FakeIMUChip(), ratio=-1.,
+                                         rng=(-100., 100.), home=False)
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis, -60., 60., 7)
+        self.assertIn("disagree about which way is +B", str(cm.exception))
+    def test_vectors_naming_the_wrong_pair_are_refused(self):
+        # The head turns in x-z, but the config says x-y
+        obj, axis, _ = build_calibration(
+            FakeIMUChip(angle=0.), home=False,
+            config_values={'zero_vector': '+z', 'positive_vector': '+y',
+                           'max_magnitude_error': 0.})
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis)
+        self.assertIn("the y axis varied least", str(cm.exception))
+        self.assertIn("leave x as the rotation axis", str(cm.exception))
+    def test_an_unbelievable_offset_is_refused(self):
+        chip = FakeIMUChip(angle=0., offset=(-4000., 0., 0.))
+        obj, axis, configfile = build_calibration(
+            chip, home=False, config_values={'max_magnitude_error': 0.})
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis)
+        self.assertIn("not believable", str(cm.exception))
+        self.assertEqual(obj.calibration, abh.IDENTITY_CALIBRATION)
+        self.assertEqual(configfile.saved, {})
+    def test_an_endstop_rail_is_not_homed_again(self):
+        chip = FakeIMUChip(angle=0., offset=(-980., 0., 0.))
+        obj, axis, _ = build_calibration(chip, home=False)
+        axis.has_endstop = True
+        self._calibrate(obj, axis)
+        self.assertEqual(axis.homes, 0)
+        self.assertEqual(axis.moves[-1], 0.)
+    def test_noise_leaves_the_zero_well_inside_tolerance(self):
+        chip = FakeIMUChip(angle=20., offset=(-980., 0., 150.), noise=150.,
+                           gain=(1., 1., 1.02))
+        obj, axis, _ = build_calibration(chip, config_values={
+            'sample_time': .7})
+        obj.calibrate_sensor(axis, -45., 100., 13, 0., .5)
+        self.assertLess(abs(chip.angle), .25)
+
+class TestSensorCalibrationCommand(unittest.TestCase):
+    def _build(self, **params):
+        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.))
+        obj, axis, configfile = build_calibration(chip, home=False)
+        obj.b_axis = axis
+        return obj, axis, FakeGCmd(params)
+    def _run(self, obj, gcmd):
+        obj.printer.lookup_object('gcode').commands['B_SENSOR_CALIBRATE'](gcmd)
+    def test_it_sweeps_the_soft_limits_by_default(self):
+        obj, axis, gcmd = self._build(SETTLE=0., SAMPLE_TIME=.1)
+        self._run(obj, gcmd)
+        self.assertEqual(axis.moves[0], -45.)
+        self.assertEqual(axis.moves[12], 100.)
+        self.assertAlmostEqual(obj.calibration[0], -980., places=2)
+    def test_it_needs_b_homed(self):
+        obj, axis, gcmd = self._build()
+        axis.is_homed = False
+        with self.assertRaises(ConfigError) as cm:
+            self._run(obj, gcmd)
+        self.assertIn("G28 B", str(cm.exception))
+        self.assertEqual(axis.moves, [])
+    def test_it_refuses_with_rtcp_on(self):
+        class Rtcp:
+            def check_disabled(self, what):
+                raise ConfigError("%s must run with RTCP compensation off"
+                                  % (what,))
+        obj, axis, gcmd = self._build()
+        obj.printer.add_object('rtcp', Rtcp())
+        with self.assertRaises(ConfigError) as cm:
+            self._run(obj, gcmd)
+        self.assertIn("B_SENSOR_CALIBRATE must run", str(cm.exception))
+        self.assertEqual(axis.moves, [])
 
 
 if __name__ == '__main__':
