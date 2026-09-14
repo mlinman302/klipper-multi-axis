@@ -36,9 +36,9 @@ class ConfigError(Exception):
 class FakeRotaryAxis:
     def __init__(self, gcode_id='B', is_homed=True):
         self.gcode_id, self.is_homed = gcode_id, is_homed
-        self.homing_direction_source = None
-    def set_homing_direction_source(self, source):
-        self.homing_direction_source = source
+        self.homing_source = None
+    def set_homing_source(self, source):
+        self.homing_source = source
     def get_axis_gcode_id(self):
         return self.gcode_id
     def get_status(self, eventtime=None):
@@ -234,6 +234,12 @@ class FakeConfig:
         if default is Ellipsis:
             raise ConfigError("Option '%s' is not valid" % (option,))
         return None if default is None else float(default)
+    def getint(self, option, default=Ellipsis, **kwargs):
+        if option in self.values:
+            return int(self.values[option])
+        if default is Ellipsis:
+            raise ConfigError("Option '%s' is not valid" % (option,))
+        return default
     def getboolean(self, option, default=Ellipsis, **kwargs):
         if option in self.values:
             return bool(self.values[option])
@@ -829,14 +835,148 @@ class TestFusion(unittest.TestCase):
 
 
 ######################################################################
-# Picking the B homing direction
+# Homing without an endstop: measure, then drive to B = 0
 ######################################################################
 
-class TestHomingDirection(unittest.TestCase):
+class FakeStepper:
+    def __init__(self, name):
+        self.name = name
+    def get_name(self):
+        return self.name
+
+class FakeStepperEnable:
+    def __init__(self):
+        self.enabled = []
+    def set_motors_enable(self, names, enable):
+        self.enabled.append((list(names), enable))
+
+# The B axis as the homing routine sees it, attached to the chip so that
+# a commanded move really turns the head.  ratio is how far the head
+# turns per commanded degree: 1 is a correct b_coupling_ratio, 0.9 a
+# drive that falls short, -1 a positive_vector that disagrees with the
+# motors, and 0 a head the motors are not driving.
+class FakeMeasuredAxis:
+    def __init__(self, chip, ratio=1., rng=(-45., 100.)):
+        self.chip, self.ratio, self.rng = chip, ratio, rng
+        self.position = None
+        self.is_homed = False
+        self.moves = []
+    def get_range(self):
+        return self.rng
+    def get_drive_steppers(self):
+        return [FakeStepper('stepper_tilt'), FakeStepper('stepper_r')]
+    def set_measured_position(self, angle):
+        self.position = angle
+        self.is_homed = True
+    def move_axis(self, angle, speed=None):
+        if not self.is_homed:
+            raise ConfigError("Must home rotary axis B first")
+        lo, hi = self.rng
+        if angle < lo or angle > hi:
+            raise ConfigError("Rotary axis B move out of range")
+        self.moves.append(angle)
+        self.chip.angle += self.ratio * (angle - self.position)
+        self.position = angle
+
+def build_home(head_angle, ratio=1., config_values=None, rng=(-45., 100.)):
+    chip = FakeIMUChip(angle=head_angle)
+    obj = build(config_values, chip=chip)
+    enable = FakeStepperEnable()
+    obj.printer.add_object('stepper_enable', enable)
+    return obj, FakeMeasuredAxis(chip, ratio, rng), enable
+
+class TestMeasuredHome(unittest.TestCase):
+    def _responses(self, obj):
+        return "\n".join(obj.printer.lookup_object('gcode').responses)
     def test_it_registers_with_the_b_axis(self):
         obj = build()
         b_axis = obj.printer.lookup_object('toolhead').b_axis
-        self.assertIs(b_axis.homing_direction_source, obj)
+        self.assertIs(b_axis.homing_source, obj)
+    def test_a_correct_drive_homes_to_zero(self):
+        obj, axis, _ = build_home(30.)
+        obj.home_axis(axis)
+        # A capped check move first, then straight to zero
+        self.assertEqual(axis.moves[:2], [25., 0.])
+        self.assertAlmostEqual(axis.chip.angle, 0., places=2)
+        self.assertEqual(axis.position, 0.)
+        self.assertTrue(axis.is_homed)
+        self.assertIn("head at B = 30.00", self._responses(obj))
+    def test_the_check_move_heads_toward_zero_from_either_side(self):
+        obj, axis, _ = build_home(-20.)
+        obj.home_axis(axis)
+        self.assertEqual(axis.moves[0], -15.)
+        self.assertAlmostEqual(axis.chip.angle, 0., places=2)
+    def test_the_motors_are_energised_before_measuring(self):
+        obj, axis, enable = build_home(10.)
+        obj.home_axis(axis)
+        self.assertEqual(enable.enabled[0],
+                         (['stepper_tilt', 'stepper_r'], True))
+    def test_a_short_drive_is_corrected_by_measuring_again(self):
+        obj, axis, _ = build_home(60., ratio=.9)
+        obj.home_axis(axis)
+        self.assertLess(abs(axis.chip.angle), .25)
+        self.assertGreater(len(axis.moves), 3)
+    def test_a_head_already_vertical_needs_no_correction(self):
+        obj, axis, _ = build_home(.1)
+        obj.home_axis(axis)
+        # Only the final move onto a commanded zero
+        self.assertEqual(axis.moves, [0.])
+        self.assertAlmostEqual(axis.chip.angle, 0., places=6)
+    def test_a_reversed_head_stops_after_the_check_move(self):
+        obj, axis, _ = build_home(80., ratio=-1.)
+        with self.assertRaises(ConfigError) as cm:
+            obj.home_axis(axis)
+        self.assertIn("positive_vector", str(cm.exception))
+        self.assertIn("invert_b_direction", str(cm.exception))
+        # Driven the wrong way by the check move only - never toward 160
+        self.assertEqual(axis.moves, [75.])
+        self.assertAlmostEqual(axis.chip.angle, 85., places=2)
+    def test_a_head_that_does_not_move_is_refused(self):
+        obj, axis, _ = build_home(30., ratio=0.)
+        with self.assertRaises(ConfigError) as cm:
+            obj.home_axis(axis)
+        self.assertIn("not following the motors", str(cm.exception))
+    def test_a_wildly_long_drive_is_refused(self):
+        obj, axis, _ = build_home(30., ratio=3.)
+        with self.assertRaises(ConfigError) as cm:
+            obj.home_axis(axis)
+        self.assertIn("b_coupling_ratio", str(cm.exception))
+    def test_a_drive_that_never_converges_is_refused(self):
+        obj, axis, _ = build_home(60., ratio=.6,
+                                  config_values={'max_homing_moves': 2})
+        with self.assertRaises(ConfigError) as cm:
+            obj.home_axis(axis)
+        self.assertIn("not converging", str(cm.exception))
+    def test_the_check_move_is_configurable(self):
+        obj, axis, _ = build_home(30., config_values={
+            'direction_check_move': 10.})
+        obj.home_axis(axis)
+        self.assertEqual(axis.moves[0], 20.)
+    def test_a_tiny_first_move_gives_no_verdict(self):
+        # 0.8 degrees is too short to say which way the head went, so it
+        # is neither refused nor trusted: the next move is capped again,
+        # and that one is long enough to catch the reversal
+        obj, axis, _ = build_home(.8, ratio=-1.)
+        with self.assertRaises(ConfigError) as cm:
+            obj.home_axis(axis)
+        self.assertIn("positive_vector", str(cm.exception))
+        self.assertEqual(axis.moves[0], 0.)
+        self.assertAlmostEqual(axis.moves[1], 0., places=6)
+        self.assertEqual(len(axis.moves), 2)
+    def test_a_head_outside_the_soft_limits_is_reported(self):
+        obj, axis, _ = build_home(110.)
+        obj.home_axis(axis)
+        self.assertIn("outside the soft limits", self._responses(obj))
+        # The first move cannot end beyond the limit, so it ends on it
+        self.assertEqual(axis.moves[0], 100.)
+        self.assertAlmostEqual(axis.chip.angle, 0., places=2)
+
+
+######################################################################
+# Picking the B homing direction of an endstop
+######################################################################
+
+class TestHomingDirection(unittest.TestCase):
     def test_below_the_endstop_homes_positive(self):
         obj = build(chip=FakeIMUChip(angle=-20.))
         positive, sweep = obj.choose_homing_direction(40., -90., 90.)
@@ -909,6 +1049,7 @@ class FakeHomingInfo:
 class FakeRail:
     def __init__(self, position_endstop, positive_dir):
         self.hi = FakeHomingInfo(position_endstop, positive_dir)
+        self.hi.speed = 30.
         self.homing_speed = 30.
     def get_homing_info(self):
         return self.hi
@@ -917,6 +1058,8 @@ class FakeRail:
 
 class FakeHomingToolhead(FakeToolhead):
     def move(self, pos, speed):
+        self.position = list(pos)
+    def set_position(self, pos):
         self.position = list(pos)
 
 class FakeSource:
@@ -948,7 +1091,8 @@ class TestRotaryAxisHome(unittest.TestCase):
         ra.rail = FakeRail(position_endstop, positive_dir)
         ra.pos_min, ra.pos_max = rng
         ra.can_home, ra.is_homed = True, False
-        ra.homing_direction_source = source
+        ra.has_endstop = True
+        ra.homing_source = source
         toolhead.extra_axes = [FakeExtruder(), None, ra]
         return ra
     def _forcepos(self, ra):
@@ -986,6 +1130,104 @@ class TestRotaryAxisHome(unittest.TestCase):
     def test_a_failed_verification_leaves_b_unhomed(self):
         source = FakeSource(True, 10., verify_error="not at the endstop")
         ra = self._axis(0., None, source)
+        with self.assertRaises(ConfigError):
+            ra.home()
+        self.assertFalse(ra.is_homed)
+
+import stepper
+
+class FakeRailStepper(FakeStepper):
+    def get_commanded_position(self):
+        return 0.
+    def calc_position_from_coord(self, coord):
+        return 0.
+
+class FakeRailPrinter(FakePrinter):
+    def load_object(self, config, name):
+        return None
+
+class FakeRailConfig(FakeConfig):
+    def get_name(self):
+        return 'stepper_tilt'
+
+class TestEndstoplessRail(unittest.TestCase):
+    def _rail(self, values):
+        config = FakeRailConfig(FakeRailPrinter(), values)
+        return stepper.GenericPrinterRail(config, infer_homing_dir=False,
+                                          need_endstop=False)
+    def test_the_range_is_a_soft_limit_with_no_endstop(self):
+        rail = self._rail({'position_min': -45., 'position_max': 100.,
+                           'homing_speed': 30.})
+        rail.add_stepper(FakeRailStepper('stepper_tilt'))
+        self.assertEqual(rail.get_endstops(), [])
+        self.assertEqual(rail.get_range(), (-45., 100.))
+        hi = rail.get_homing_info()
+        self.assertIsNone(hi.position_endstop)
+        self.assertIsNone(hi.positive_dir)
+        self.assertEqual(hi.speed, 30.)
+    def test_endstop_options_without_an_endstop_are_refused(self):
+        for option in ('position_endstop', 'homing_positive_dir'):
+            with self.assertRaises(ConfigError) as cm:
+                self._rail({'position_min': -45., 'position_max': 100.,
+                            option: 1})
+            self.assertIn(option, str(cm.exception))
+            self.assertIn("endstop_pin", str(cm.exception))
+
+class FakeMeasuringSource:
+    def __init__(self, angle=0., error=None):
+        self.angle, self.error = angle, error
+    def home_axis(self, axis):
+        axis.set_measured_position(self.angle)
+        if self.error:
+            raise ConfigError(self.error)
+        axis.move_axis(0.)
+
+class TestRotaryAxisMeasuredHome(unittest.TestCase):
+    def setUp(self):
+        FakeHomingState.calls = []
+        self.saved = homing_module.Homing
+        homing_module.Homing = FakeHomingState
+    def tearDown(self):
+        homing_module.Homing = self.saved
+    def _axis(self, source=None):
+        printer = FakePrinter()
+        toolhead = FakeHomingToolhead()
+        printer.add_object('toolhead', toolhead)
+        ra = rotary_axis.BaseRotaryAxis()
+        ra.printer, ra.gcode_id = printer, 'B'
+        ra.rail = FakeRail(None, None)
+        ra.pos_min, ra.pos_max = -45., 100.
+        ra.has_endstop = False
+        ra.can_home, ra.is_homed = True, False
+        ra.commanded_pos = 0.
+        ra.homing_source = None
+        toolhead.extra_axes = [FakeExtruder(), None, ra]
+        if source is not None:
+            ra.set_homing_source(source)
+        return ra, toolhead
+    def test_no_endstop_and_no_source_is_an_error(self):
+        ra, _ = self._axis()
+        with self.assertRaises(ConfigError) as cm:
+            ra.home()
+        self.assertIn("[accel_b_homing]", str(cm.exception))
+        self.assertIn("SET_ROTARY_AXIS AXIS=B SET_POSITION",
+                      str(cm.exception))
+        self.assertFalse(ra.is_homed)
+    def test_the_source_homes_the_axis_without_a_sweep(self):
+        ra, toolhead = self._axis(FakeMeasuringSource(angle=30.))
+        ra.home()
+        self.assertEqual(FakeHomingState.calls, [])
+        self.assertTrue(ra.is_homed)
+        self.assertEqual(toolhead.position[ra.get_position_index()], 0.)
+        self.assertEqual(ra.commanded_pos, 0.)
+    def test_registering_a_source_makes_the_axis_unhomed(self):
+        ra, _ = self._axis()
+        ra.can_home, ra.is_homed = False, True
+        ra.set_homing_source(FakeMeasuringSource())
+        self.assertTrue(ra.can_home)
+        self.assertFalse(ra.is_homed)
+    def test_a_failed_measured_home_leaves_b_unhomed(self):
+        ra, _ = self._axis(FakeMeasuringSource(angle=30., error="reversed"))
         with self.assertRaises(ConfigError):
             ra.home()
         self.assertFalse(ra.is_homed)

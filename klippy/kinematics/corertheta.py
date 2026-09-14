@@ -18,7 +18,9 @@
 #                   in, which is why the rail is named for the radius
 #                   rather than for x.
 #   [stepper_tilt]  second gantry motor.  Carries the B (tool rotation)
-#                   endstop and position_min/position_max, in degrees.
+#                   position_min/position_max, in degrees.  B normally
+#                   has no endstop: those are soft limits, and G28 B
+#                   measures the head with [accel_b_homing] instead.
 #   [stepper_z]     leadscrew raising the gantry.
 #
 # As on polar.py the g-code words stay cartesian: x/y are resolved into
@@ -84,19 +86,23 @@ class CoreRThetaKinematics:
         stepper_bed = stepper.PrinterStepper(config.getsection('stepper_c'),
                                              units_in_radians=True)
         rail_r = stepper.LookupMultiRail(config.getsection('stepper_r'))
-        # B's endstop is not guessed from where it sits in the range: with
-        # homing_positive_dir unset, G28 B measures the head against
-        # gravity and homes toward the endstop from there - see
-        # rotary_axis.BaseRotaryAxis.home() and [accel_b_homing]
+        # B has no endstop by default.  G28 B measures the head against
+        # gravity and drives it to B=0, so position_min/position_max are
+        # only soft limits - see rotary_axis.BaseRotaryAxis.home() and
+        # [accel_b_homing].  An endstop_pin is still accepted, and its
+        # homing direction is not guessed from where it sits in the range:
+        # with homing_positive_dir unset, the IMU picks it at G28 B.
         rail_b = stepper.LookupMultiRail(config.getsection('stepper_tilt'),
-                                         infer_homing_dir=False)
+                                         infer_homing_dir=False,
+                                         need_endstop=False)
         rail_z = stepper.LookupMultiRail(config.getsection('stepper_z'))
         # Either gantry motor moves both R and B, so each axis' endstop
         # has to watch both of them
         for s in rail_b.get_steppers():
             rail_r.get_endstops()[0][0].add_stepper(s)
-        for s in rail_r.get_steppers():
-            rail_b.get_endstops()[0][0].add_stepper(s)
+        if rail_b.get_endstops():
+            for s in rail_r.get_steppers():
+                rail_b.get_endstops()[0][0].add_stepper(s)
         stepper_bed.setup_itersolve('corertheta_stepper_alloc', b'c',
                                     self.b_coeff)
         rail_r.setup_itersolve('corertheta_stepper_alloc', b'-', self.b_coeff)
@@ -125,9 +131,16 @@ class CoreRThetaKinematics:
         self.axes_max = toolhead.Coord((max_r, max_r, max_z))
     def get_steppers(self):
         return list(self.steppers)
+    def get_axis_drive_steppers(self, axis_name):
+        # Every motor that turns B.  Both gantry motors hold the head
+        # through the differential, so both are energised before B is
+        # measured - see [accel_b_homing].
+        if axis_name == 'b':
+            return self.rail_b.get_steppers() + self.rail_r.get_steppers()
+        return None
     def get_axis_rail(self, axis_name):
-        # Called by rotary_axis.CoupledRotaryAxis to find the range and
-        # endstop of the B axis, which has no stepper of its own.  'r' is
+        # Called by rotary_axis.CoupledRotaryAxis to find the range (and
+        # any endstop) of the B axis, which has no stepper of its own.  'r' is
         # answered too, so a macro or a diagnostic can reach the radial
         # rail by the name the machine uses for it.
         if axis_name == 'b':

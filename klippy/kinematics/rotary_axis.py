@@ -84,9 +84,10 @@ class DummyRotaryAxis:
 class BaseRotaryAxis:
     def _register(self):
         self.commanded_pos = 0.
-        # Picks the homing direction when the rail has no
-        # homing_positive_dir - see set_homing_direction_source()
-        self.homing_direction_source = None
+        # Homes an axis that has no endstop, and picks the direction of
+        # one that has an endstop but no homing_positive_dir - see
+        # set_homing_source()
+        self.homing_source = None
         gcode = self.printer.lookup_object('gcode')
         gcode.register_mux_command('SET_ROTARY_AXIS', 'AXIS',
                                    self.gcode_id, self.cmd_SET_ROTARY_AXIS,
@@ -169,17 +170,47 @@ class BaseRotaryAxis:
         pos[self.get_position_index()] = newpos
         toolhead.set_position(pos)
         self.commanded_pos = newpos
-    def set_homing_direction_source(self, source):
-        # A rail built with infer_homing_dir=False and no
-        # homing_positive_dir has no direction until it homes.  The
-        # source measures the axis before the home and returns
-        # (positive_dir, min_sweep); it checks the result afterwards with
-        # verify_home(position_endstop).  [accel_b_homing] is one.
-        self.homing_direction_source = source
+    def get_range(self):
+        return self.pos_min, self.pos_max
+    def get_drive_steppers(self):
+        # Every motor that has to be energised to hold this axis still
+        return list(self.steppers)
+    def set_homing_source(self, source):
+        # Something that can measure the axis - [accel_b_homing] is one.
+        # It does two jobs, depending on the rail:
+        #
+        #   no endstop    the source *is* the home: home_axis(axis) measures
+        #                 the axis, books the measurement as its position
+        #                 and drives it to zero.  This is the default for
+        #                 the corertheta B axis, whose position_min and
+        #                 position_max are then only soft limits.
+        #   an endstop    with homing_positive_dir unset, the source picks
+        #   and no        the direction: choose_homing_direction() returns
+        #   direction     (positive_dir, min_sweep) before the sweep, and
+        #                 verify_home(position_endstop) checks it after.
+        self.homing_source = source
+        if not self.has_endstop:
+            self.can_home = True
+            self.is_homed = False
+    def set_measured_position(self, angle):
+        # Called by a homing source that has just measured the axis
+        self.set_position(angle)
+        self.is_homed = True
+    def move_axis(self, angle, speed=None):
+        # A move of this axis alone, for a homing source to drive it with
+        toolhead = self.printer.lookup_object('toolhead')
+        if speed is None:
+            speed = self.rail.get_homing_info().speed
+        pos = toolhead.get_position()
+        pos[self.get_position_index()] = angle
+        toolhead.move(pos, speed)
+        toolhead.wait_moves()
+        self.commanded_pos = toolhead.get_position()[
+            self.get_position_index()]
     def _homing_direction(self, hi):
         if hi.positive_dir is not None:
             return hi.positive_dir, 0., None
-        source = self.homing_direction_source
+        source = self.homing_source
         if source is None:
             raise self.printer.command_error(
                 "Rotary axis %s has no homing_positive_dir and nothing to"
@@ -189,19 +220,37 @@ class BaseRotaryAxis:
         positive_dir, min_sweep = source.choose_homing_direction(
             hi.position_endstop, self.pos_min, self.pos_max)
         return positive_dir, min_sweep, source
+    def _home_by_measurement(self):
+        source = self.homing_source
+        if source is None:
+            raise self.printer.command_error(
+                "Rotary axis %s has no endstop and nothing to measure it"
+                " with - configure [accel_b_homing], or set the position by"
+                " hand with SET_ROTARY_AXIS AXIS=%s SET_POSITION=<angle>"
+                % (self.gcode_id, self.gcode_id))
+        try:
+            source.home_axis(self)
+        except Exception:
+            self.is_homed = False
+            raise
+        toolhead = self.printer.lookup_object('toolhead')
+        self.commanded_pos = toolhead.get_position()[self.get_position_index()]
     def home(self):
-        # The axis is part of the main kinematic space, so homing is an
-        # ordinary toolhead homing move along this axis - no private drip
-        # move is involved.
         if not self.can_home:
             raise self.printer.command_error(
                 "Rotary axis %s has no endstop - cannot home"
                 % (self.gcode_id,))
+        self.is_homed = False
+        if not self.has_endstop:
+            self._home_by_measurement()
+            return
+        # With an endstop the axis is part of the main kinematic space, so
+        # homing is an ordinary toolhead homing move along this axis - no
+        # private drip move is involved.
         from extras import homing
         toolhead = self.printer.lookup_object('toolhead')
         pos_index = self.get_position_index()
         hi = self.rail.get_homing_info()
-        self.is_homed = False
         positive_dir, min_sweep, source = self._homing_direction(hi)
         homepos = [None] * len(toolhead.get_position())
         homepos[pos_index] = hi.position_endstop
@@ -244,7 +293,7 @@ class BaseRotaryAxis:
         if enable is not None:
             stepper_enable = self.printer.lookup_object('stepper_enable')
             stepper_enable.set_motors_enable(
-                [s.get_name() for s in self.steppers], enable)
+                [s.get_name() for s in self.get_drive_steppers()], enable)
         setpos = gcmd.get_float('SET_POSITION', None)
         if setpos is not None:
             self.set_position(setpos)
@@ -272,7 +321,8 @@ class RotaryAxis(BaseRotaryAxis):
             'instantaneous_corner_velocity', None, above=0.)
         # Setup stepper(s).  An endstop_pin turns this into a homeable
         # rail, which then also requires position_min/position_max.
-        self.can_home = config.get('endstop_pin', None) is not None
+        self.has_endstop = config.get('endstop_pin', None) is not None
+        self.can_home = self.has_endstop
         if self.can_home:
             self.rail = stepper.LookupMultiRail(config)
             self.pos_min, self.pos_max = self.rail.get_range()
@@ -319,10 +369,21 @@ class CoupledRotaryAxis(BaseRotaryAxis):
                 " section or a carriage on axis '%s' in the printer"
                 " kinematics" % (axis_letter, axis_letter, axis_letter))
         self.steppers = self.rail.get_steppers()
+        # The rail's own steppers are not necessarily all the motors that
+        # turn the axis - on corertheta both gantry motors do
+        get_drive = getattr(kin, 'get_axis_drive_steppers', None)
+        drive = get_drive(axis_letter) if get_drive is not None else None
+        self.drive_steppers = drive or self.steppers
         self.pos_min, self.pos_max = self.rail.get_range()
-        self.can_home = bool(self.rail.get_endstops())
-        self.is_homed = not self.can_home
+        # A coupled axis always starts unhomed.  With no endstop it is
+        # homed by measuring it (set_homing_source()), or by hand with
+        # SET_ROTARY_AXIS SET_POSITION - never assumed to be anywhere.
+        self.has_endstop = bool(self.rail.get_endstops())
+        self.can_home = True
+        self.is_homed = False
         self._register()
+    def get_drive_steppers(self):
+        return list(self.drive_steppers)
 
 
 # Called from toolhead.add_printer_objects() once the toolhead exists

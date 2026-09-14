@@ -20,13 +20,18 @@
 > part of the phase two offset fit is done by the chip. See
 > [BMI160_IMU.md](BMI160_IMU.md).
 
-**Status: phase one is implemented** - `[accel_b_homing]` and the
-`B_MEASURE` command (`klippy/extras/accel_b_homing.py`). Phases two to
-five below are still design. One piece of homing has landed ahead of
-them: with `homing_positive_dir` unset in `[stepper_tilt]`, `G28 B`
-measures the head to pick which way to sweep into the endstop, and
-measures it again afterwards to confirm it arrived (see `[accel_b_homing]`
-in Config_Reference.md).
+**Status: phases one and four are implemented** - `[accel_b_homing]`,
+the `B_MEASURE` command, and homing (`klippy/extras/accel_b_homing.py`).
+**B has no endstop by default.** `G28 B` measures the head, books the
+measurement as B and turns it to B = 0, measuring and correcting until
+it is there; `[stepper_tilt]`'s `position_min` and `position_max` are soft
+limits that keep the filament tube from kinking, not physical stops. See
+[Algorithm: homing](#algorithm-homing) and `[accel_b_homing]` in
+Config_Reference.md. Phases two, three and five are still design, so the
+zero the head homes to is the sensor's uncalibrated one (after
+`BMI160_CALIBRATE`, a hardware-trimmed one). A `[stepper_tilt]` that does
+have an `endstop_pin` still sweeps into it, with the measurement picking
+the direction and confirming the result.
 
 This document describes how an ADXL345 mounted on the tilting head can
 
@@ -44,12 +49,14 @@ single module.
 
 B on the corertheta machine is the awkward axis:
 
-* It homes on a **TMC StallGuard virtual endstop** shared with the R
-  gantry pair. A home issued too soon after another move triggers
-  instantly, the axis does not move, no error is raised, and B is still
-  reported homed - see the `HOME_B` macro's `G4 P2000` in
-  `config/example-corertheta.cfg`. A silent wrong home on B is expensive:
-  `[rtcp]` turns every B error into an X/Z error at the nozzle.
+* It has **no physical endstop** worth the name. It used to home on a
+  TMC StallGuard virtual endstop shared with the R gantry pair, where a
+  home issued too soon after another move triggered instantly, the axis
+  did not move, no error was raised, and B was still reported homed. Its
+  range ends are not hard stops either - they are where the filament
+  tube starts to kink - so there is nothing it should ever be driven
+  into. A silent wrong home on B is expensive: `[rtcp]` turns every B
+  error into an X/Z error at the nozzle.
 * Its zero is a *physical* claim - "the nozzle points straight down" -
   that a switch or a stall threshold only approximates. `[rtcp]` and
   `[bltouch] b_offset` are both built on that claim.
@@ -61,8 +68,8 @@ B on the corertheta machine is the awkward axis:
 An accelerometer at rest reads the gravity vector. A gravity vector in
 the head's own frame *is* the head's tilt, absolutely, with no reference
 to where the axis has travelled. That makes homing an observation rather
-than a move, gives an independent check on the stall home, and turns the
-drive ratio into something measurable.
+than a sweep into a stop, and turns the drive ratio into something
+measurable.
 
 ## Hardware
 
@@ -216,7 +223,9 @@ repeatability.
 ## Where the code lives
 
     klippy/extras/accel_b_homing.py          new - the whole feature
-    klippy/kinematics/rotary_axis.py         small hook: home override
+    klippy/kinematics/rotary_axis.py         small hook: homing source
+    klippy/kinematics/corertheta.py          B rail without an endstop
+    klippy/stepper.py                        need_endstop=False rails
     config/example-corertheta.cfg            new section, HOME_B rewrite
     docs/Config_Reference.md                 new section
     docs/Multi_Axis.md                       cross-reference
@@ -241,23 +250,35 @@ The module splits into three layers, deliberately:
 ### The hook into `G28 B`
 
 `PrinterHoming.cmd_G28` already ends with `for ea in extra_axes:
-ea.home()`, so the cleanest integration is a one-method override point on
-`BaseRotaryAxis`:
+ea.home()`, so the integration is a registration point on
+`BaseRotaryAxis`, as implemented:
 
 ```python
 # rotary_axis.py
-def set_home_override(self, cb):      # called by accel_b_homing at connect
-    self.home_override = cb
+def set_homing_source(self, source):  # called by accel_b_homing at connect
+    self.homing_source = source
+    if not self.has_endstop:          # the source becomes the home
+        self.can_home, self.is_homed = True, False
 def home(self):
-    if self.home_override is not None:
-        return self.home_override()
-    ... existing endstop sweep ...
+    self.is_homed = False
+    if not self.has_endstop:
+        return self._home_by_measurement()   # -> source.home_axis(self)
+    ... endstop sweep, direction from the source if unset ...
 ```
 
-That is about ten lines of core change, no monkeypatching, and `G28 B`,
-`M400`, the homed-state bookkeeping and the error path all keep working
-unchanged. `B_HOME` is registered as well, so the routine is reachable
-without going through `G28`.
+The source drives the axis through three small methods on it -
+`get_range()`, `set_measured_position(angle)` (set B and mark it homed)
+and `move_axis(angle)` - plus `get_drive_steppers()`, which on corertheta
+is both gantry motors. No monkeypatching, and `G28 B`, `M400`, the
+homed-state bookkeeping and the error path (`cmd_G28` turns the motors
+off and B is left unhomed) all keep working unchanged.
+
+The rail itself is built with `need_endstop=False`: an `[stepper_tilt]`
+with no `endstop_pin` gets a range and a `homing_speed` but no endstop,
+and refuses `position_endstop` and the other endstop-only options rather
+than ignoring them. A coupled axis always starts unhomed, so without
+`[accel_b_homing]` B can only be placed with `SET_ROTARY_AXIS AXIS=B
+SET_POSITION=`.
 
 ## Config surface
 
@@ -276,6 +297,17 @@ positive_vector: +x           # sensor axis reading +1 g at B = +90
 #check_tolerance: 5.0         # deg; default for B_MEASURE CHECK=1
 ```
 
+Phase four, as implemented:
+
+```ini
+#zero_tolerance: 0.25         # deg; G28 B stops correcting within this
+#max_homing_moves: 5          # moves toward B = 0 before giving up
+#direction_check_move: 5.0    # deg; longest move before the head is seen
+                              #   to follow the motors
+#homing_tolerance: 5.0        # deg; endstop rails only
+#verify_home: True            # endstop rails only
+```
+
 Only the two vectors are required. The two gates are in mm/s^2, the units
 the chips report, and both are disabled by setting them to zero.
 
@@ -286,7 +318,13 @@ accelerating or a chip that is not reporting properly, not to grade the
 sensor. `check_tolerance` is loose for the same reason - see *What phase
 one does not do* below.
 
-Phases two to five add:
+There is no `home_method` option. Which home runs follows from the rail:
+no `endstop_pin` in `[stepper_tilt]` (the default) is the measured home,
+and an `endstop_pin` is the endstop sweep. The `endstop_then_accel` mode
+the design once proposed is what an endstop rail with `verify_home`
+already does.
+
+Phases two, three and five add:
 
 ```ini
 # --- sensor calibration (written by B_SENSOR_CALIBRATE / SAVE_CONFIG) ---
@@ -295,13 +333,6 @@ offset_u: 0.0                 # zero-g offset, mm/s^2
 offset_w: 0.0
 gain_ratio: 1.0               # amplitude(w) / amplitude(u)
 level_offset: 0.0             # frame tilt vs gravity, deg (usually 0)
-
-# --- homing ---
-home_method: accelerometer    # accelerometer | endstop | endstop_then_accel
-home_tolerance: 0.10          # deg; refine loop convergence
-max_home_iterations: 3
-verify_move: 5.0              # deg; 0 disables the liveness check
-endstop_agreement: 3.0        # deg; endstop_then_accel disagreement limit
 
 # --- safety ---
 min_safe_z: 40.0              # refuse to swing B below this Z
@@ -333,7 +364,7 @@ silently did not move is tens of degrees out, not tenths.
 | --- | --- |
 | `B_MEASURE [SETTLE=] [SAMPLE_TIME=]` | *(implemented)* Report measured B, the raw vector, the in-plane and out-of-plane components, the noise stats, and the error against commanded B. Read-only, safe any time the head is still. |
 | `B_MEASURE CHECK=1 [TOLERANCE=]` | *(implemented)* As above, but raise an error if measured and commanded B disagree. For `PRINT_START` and layer macros - it catches belt slip and a silently failed home. Requires B homed, since an unhomed B has no commanded angle to compare against. |
-| `B_HOME` | Set B from the measurement (also what `G28 B` calls). |
+| `G28 B` | *(implemented)* Measure B, set it, and turn the head to B = 0 - see [Algorithm: homing](#algorithm-homing). |
 | `B_SET_ZERO` | Declare the current physical pose to be B = 0. Run it with the head referenced mechanically - square against the bed, or with the probe pin hanging vertical. |
 | `B_SENSOR_CALIBRATE [START=] [END=] [STEPS=]` | Sweep the arc, fit offsets and gain, report conditioning. |
 | `B_STEP_CALIBRATE [START=] [END=] [STEPS=] [RETURN=1]` | The drive ratio routine. `RETURN=1` sweeps back to measure backlash. |
@@ -384,40 +415,64 @@ Three details that matter:
 
 ## Algorithm: homing
 
+This is the default, and the only home on a `[stepper_tilt]` without an
+endstop. As implemented (`AccelBHoming.home_axis()`):
+
 ```
-B_HOME
-  1. refuse unless the transforms are off (the same check G28 already runs)
-  2. ensure the B motors are energised - a head that can droop unpowered
-     must be held before it is measured
-  3. optional liveness check (verify_move != 0):
-       measure -> B0 ; move B by +verify_move ; measure -> B1
-       require |(B1 - B0) - verify_move| < 2 deg, else raise
-       "the accelerometer is not responding to B motion"
-  4. measure -> B_meas
-  5. range check against the axis pos_min / pos_max
-  6. axis.set_position(B_meas); is_homed = True
-  7. optional refinement (home_tolerance > 0):
-       repeat up to max_home_iterations:
-         move to B = 0; measure; if |B| <= tolerance: done
-         else set_position(measured) and go again
+G28 B
+  1. refuse unless the transforms are off (PrinterHoming's own check)
+  2. energise both gantry motors - a head that can droop unpowered must
+     be held before it is measured
+  3. measure -> B ; set_measured_position(B)      (B is now homed)
+     report it, and say so if it is outside the soft limits
+  4. while |B| > zero_tolerance:
+       if max_homing_moves moves have been made: raise "not converging"
+       until the direction is confirmed:
+           target = B moved toward 0 by at most direction_check_move,
+                    clamped into [position_min, position_max]
+       afterwards:
+           target = 0
+       move to target ; measure -> B'
+       first move of at least 1 deg: check (B' - B) / (target - B)
+           <= -0.5      raise: positive_vector vs the motors
+           < 0.5        raise: the head is not following the motors
+           > 2          raise: b_coupling_ratio
+           otherwise    direction confirmed
+       B = B' ; set_measured_position(B)
+  5. move to a commanded B = 0
 ```
 
-Step 7 is what makes homing tolerant of a wrong `b_coupling_ratio`:
-setting the position is exact regardless of the ratio, and the refine
-loop closes the gap between "where I said to go" and "where I ended up".
-Two iterations converge for any ratio error under ~10 %. It is also a
-diagnostic - if the loop does not converge, the ratio is badly wrong, and
-the message should say so and point at `B_STEP_CALIBRATE`.
+Setting the position from the measurement is exact whatever the ratio,
+so step 4 is what makes homing tolerant of a wrong `b_coupling_ratio`:
+the loop closes the gap between "where I said to go" and "where I ended
+up". A 10 % ratio error converges to 0.25 degrees from 60 degrees out in
+three moves after the check move. It is also a diagnostic - if the loop
+does not converge, the ratio is badly wrong, and the message says so.
 
-**`home_method: endstop_then_accel`** runs the existing stall-detect home
-first and then measures. If the measurement disagrees with
-`position_endstop` by more than `endstop_agreement`, the endstop home is
-declared failed - which is precisely the silent-no-op failure mode the
-StallGuard pair has today. This is the recommended mode while the sensor
-is being trusted, because it keeps the mechanical hard reference and adds
-detection of the known bug. `accelerometer` mode, once trusted, is
-strictly better: no swing, no stall threshold, no `G4 P2000`, and an
-absolute rather than a relative zero.
+The capped first move is the safety half. Until the head has been seen
+to follow the motors, "toward zero" is an assumption: with
+`positive_vector` or `invert_b_direction` wrong, a straight move to zero
+from B = 80 would drive the head to 160, well past the soft limit and
+into a kinked filament tube. Capping the first move bounds that mistake
+to `direction_check_move` degrees and turns it into an error. Soft limits
+are enforced on the commanded angle only, which is why a head measured
+beyond one has its first move end *on* the limit - that move is then
+longer than the cap, and is still checked.
+
+Nothing here needs a dwell, a stall threshold or a sweep, and the zero is
+absolute rather than relative to a switch. Its accuracy is the sensor's:
+until phase two lands, B = 0 is as vertical as `zero_vector`, the
+mounting and `BMI160_CALIBRATE` make it.
+
+### With an endstop
+
+A `[stepper_tilt]` with an `endstop_pin` sweeps into it, and the
+measurement steers the sweep instead: with `homing_positive_dir` unset,
+the head is measured to pick the direction, and measured again after the
+home. If it is not within `homing_tolerance` of `position_endstop` - the
+silent no-op a StallGuard endstop produces when homed too soon after
+another move - B is left unhomed. This is what the design called
+`home_method: endstop_then_accel`.
 
 ## Algorithm: sensor calibration
 
@@ -607,6 +662,14 @@ of up to 145 degrees. Every routine that moves B:
 
 `B_MEASURE` moves nothing and needs none of this.
 
+`G28 B` does not meet the first point: it runs before Z is homed, so it
+cannot lift, and the head has to clear the bed at every angle between
+where it rests and B = 0 - the same condition the `HOME_Z` macro already
+places on `RTCP_PROBE_ORIENT`. It meets the second through the soft
+limits and the capped first move, and the third by finishing on a
+commanded B = 0; on the error path the motors are turned off and B is
+left unhomed.
+
 ## Failure modes and what the user should see
 
 | Symptom | Message should say |
@@ -617,22 +680,26 @@ of up to 145 degrees. Every routine that moves B:
 | Magnitude far from 1 g | the head is moving, or the chip is misconfigured |
 | `v` varies across the sweep | `zero_vector`/`positive_vector` are wrong - here is the pair that did vary |
 | In-plane radius well below 1 g | the B axis is not in the fitted plane - remount or re-run the sweep |
-| Refine loop will not converge | `b_coupling_ratio` is wrong - run `B_STEP_CALIBRATE` |
-| Endstop and sensor disagree | the stall home did not move the axis (the known `G4 P2000` failure) |
+| Refine loop will not converge | *(implemented)* `b_coupling_ratio` is wrong - check it (`B_STEP_CALIBRATE` once it exists) |
+| Head turned the wrong way on the check move | *(implemented)* `positive_vector` and the motors disagree about +B - check it, then `invert_b_direction` |
+| Head did not move on the check move | *(implemented)* the motors are not driving the head, or the sensor is not on the rotating part |
+| Head measured outside the soft limits | *(implemented)* reported, and the first move goes to the limit - check the filament tube |
+| Endstop and sensor disagree | *(implemented, endstop rails only)* the stall home did not move the axis (the known `G4 P2000` failure) |
 | Measured B drifts between prints | thermal offset drift; re-run `B_SET_ZERO` after heat soak |
 
 ## Testing
 
 The dev box cannot run klippy, so the test split follows the code split:
 
-* **Host, `test/multi_axis/test_accel_b_homing.py`** (32 tests, run it
-  with `python test/multi_axis/test_accel_b_homing.py`).  It drives the
+* **Host, `test/multi_axis/test_accel_b_homing.py`** (run it with
+  `python test/multi_axis/test_accel_b_homing.py`).  It drives the
   *real* module against a stubbed printer and a synthetic accelerometer,
-  following `test_rtcp_probe.py`, so the whole of phase one is covered on
+  following `test_rtcp_probe.py`, so phases one and four are covered on
   a host that cannot run klippy - config validation, the sample window
   and its settle offset, every rejection path, the angle at the reference
-  poses, noise averaging, and the `B_MEASURE` report and its
-  `b_projection`-aware comparison.
+  poses, noise averaging, the `B_MEASURE` report and its
+  `b_projection`-aware comparison, and `G28 B` against a simulated head
+  whose drive can be exact, short, reversed, stalled or wildly long.
   Later phases add the fits: synthesise `(u, w)` points with known
   offsets, gain mismatch and gaussian noise and assert the ellipse fit
   recovers them; assert the angle unwrap survives a sweep through
@@ -654,9 +721,10 @@ The dev box cannot run klippy, so the test split follows the code split:
      commanded to within the ratio error.
   6. `B_STEP_CALIBRATE`; compare the fitted ratio against the nominal
      1.0, and check the residual shape against the table above.
-  7. `home_method: endstop_then_accel` for a while, watching for the
-     disagreement error - it should fire on exactly the back-to-back
-     homes that fail today.
+  7. `G28 B` from several resting angles on both sides of zero, including
+     back-to-back: every one should report the head within
+     `zero_tolerance`, in a similar number of moves. Turn the head by
+     hand with the motors off between runs to vary the start.
 
 ## Implementation order
 
@@ -671,10 +739,12 @@ Each phase is independently useful and independently shippable.
 3. **Step calibration.** `B_STEP_CALIBRATE`, step counting, the residual
    report, the ratio write-back. Uses only phases 1-2 and the existing
    endstop home.
-4. **Homing.** The `rotary_axis` hook, `B_HOME`, `home_method`, the
-   refine loop, `endstop_then_accel`. Last, because it is the only phase
-   that changes existing behaviour, and because phases 1-3 are what make
-   it safe to trust.
+4. **Homing** - *done*, ahead of phases 2 and 3. The `rotary_axis` hook,
+   the endstop-less `[stepper_tilt]`, the capped check move and the
+   refine loop in `G28 B`, and measured direction and verification for a
+   rail that keeps an endstop. It landed early because the machine has no
+   real endstop to fall back on; until phase two it homes to the
+   sensor's own zero.
 5. **Guard rail.** `B_MEASURE CHECK=1` in `PRINT_START`, and optionally a
    periodic check between layers.
 

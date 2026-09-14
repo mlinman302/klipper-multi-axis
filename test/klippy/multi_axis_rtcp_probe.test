@@ -12,9 +12,10 @@ RTCP_PROBE_INFO
 SET_RTCP ENABLE=0
 
 # Home the arm and the tilt axis.  Z cannot be homed until the head has
-# been turned so the probe faces the bed.
+# been turned so the probe faces the bed.  B has no endstop and this
+# harness has no IMU to home it with, so its position is set by hand.
 G28 X
-G28 B
+SET_ROTARY_AXIS AXIS=B SET_POSITION=0
 
 # Turn the probe to the bed, then put it over the bed - after homing the
 # arm is parked at its outermost radius, well off it.  Home Z off centre:

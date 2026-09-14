@@ -10,10 +10,9 @@
 # where the axis has travelled since it was last homed.  That turns
 # measuring B into an observation rather than a move.
 #
-# This module is phase one of docs/Accel_B_Homing.md: the measurement
-# primitive and the B_MEASURE command that reports it.  Nothing here
-# moves the machine.  It does steer the endstop home: see "WHICH WAY TO
-# HOME" below.
+# This module is the measurement primitive of docs/Accel_B_Homing.md,
+# the B_MEASURE command that reports it, and the G28 B home built on it:
+# see "HOMING" below.  B_MEASURE never moves the machine.
 #
 # THE ZERO REFERENCE
 #
@@ -98,19 +97,27 @@
 # Both are skipped for chips with no gyroscope, so an [adxl345] keeps
 # working exactly as before.  See docs/BMI160_IMU.md.
 #
-# WHICH WAY TO HOME
+# HOMING
 #
-# The corertheta B rail does not guess its homing direction from where
-# position_endstop sits in the range (see stepper.py's infer_homing_dir).
-# With homing_positive_dir unset, G28 B asks this module instead: the
+# The corertheta B axis has no endstop by default.  Its position_min and
+# position_max are soft limits - there to keep the filament tube from
+# kinking, not physical stops - and G28 B asks this module to home it
+# (see home_axis()): energise the gantry motors, measure the head, book
+# the measurement as B, and drive it to B=0 (nozzle vertical), measuring
+# and correcting until it is within zero_tolerance.  The first move is
+# capped at direction_check_move and checked, so a positive_vector that
+# disagrees with the motors about which way is +B stops the home a few
+# degrees in instead of driving the head through a soft limit.
+#
+# A [stepper_tilt] with an endstop_pin still homes to it.  The rail does
+# not guess the direction from where position_endstop sits in the range
+# (see stepper.py's infer_homing_dir): with homing_positive_dir unset the
 # head is measured where it rests, and homes positive if that is below
 # position_endstop, negative if above.  Within homing_tolerance of the
 # endstop the measurement cannot tell the sides apart, so an endstop at
 # a range limit is homed toward that limit and one inside the range is
 # refused.  After the home the head is measured again, and a head that
-# is not at the endstop - a sensorless home that triggered instantly, or
-# a positive_vector that disagrees with the motors about which way is
-# +B - leaves B unhomed.
+# is not at the endstop leaves B unhomed.
 #
 # WHAT THIS PHASE DOES NOT DO
 #
@@ -154,6 +161,17 @@ MIN_FUSION_SPANS = 3.
 # angle now", so they agree when the gyroscope is wired up correctly and
 # diverge when it is not - see the disagreement check in measure().
 FUSION_TAIL_FRACTION = .2
+
+# Homing without an endstop.  A move shorter than this says nothing
+# reliable about which way the head went, so it neither confirms the
+# direction nor refuses it.
+MIN_DIRECTION_CHECK = 1.
+# How far the head's response to that first move may stray from what was
+# commanded before it is refused - measured / commanded outside these
+# bounds is not a b_coupling_ratio error, it is a head that is not
+# following the motors.
+MIN_RESPONSE_RATIO = .5
+MAX_RESPONSE_RATIO = 2.
 
 # Levi-Civita symbol, for the cross product in gyro_axis_coefficient()
 LEVI_CIVITA = {(0, 1, 2): 1., (1, 2, 0): 1., (2, 0, 1): 1.,
@@ -355,10 +373,23 @@ class AccelBHoming:
         # the header comment.
         self.check_tolerance = config.getfloat('check_tolerance', 5.,
                                                above=0.)
-        # Picking the B homing direction.  The tolerance is the band
-        # around position_endstop inside which the uncalibrated reading
-        # cannot say which side the head is on, the extra sweep past the
-        # measured distance, and the allowed error of the post-home check.
+        # Homing without an endstop (the default).  The head is driven to
+        # B=0 and re-measured until it is within zero_tolerance, using at
+        # most max_homing_moves moves.  The first of them is no longer
+        # than direction_check_move, because until the head has been seen
+        # to follow the motors a move toward zero might be a move away
+        # from it - toward a soft limit and a kinked filament tube.
+        self.zero_tolerance = config.getfloat('zero_tolerance', .25,
+                                              above=0.)
+        self.max_homing_moves = config.getint('max_homing_moves', 5,
+                                              minval=1)
+        self.direction_check_move = config.getfloat(
+            'direction_check_move', 5., minval=MIN_DIRECTION_CHECK)
+        # Homing to an endstop, when [stepper_tilt] has one.  The
+        # tolerance is the band around position_endstop inside which the
+        # uncalibrated reading cannot say which side the head is on, the
+        # extra sweep past the measured distance, and the allowed error of
+        # the post-home check.
         self.homing_tolerance = config.getfloat('homing_tolerance', 5.,
                                                 above=0.)
         self.verify_home_enabled = config.getboolean('verify_home', True)
@@ -405,7 +436,7 @@ class AccelBHoming:
             raise self.printer.config_error(
                 "[%s] the printer has no B axis - add 'b' to the"
                 " 'additional_axes' option of [printer]" % (self.name,))
-        set_source = getattr(self.b_axis, 'set_homing_direction_source', None)
+        set_source = getattr(self.b_axis, 'set_homing_source', None)
         if set_source is not None:
             set_source(self)
 
@@ -580,11 +611,98 @@ class AccelBHoming:
         return reading
 
     ######################################################################
-    # Homing direction (called by rotary_axis.BaseRotaryAxis.home)
+    # Homing without an endstop (called by rotary_axis.BaseRotaryAxis.home)
     ######################################################################
     def _respond(self, msg):
         logging.info(msg)
         self.printer.lookup_object('gcode').respond_info(msg)
+    def _energise(self, axis):
+        # A head left limp would be measured where it droops and then
+        # jump when the motors took hold, so hold it before measuring.
+        # The settle dwell of the measurement covers the jump.
+        stepper_enable = self.printer.lookup_object('stepper_enable', None)
+        if stepper_enable is None:
+            return
+        stepper_enable.set_motors_enable(
+            [s.get_name() for s in axis.get_drive_steppers()], True)
+    def _check_response(self, before, after, commanded):
+        moved = wrap180(after - before)
+        ratio = moved / commanded
+        if MIN_RESPONSE_RATIO <= ratio <= MAX_RESPONSE_RATIO:
+            return
+        if ratio <= -MIN_RESPONSE_RATIO:
+            hint = ("positive_vector and the motors disagree about which way"
+                    " is +B - check positive_vector, then invert_b_direction"
+                    " in [printer]")
+        elif ratio > MAX_RESPONSE_RATIO:
+            hint = ("the head turned much further than commanded - check"
+                    " b_coupling_ratio in [printer]")
+        else:
+            hint = ("the head is not following the motors - check that they"
+                    " are driving it, and that the sensor is on the rotating"
+                    " part of the head")
+        raise self.printer.command_error(
+            "%s: B was commanded to turn %+.2f deg and the head turned %+.2f"
+            " (from %.2f to %.2f), so homing stopped before driving it any"
+            " further: %s" % (self.name, commanded, moved, before, after,
+                              hint))
+    def home_axis(self, axis):
+        # Measure the head, book the measurement as B, and drive to B=0.
+        # A wrong b_coupling_ratio lands the move short or long, so
+        # measure again and repeat until the head is within
+        # zero_tolerance.  The first move is capped at
+        # direction_check_move and its result checked, so a head that
+        # turns the wrong way is caught a few degrees in rather than
+        # after it has been driven through a soft limit.
+        self._energise(axis)
+        pos_min, pos_max = axis.get_range()
+        angle = self.measure().angle
+        axis.set_measured_position(angle)
+        note = ""
+        if angle < pos_min or angle > pos_max:
+            note = (" - outside the soft limits of %.2f to %.2f, so check the"
+                    " filament tube" % (pos_min, pos_max))
+        self._respond("%s: head at B = %.2f deg, homing to B = 0%s"
+                      % (self.name, angle, note))
+        confirmed = False
+        moves = 0
+        while abs(angle) > self.zero_tolerance:
+            if moves >= self.max_homing_moves:
+                raise self.printer.command_error(
+                    "%s: the head is still at B = %.2f deg after %d moves"
+                    " toward B = 0 (tolerance %.2f) - the moves are not"
+                    " converging, so check b_coupling_ratio in [printer],"
+                    " or raise zero_tolerance if the head is settling"
+                    " somewhere slightly different each time"
+                    % (self.name, angle, moves, self.zero_tolerance))
+            if confirmed:
+                target = 0.
+            else:
+                step = min(abs(angle), self.direction_check_move)
+                target = angle - math.copysign(step, angle)
+                # A head measured beyond a soft limit cannot be commanded
+                # to stay beyond it, so its first move goes to that limit
+                target = min(max(target, pos_min), pos_max)
+            axis.move_axis(target)
+            moves += 1
+            new_angle = self.measure().angle
+            commanded = target - angle
+            if not confirmed and abs(commanded) >= MIN_DIRECTION_CHECK:
+                self._check_response(angle, new_angle, commanded)
+                confirmed = True
+            angle = new_angle
+            axis.set_measured_position(angle)
+        # B now reads the measured angle, within zero_tolerance of zero.
+        # Finish on a commanded zero, so the transforms switched on after
+        # homing see the nozzle vertical.
+        if angle:
+            axis.move_axis(0.)
+        self._respond("%s: B homed, head measured at %.2f deg after %d"
+                      " moves" % (self.name, angle, moves))
+
+    ######################################################################
+    # Homing to an endstop (called by rotary_axis.BaseRotaryAxis.home)
+    ######################################################################
     def choose_homing_direction(self, position_endstop, position_min,
                                 position_max):
         reading = self.measure()

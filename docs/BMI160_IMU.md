@@ -635,10 +635,11 @@ answer "was this a static tilt?", which is a different question from
 
 `B_GYRO_CALIBRATE` - job 3 above - remains new work: start the stream,
 run a commanded B move, integrate the on-axis rate across it, report
-swept angle against commanded angle. It moves the machine, which nothing
-in `[accel_b_homing]` does today, so it arrives with the usual
-homing-state and interlock questions. It is also what finally verifies
-the gyroscope's sign, per the limits noted above.
+swept angle against commanded angle. Of `[accel_b_homing]` today only
+`G28 B` moves the machine, and it measures a parked head before and after
+each move, so it checks the accelerometer's sense of rotation but not the
+gyroscope's. It is `B_GYRO_CALIBRATE` that finally verifies the
+gyroscope's sign, per the limits noted above.
 
 ## The Z homing path
 

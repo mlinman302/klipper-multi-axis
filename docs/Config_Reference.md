@@ -661,13 +661,20 @@ gear_ratio:
 [stepper_r]
 
 # The stepper_tilt section describes the second gantry motor. It carries
-# the endstop and position_min/position_max of the B axis, in degrees.
-# Its rotation_distance is in gantry travel, as for stepper_r, since a
-# gantry motor position is a mix of the B rotation and the arm radius.
-# Unlike every other rail, homing_positive_dir is not inferred from where
-# position_endstop sits in the range. Either set it, or leave it unset and
-# configure [accel_b_homing], which measures the head before G28 B and
-# homes toward the endstop from there.
+# position_min/position_max of the B axis, in degrees. Its
+# rotation_distance is in gantry travel, as for stepper_r, since a gantry
+# motor position is a mix of the B rotation and the arm radius.
+# B normally has no endstop_pin: G28 B measures the head against gravity
+# with [accel_b_homing] and turns it to B=0, so position_min and
+# position_max are soft limits only, and homing_speed is the speed that
+# turn runs at. Without [accel_b_homing], B starts unhomed and its
+# position can only be set by hand with SET_ROTARY_AXIS AXIS=B
+# SET_POSITION=<angle>.
+# An endstop_pin and position_endstop may still be given, in which case
+# G28 B sweeps into the endstop. Unlike every other rail its
+# homing_positive_dir is then not inferred from where position_endstop
+# sits in the range: either set it, or leave it unset and let
+# [accel_b_homing] measure which side of the endstop the head is on.
 [stepper_tilt]
 
 # The stepper_z section is used to describe the leadscrew stepper
@@ -2691,9 +2698,10 @@ carriages stay where they are.
 
 Homing runs in the carriage frame, so `G28` is refused with compensation
 on, whatever axis it names - run `SET_RTCP ENABLE=0` first. This is not
-bookkeeping: with it on a B home sweeps the head looking for its endstop,
-which the compensation turns into an unchecked X/Z move of up to the
-whole tool offset before either axis is homed, while a linear home books
+bookkeeping: with it on a B home turns the head to B=0 (or sweeps it
+into an endstop, where there is one), which the compensation turns into
+an unchecked X/Z move of up to the whole tool offset before either axis
+is homed, while a linear home books
 its result as a tool tip rather than a carriage position and so homes the
 axis to the wrong place without raising anything. The homing macros in
 [example-corertheta.cfg](../config/example-corertheta.cfg) each turn
@@ -2726,7 +2734,7 @@ two frames coincide and `B` reaches the machine unchanged.
 The scaling applies at **every** angle: the ratio at a given X/Y is the
 same at `B5` as at `B50`, with no threshold anywhere. It therefore also
 scales the machine angles that orientation commands use - the probe's
-`b_offset`, the `G28 B` park angle - so **homing, probing and
+`b_offset`, the angle `G28 B` measures - so **homing, probing and
 `RTCP_PROBE_ORIENT` are refused while the projection is on**, exactly as
 they are refused while RTCP is on. Run `SET_B_PROJECTION ENABLE=0` for
 them and `SET_B_PROJECTION ENABLE=1` to print; the macros in
@@ -2863,18 +2871,40 @@ accelerometer at rest reads the gravity vector, and a gravity vector in
 the head's own frame is the head's tilt - absolutely, with no reference
 to where the axis has travelled since it was homed.
 
-This is phase one of [Accel_B_Homing.md](Accel_B_Homing.md): it measures
-and reports, and it moves nothing itself. It does steer the endstop home
-of a corertheta B axis: `[stepper_tilt]` has no inferred
-`homing_positive_dir`, so when that option is unset `G28 B` measures the
-head first and homes positive if it is below `position_endstop`, negative
-if above. Within `homing_tolerance` of the endstop the side cannot be
-told apart; an endstop at a range limit is then homed toward that limit,
-and one inside the range is refused. The head is measured again after
-the home, and B is left unhomed if it is not at the endstop - which
-catches a sensorless home that triggered before the head moved, and a
-`positive_vector` that disagrees with the motors about which way is +B.
-Setting `homing_positive_dir` in `[stepper_tilt]` bypasses all of this.
+It is also how a corertheta B axis homes. `[stepper_tilt]` has no
+endstop by default, so `G28 B` is a measurement rather than a sweep:
+
+1. Both gantry motors are energised, so a head that droops unpowered is
+   held before it is measured.
+2. The head is measured, and the measured angle becomes B.
+3. B is turned toward 0 (nozzle vertical). The first move is no longer
+   than `direction_check_move`, and the head is measured after it: if it
+   turned the wrong way, or not at all, or much further than commanded,
+   the home stops there with an error naming the likely cause - rather
+   than driving the head on through a soft limit.
+4. B is turned to 0, measured, and the measurement booked as B again,
+   until the head measures within `zero_tolerance` of 0. A
+   `b_coupling_ratio` that is somewhat off only costs an extra move; one
+   that is badly off fails after `max_homing_moves`.
+5. B finishes on a commanded 0.
+
+`position_min` and `position_max` are then only soft limits - they keep
+the filament tube from kinking - and nothing physical is ever run into.
+A head measured outside them is reported, and its first move goes to the
+nearest limit. B=0 is only as vertical as the sensor's zero: see the
+accuracy note below, and run `BMI160_CALIBRATE` first.
+
+If `[stepper_tilt]` does have an `endstop_pin`, `G28 B` sweeps into it
+instead, and this section only steers that sweep: with
+`homing_positive_dir` unset the head is measured first and homes
+positive if it is below `position_endstop`, negative if above. Within
+`homing_tolerance` of the endstop the side cannot be told apart; an
+endstop at a range limit is then homed toward that limit, and one inside
+the range is refused. The head is measured again after the home, and B
+is left unhomed if it is not at the endstop - which catches a sensorless
+home that triggered before the head moved, and a `positive_vector` that
+disagrees with the motors about which way is +B. Setting
+`homing_positive_dir` in `[stepper_tilt]` bypasses the measurement.
 
 Which way is "B = 0" is declared with two signed sensor axes, restricted
 to the six axis-aligned directions. An accelerometer at rest reads the
@@ -3020,17 +3050,32 @@ positive_vector:
 #check_tolerance: 5.0
 #   Default TOLERANCE (in degrees) for B_MEASURE CHECK=1. The default is
 #   5.0 - loose, for the reasons above.
+#zero_tolerance: 0.25
+#   How close to B=0 (in degrees) the head must measure before G28 B
+#   stops correcting it. It is measured against the sensor's own zero,
+#   so it bounds repeatability, not how vertical the nozzle really is.
+#   The default is 0.25.
+#max_homing_moves: 5
+#   The most moves G28 B may make toward B=0, the capped first move
+#   included, before it gives up with an error. The default is 5.
+#direction_check_move: 5.0
+#   The longest first move (in degrees) G28 B makes toward B=0, before
+#   the head has been seen to follow the motors. The head is measured
+#   after it, and the home is refused if it turned the wrong way, less
+#   than half as far as commanded, or more than twice as far. Keep it
+#   no larger than the travel the filament tube can take beyond a soft
+#   limit. It must be at least 1.0. The default is 5.0.
 #homing_tolerance: 5.0
-#   Used when G28 B picks its own direction (see above), in degrees: the
-#   band around position_endstop inside which the head's side of the
-#   endstop is treated as unknown, the extra sweep beyond the measured
-#   distance to the endstop, and the error allowed by the check after
-#   the home. It must cover the sensor's uncalibrated error. The default
-#   is 5.0.
+#   Only for a [stepper_tilt] with an endstop_pin, when G28 B picks its
+#   own direction (see above), in degrees: the band around
+#   position_endstop inside which the head's side of the endstop is
+#   treated as unknown, the extra sweep beyond the measured distance to
+#   the endstop, and the error allowed by the check after the home. It
+#   must cover the sensor's uncalibrated error. The default is 5.0.
 #verify_home: True
-#   Whether to measure the head after G28 B and refuse the home if it is
-#   not within homing_tolerance of position_endstop. The default is
-#   True.
+#   Only for a [stepper_tilt] with an endstop_pin: whether to measure
+#   the head after G28 B and refuse the home if it is not within
+#   homing_tolerance of position_endstop. The default is True.
 ```
 
 `B_MEASURE [SETTLE=<s>] [SAMPLE_TIME=<s>] [FUSION=0|1] [CHECK=0|1]

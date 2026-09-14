@@ -654,9 +654,10 @@ that, and nothing should: it is measured.
 Homing has to, on two counts, and neither of them announces itself:
 
 * **A B home would drive the linear axes, unchecked.**  With RTCP on,
-  turning B *is* an X/Z move, and a B home sweeps the head across 1.5
-  times its range looking for the endstop — so the carriages travel by up
-  to the whole tool offset, typically before either of them is homed.
+  turning B *is* an X/Z move, and a B home turns the head from wherever
+  it was measured to B = 0 (or, on a rail with an endstop, sweeps it
+  across 1.5 times its range) — so the carriages travel by up to the
+  whole tool offset, typically before either of them is homed.
   Nothing catches it, either: a rotation-only move has
   `is_kinematic_move = False`, so `kin.check_move()` is skipped, and
   `drip_move()` — which is what a homing move is — never runs the
@@ -694,11 +695,11 @@ was left in.
 
 `[b_projection]` is refused by the same three call sites, and by
 `RTCP_PROBE_ORIENT`.  Its reason is different but points the same way:
-the endstop sweep, the park angle and the angle the probe pin hangs
-vertical at are all *machine* angles, and the projection would scale
-every one of them by whatever bed angle happened to be under the arm —
-by nearly zero with the arm square to the tilt plane, so a B home would
-never reach its endstop.
+the angle a B home measures and the angle the probe pin hangs vertical
+at are both *machine* angles, and the projection would scale each of
+them by whatever bed angle happened to be under the arm — by nearly zero
+with the arm square to the tilt plane, so a B home would book a head
+tilted well away from vertical as being at B = 0.
 
 The catch is point 3's other half: with RTCP off the arm radius *is* the
 bed radius, so probing the centre of the bed drives the arm to radius
@@ -800,11 +801,12 @@ the touching.
 * **Rotational limits in the kinematics classes**, so `axis_minimum` /
   `axis_maximum` and the front-end status describe the rotational axes
   too.
-* **Gravity-referenced B homing and drive-ratio calibration**, using
-  an IMU on the tilting head - design outline in
-  [Accel_B_Homing.md](Accel_B_Homing.md).  Homing B
-  becomes a measurement rather than an endstop sweep, and
-  `b_coupling_ratio` becomes measurable.
+* **Drive-ratio calibration against the head IMU** - design outline in
+  [Accel_B_Homing.md](Accel_B_Homing.md), which also covers the
+  gravity-referenced B home that is already implemented: the corertheta
+  B axis has no endstop, `G28 B` measures the head and turns it to
+  B = 0, and `[stepper_tilt]`'s range is a soft limit.  The calibration
+  would make `b_coupling_ratio` measured rather than nominal.
 * **Accelerometer Z homing by tapping the bed with the nozzle**, using
   the same head-mounted IMU - design outline in
   [Accel_Z_Tap.md](Accel_Z_Tap.md).  Contact is detected on the
