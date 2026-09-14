@@ -397,7 +397,8 @@ class TestMeasure(unittest.TestCase):
     def test_a_clean_reading(self):
         obj = build(chip=FakeAccelChip(angle=-32.5))
         reading = obj.measure()
-        self.assertAlmostEqual(reading.angle, -32.5, places=9)
+        self.assertAlmostEqual(reading.accel_angle, -32.5, places=9)
+        self.assertIsNone(reading.fused_angle)
         self.assertAlmostEqual(reading.magnitude, G, places=6)
         self.assertEqual(reading.count, int(3200 * .5))
         self.assertAlmostEqual(math.hypot(reading.u, reading.w), G, places=6)
@@ -421,7 +422,7 @@ class TestMeasure(unittest.TestCase):
         # routine averages rather than taking one sample.
         chip = FakeAccelChip(angle=20., noise=500.)
         obj = build({'max_sample_deviation': 0.}, chip=chip)
-        self.assertAlmostEqual(obj.measure().angle, 20., delta=.1)
+        self.assertAlmostEqual(obj.measure().accel_angle, 20., delta=.1)
     def test_a_moving_head_is_rejected(self):
         chip = FakeAccelChip(angle=0., noise=900.)
         obj = build(chip=chip)
@@ -483,9 +484,26 @@ class TestMeasure(unittest.TestCase):
         obj = build(chip=chip)
         self.assertAlmostEqual(obj.measure().out_of_plane, 250.)
     def test_status_carries_the_last_reading(self):
+        obj = build(chip=FakeIMUChip(angle=15.))
+        obj.measure()
+        status = obj.get_status()
+        self.assertAlmostEqual(status['measured_b'], 15., places=4)
+        self.assertAlmostEqual(status['accel_b'], 15., places=4)
+    def test_status_never_reports_an_unfused_angle_as_measured_b(self):
         obj = build(chip=FakeAccelChip(angle=15.))
         obj.measure()
-        self.assertAlmostEqual(obj.get_status()['measured_b'], 15., places=9)
+        status = obj.get_status()
+        self.assertIsNone(status['measured_b'])
+        self.assertAlmostEqual(status['accel_b'], 15., places=9)
+        # An unfused diagnostic does not overwrite the last fused angle
+        chip = FakeIMUChip(angle=15.)
+        obj = build(chip=chip)
+        obj.measure()
+        chip.angle = 20.
+        obj.measure(fusion=False)
+        status = obj.get_status()
+        self.assertAlmostEqual(status['measured_b'], 15., places=4)
+        self.assertAlmostEqual(status['accel_b'], 20., places=4)
 
 
 ######################################################################
@@ -521,7 +539,7 @@ class TestCommand(unittest.TestCase):
         self.assertIn("B is not homed", out)
         self.assertNotIn("commanded B", out)
     def test_check_on_an_unhomed_b_is_an_error(self):
-        obj = build(chip=FakeAccelChip(angle=7.))
+        obj = build(chip=FakeIMUChip(angle=7.))
         obj.printer.lookup_object('toolhead').b_axis.is_homed = False
         gcmd = FakeGCmd({'CHECK': 1})
         with self.assertRaises(ConfigError) as cm:
@@ -531,11 +549,11 @@ class TestCommand(unittest.TestCase):
         # the answer even when there is nothing to compare it against
         self.assertIn("B = 7.000 deg", "\n".join(gcmd.responses))
     def test_check_passes_within_tolerance(self):
-        obj = build(chip=FakeAccelChip(angle=30.4))
+        obj = build(chip=FakeIMUChip(angle=30.4))
         obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 30.
         self._run(obj, {'CHECK': 1, 'TOLERANCE': .5})
     def test_check_fails_outside_tolerance(self):
-        obj = build(chip=FakeAccelChip(angle=34.))
+        obj = build(chip=FakeIMUChip(angle=34.))
         obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 30.
         with self.assertRaises(ConfigError) as cm:
             self._run(obj, {'CHECK': 1, 'TOLERANCE': .5})
@@ -545,11 +563,32 @@ class TestCommand(unittest.TestCase):
         # and the head is really at its projection - which is what the
         # sensor sees.  Comparing against the raw commanded B here would
         # report a 30 degree error that does not exist.
-        obj = build(chip=FakeAccelChip(angle=30.),
+        obj = build(chip=FakeIMUChip(angle=30.),
                     b_projection=FakeBProjection(scale=.5))
         obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 60.
         out = self._run(obj, {'CHECK': 1, 'TOLERANCE': .5})
         self.assertIn("commanded B = 30.000 deg", out)
+    def test_check_needs_a_fused_angle(self):
+        # A chip with no gyroscope has only the accelerometer angle, and
+        # CHECK=1 does not act on that
+        obj = build(chip=FakeAccelChip(angle=30.))
+        obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 30.
+        with self.assertRaises(ConfigError) as cm:
+            self._run(obj, {'CHECK': 1})
+        self.assertIn("no gyroscope", str(cm.exception))
+        obj = build(chip=FakeIMUChip(angle=30.))
+        obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 30.
+        with self.assertRaises(ConfigError) as cm:
+            self._run(obj, {'CHECK': 1, 'FUSION': 0})
+        self.assertIn("FUSION=0", str(cm.exception))
+    def test_check_compares_the_fused_angle(self):
+        # A head still turning at 4 deg/s: the accelerometer average lags
+        # at 2.0 deg, the fused angle is at 3.0.  CHECK judges the latter.
+        obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.},
+                    chip=FakeIMUChip(b_rate=4.))
+        obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 3.
+        out = self._run(obj, {'CHECK': 1, 'TOLERANCE': .1})
+        self.assertIn("error = -0.001 deg", out)
 
 
 ######################################################################
@@ -574,9 +613,9 @@ class TestOverflows(unittest.TestCase):
             self.assertIn("Lower the chip's rate", str(cm.exception))
             self.assertIn("On spi", str(cm.exception))
     def test_the_unfused_gyroscope_stream_is_checked_too(self):
-        obj = build({'fusion': False}, chip=FakeIMUChip(overflows=1))
+        obj = build(chip=FakeIMUChip(overflows=1))
         with self.assertRaises(ConfigError):
-            obj.measure()
+            obj.measure(fusion=False)
 
 
 class TestMotionGate(unittest.TestCase):
@@ -588,7 +627,7 @@ class TestMotionGate(unittest.TestCase):
         obj = build(chip=FakeIMUChip(angle=12.))
         self.assertTrue(obj.has_gyro)
         reading = obj.measure()
-        self.assertAlmostEqual(reading.angle, 12., places=4)
+        self.assertAlmostEqual(reading.fused_angle, 12., places=4)
         self.assertAlmostEqual(reading.rotation_rate, 0.)
     def test_a_turning_head_is_rejected(self):
         obj = build(chip=FakeIMUChip(b_rate=4.))
@@ -616,9 +655,9 @@ class TestMotionGate(unittest.TestCase):
     def test_a_silent_gyroscope_is_reported(self):
         # The accelerometer arrives but the gyroscope stream does not.
         # Fusion reads one combined stream, so this is the unfused path.
-        obj = build({'fusion': False}, chip=FakeIMUChip(gyro_lag=5.))
+        obj = build(chip=FakeIMUChip(gyro_lag=5.))
         with self.assertRaises(ConfigError) as cm:
-            obj.measure()
+            obj.measure(fusion=False)
         self.assertIn("no gyroscope samples", str(cm.exception))
     def test_the_rate_reaches_get_status(self):
         obj = build({'max_sample_deviation': 0.},
@@ -750,8 +789,9 @@ class TestFusion(unittest.TestCase):
         obj = build(chip=FakeAccelChip(angle=7.))
         reading = obj.measure()
         self.assertIsNone(reading.fused_angle)
-        self.assertAlmostEqual(reading.angle, reading.accel_angle)
-        self.assertFalse(obj.get_status()['fusion'])
+        self.assertAlmostEqual(reading.accel_angle, 7.)
+        self.assertFalse(obj.get_status()['has_gyro'])
+        self.assertIsNone(obj.get_status()['measured_b'])
     def test_a_stationary_head_fuses_to_the_same_answer(self):
         obj = build(chip=FakeIMUChip(angle=12.))
         reading = obj.measure()
@@ -768,8 +808,10 @@ class TestFusion(unittest.TestCase):
         reading = obj.measure()
         self.assertAlmostEqual(reading.accel_angle, 2.0, delta=.02)
         self.assertAlmostEqual(reading.fused_angle, 3.0, delta=.02)
-        # and the authoritative angle is the fused one
-        self.assertEqual(reading.angle, reading.fused_angle)
+        # and the angle from vertical that B acts on is the fused one
+        self.assertEqual(obj.measure_vertical(), obj.last_reading.fused_angle)
+        self.assertAlmostEqual(obj.get_status()['measured_b'], 3.0,
+                               delta=.02)
     def test_the_fused_angle_follows_the_sign_of_the_rotation(self):
         for b_rate in (4., -4.):
             obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.},
@@ -794,14 +836,17 @@ class TestFusion(unittest.TestCase):
     def test_an_inverted_gyroscope_is_invisible_on_a_parked_head(self):
         # Stated as a test because it is a real limitation: with nothing
         # to integrate, the sign cannot be checked.  That needs a
-        # deliberate move (B_GYRO_CALIBRATE, phase 3).
+        # deliberate move (B_GYRO_CHECK, phase 3).
         obj = build(chip=FakeIMUChip(angle=12., invert_gyro=True))
         self.assertAlmostEqual(obj.measure().fused_angle, 12., places=4)
-    def test_fusion_can_be_turned_off_in_config(self):
-        obj = build({'fusion': False}, chip=FakeIMUChip(angle=12.))
-        reading = obj.measure()
-        self.assertIsNone(reading.fused_angle)
-        self.assertAlmostEqual(reading.angle, reading.accel_angle)
+    def test_measure_vertical_refuses_a_chip_without_a_gyroscope(self):
+        obj = build(chip=FakeAccelChip(angle=12.))
+        with self.assertRaises(ConfigError) as cm:
+            obj.measure_vertical()
+        self.assertIn("no gyroscope", str(cm.exception))
+        self.assertIn("B_MEASURE", str(cm.exception))
+    def test_fusion_is_not_a_config_option(self):
+        self.assertFalse(hasattr(build(), 'fusion'))
     def test_fusion_can_be_turned_off_per_command(self):
         obj = build(chip=FakeIMUChip(angle=12.))
         self.assertIsNone(obj.measure(fusion=False).fused_angle)
@@ -810,13 +855,16 @@ class TestFusion(unittest.TestCase):
         obj = build(chip=FakeIMUChip(angle=12.))
         gcmd = FakeGCmd()
         obj.cmd_B_MEASURE(gcmd)
-        self.assertIn("fused 12.000 deg", gcmd.responses[0])
+        self.assertIn("B = 12.000 deg from vertical, fused",
+                      gcmd.responses[0])
         self.assertIn("accelerometer alone 12.000", gcmd.responses[0])
     def test_b_measure_can_ask_for_the_unfused_angle(self):
         obj = build(chip=FakeIMUChip(angle=12.))
         gcmd = FakeGCmd({'FUSION': 0})
         obj.cmd_B_MEASURE(gcmd)
-        self.assertNotIn("fused", gcmd.responses[0])
+        self.assertIn("accelerometer only", gcmd.responses[0])
+        self.assertIn("not fused", gcmd.responses[0])
+        self.assertNotIn("accelerometer alone", gcmd.responses[0])
     def test_a_capture_shorter_than_the_filter_needs_is_refused(self):
         obj = build({'settle_time': 0., 'sample_time': .05,
                      'fusion_tau': .5}, chip=FakeIMUChip(angle=12.))
@@ -826,7 +874,8 @@ class TestFusion(unittest.TestCase):
     def test_the_fusion_state_reaches_get_status(self):
         obj = build(chip=FakeIMUChip(angle=12.))
         status = obj.get_status()
-        self.assertTrue(status['fusion'])
+        self.assertTrue(status['has_gyro'])
+        self.assertNotIn('fusion', status)
         self.assertAlmostEqual(status['fusion_tau'], .2)
         self.assertEqual(status['rotation_axis_sign'], -1.)
         self.assertIsNone(status['fusion_disagreement'])
@@ -901,6 +950,26 @@ class TestMeasuredHome(unittest.TestCase):
         self.assertEqual(axis.position, 0.)
         self.assertTrue(axis.is_homed)
         self.assertIn("head at B = 30.00", self._responses(obj))
+    def test_the_home_books_the_fused_angle(self):
+        # A head the fake keeps turning at 4 deg/s through each capture:
+        # the accelerometer average of a capture lags at +2 deg, the
+        # fused angle is at +3.  G28 B must book and drive on the latter.
+        obj, axis, _ = build_home(30., config_values={
+            'max_rotation_rate': 0., 'max_sample_deviation': 0.})
+        axis.chip.b_rate = 4.
+        obj.home_axis(axis)
+        self.assertIn("head at B = 33.00", self._responses(obj))
+        self.assertAlmostEqual(obj.last_reading.fused_angle, 0., delta=.25)
+        self.assertAlmostEqual(obj.last_reading.accel_angle, -1., delta=.25)
+    def test_a_chip_without_a_gyroscope_cannot_home(self):
+        chip = FakeAccelChip(angle=30.)
+        obj = build(chip=chip)
+        axis = FakeMeasuredAxis(chip)
+        with self.assertRaises(ConfigError) as cm:
+            obj.home_axis(axis)
+        self.assertIn("no gyroscope", str(cm.exception))
+        self.assertIsNone(axis.position)
+        self.assertEqual(axis.moves, [])
     def test_the_check_move_heads_toward_zero_from_either_side(self):
         obj, axis, _ = build_home(-20.)
         obj.home_axis(axis)
@@ -1020,6 +1089,14 @@ class TestHomingDirection(unittest.TestCase):
         with self.assertRaises(ConfigError) as cm:
             obj.verify_home(-45.)
         self.assertIn("G4 P2000", str(cm.exception))
+    def test_the_endstop_checks_need_a_fused_angle(self):
+        obj = build(chip=FakeAccelChip(angle=-20.))
+        with self.assertRaises(ConfigError) as cm:
+            obj.choose_homing_direction(40., -90., 90.)
+        self.assertIn("no gyroscope", str(cm.exception))
+        with self.assertRaises(ConfigError) as cm:
+            obj.verify_home(-20.)
+        self.assertIn("no gyroscope", str(cm.exception))
     def test_verify_can_be_disabled(self):
         obj = build({'verify_home': False}, chip=FakeIMUChip(angle=30.))
         obj.verify_home(-45.)

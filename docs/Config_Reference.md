@@ -2940,9 +2940,16 @@ accelerometer through a complementary filter, which crosses the two over
 at `fusion_tau`: above it the accelerometer wins, so the angle is
 absolute and does not drift; below it the gyroscope wins, so the angle
 tracks the head through the ringing that follows a move instead of
-waiting it out. The fused angle is the one `CHECK=1` compares and the one
-`get_status()` reports, and `B_MEASURE` prints the accelerometer-only
-angle beside it so the two can be compared on the machine.
+waiting it out.
+
+**B is only ever acted on through the fused angle from vertical.**
+`G28 B`, the direction pick and verification of a rail with an endstop,
+`B_MEASURE CHECK=1` and the drive ratio calibration all read it, and
+`measured_b` in the status is only ever a fused angle. The
+accelerometer-only angle cannot tell a tilted head from an accelerating
+one, so it is a diagnostic: `B_MEASURE` prints it beside the fused
+angle, `FUSION=0` measures with it alone, and the status reports it as
+`accel_b`. Fusion cannot be turned off in the config.
 
 Which gyroscope axis carries the rotation, and with which sign, is
 derived from `zero_vector` and `positive_vector` - there is nothing
@@ -2951,8 +2958,10 @@ further to configure and nothing to guess. See
 parameter", including the limits of the `max_fusion_disagreement` check
 that guards it.
 
-Chips without a gyroscope skip both the gate and the fusion, and behave
-exactly as before.
+Chips without a gyroscope skip both the gate and the fusion. They can
+still run `B_MEASURE`, which then reports the accelerometer-only angle,
+but they cannot home B or run `CHECK=1`: there is no fused angle to act
+on.
 
 A USB sensor board carries its own microcontroller running Klipper
 firmware, so it is configured as a secondary MCU and its pins are
@@ -2986,8 +2995,8 @@ positive_vector:
 #accel_chip: bmi160
 #   The accelerometer to read. The default is "bmi160" - a
 #   configuration still using an ADXL345 must name it explicitly.
-#   Any chip Klipper can stream works here; an IMU additionally
-#   enables the rotation gate below.
+#   Any chip Klipper can stream works for B_MEASURE, but homing B and
+#   CHECK=1 need an IMU, since they act only on the fused angle.
 #settle_time: 0.250
 #   How long (in seconds) to dwell after any motion before sampling
 #   starts. The head hangs on belts and rings after a move, so this is
@@ -3025,11 +3034,6 @@ positive_vector:
 #   and well below any real motion, and the right value is whatever
 #   B_MEASURE reports on a parked head plus a margin. Set to 0 to
 #   disable the check. See BMI160_IMU.md.
-#fusion: True
-#   Whether to fuse the gyroscope with the accelerometer. Ignored when
-#   the chip has no gyroscope. Turning it off reverts to averaging the
-#   accelerometer alone, which is what B_MEASURE FUSION=0 does for a
-#   single measurement. The default is True.
 #fusion_tau: 0.2
 #   Crossover time constant (in seconds) of the complementary filter.
 #   Shorter trusts the gyroscope further, which tracks a moving head
@@ -3081,10 +3085,13 @@ positive_vector:
 `B_MEASURE [SETTLE=<s>] [SAMPLE_TIME=<s>] [FUSION=0|1] [CHECK=0|1]
 [TOLERANCE=<deg>]` reports the measured angle, the averaged acceleration
 vector and its magnitude, the in-plane and out-of-plane components, and
-the per-axis sample deviation. With a gyroscope it also reports the
-measured rotation rate, and both the fused and accelerometer-only angles
-with the difference between them; `FUSION=0` measures without the
-gyroscope for that one command, which is the direct way to compare.
+the per-axis sample deviation. With a gyroscope the headline angle is
+the fused angle from vertical, followed by the measured rotation rate
+and the accelerometer-only angle with the difference between them;
+`FUSION=0` measures without the gyroscope for that one command, which is
+the direct way to compare, and labels the result as not fused. `CHECK=1`
+always compares the fused angle, so it refuses `FUSION=0` and a chip
+without a gyroscope.
 A measurement during which the chip reports possible FIFO overflows is
 refused, since lost samples also leave the remaining ones mistimed. When B is homed it also reports the commanded angle and
 the error against it; `CHECK=1` turns a disagreement larger than

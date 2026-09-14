@@ -94,17 +94,31 @@
 # Fusion says what the angle is; the gate says whether to trust it as a
 # *static* tilt.  A head at rest reads zero rate, so max_rotation_rate
 # tests directly for the thing max_sample_deviation can only infer.
-# Both are skipped for chips with no gyroscope, so an [adxl345] keeps
-# working exactly as before.  See docs/BMI160_IMU.md.
+# See docs/BMI160_IMU.md.
+#
+# WHICH ANGLE IS ACTED ON
+#
+# measure() produces two angles from one capture, and a TiltReading
+# carries both under their own names - there is deliberately no field
+# that means "whichever one was available".  Everything that acts on B -
+# G28 B, the endstop direction and its verification, B_MEASURE CHECK=1
+# and the drive ratio calibration - reads the head through
+# measure_vertical(), which only ever returns the fused angle from
+# vertical and refuses when there is none.  The accelerometer-only angle
+# is a diagnostic that B_MEASURE prints beside it: it cannot tell a
+# tilted head from an accelerating one, so acting on it would book a
+# head still ringing on its belts as a static tilt.  A chip without a
+# gyroscope can still run B_MEASURE, but cannot home B.
 #
 # HOMING
 #
 # The corertheta B axis has no endstop by default.  Its position_min and
 # position_max are soft limits - there to keep the filament tube from
 # kinking, not physical stops - and G28 B asks this module to home it
-# (see home_axis()): energise the gantry motors, measure the head, book
-# the measurement as B, and drive it to B=0 (nozzle vertical), measuring
-# and correcting until it is within zero_tolerance.  The first move is
+# (see home_axis()): energise the gantry motors, measure the head's
+# fused angle from vertical, book it as B, and drive it to B=0 (nozzle
+# vertical), measuring and correcting until it is within zero_tolerance.
+# The first move is
 # capped at direction_check_move and checked, so a positive_vector that
 # disagrees with the motors about which way is +B stops the home a few
 # degrees in instead of driving the head through a soft limit.
@@ -185,8 +199,10 @@ SIGNED_AXES = {
 }
 VALID_AXES = "+x, -x, +y, -y, +z or -z"
 
+# fused_angle is None when the reading was not fused.  Nothing that acts
+# on B may fall back to accel_angle - see measure_vertical().
 TiltReading = collections.namedtuple('TiltReading', (
-    'angle', 'accel_angle', 'fused_angle', 'disagreement', 'vector',
+    'accel_angle', 'fused_angle', 'disagreement', 'vector',
     'deviation', 'magnitude', 'u', 'w', 'out_of_plane', 'count',
     'rotation_rate'))
 
@@ -358,7 +374,8 @@ class AccelBHoming:
         # gyroscope's zero-rate offset through; longer trusts the
         # accelerometer further.  It is the knob worth tuning on the
         # machine, and the default is a starting point, not a result.
-        self.fusion = config.getboolean('fusion', True)
+        # There is no option to turn fusion off: the fused angle is the
+        # only one B is homed, checked or calibrated on.
         self.fusion_tau = config.getfloat('fusion_tau', .2, above=0.)
         # How far the fused angle may sit from a trailing accelerometer
         # average before the measurement is refused.  Both estimate the
@@ -397,6 +414,7 @@ class AccelBHoming:
         self.has_gyro = False
         self.b_projection = None
         self.last_reading = None
+        self.last_fused_angle = None
         self.printer.register_event_handler("klippy:connect",
                                             self._handle_connect)
         gcode = self.printer.lookup_object('gcode')
@@ -443,12 +461,13 @@ class AccelBHoming:
     ######################################################################
     # The measurement primitive
     ######################################################################
-    def measure(self, settle_time=None, sample_time=None, fusion=None):
+    def measure(self, settle_time=None, sample_time=None, fusion=True):
+        # fusion=False is B_MEASURE FUSION=0, the diagnostic that compares
+        # the two estimators.  Nothing that acts on B passes it.
         settle = self.settle_time if settle_time is None else settle_time
         window = self.sample_time if sample_time is None else sample_time
         toolhead = self.toolhead
-        fuse = self.fusion if fusion is None else fusion
-        fuse = bool(fuse) and self.has_gyro
+        fuse = bool(fusion) and self.has_gyro
         toolhead.wait_moves()
         # Fusing reads the combined stream, where each sample carries an
         # acceleration and a rotation rate the chip measured at the same
@@ -599,7 +618,6 @@ class AccelBHoming:
                         % (self.name, fused_angle, tail_angle, disagreement,
                            self.max_fusion_disagreement))
         reading = TiltReading(
-            angle=accel_angle if fused_angle is None else fused_angle,
             accel_angle=accel_angle, fused_angle=fused_angle,
             disagreement=disagreement,
             vector=mean, deviation=dev, magnitude=mag,
@@ -608,7 +626,32 @@ class AccelBHoming:
             out_of_plane=mean[self.oop_index], count=len(vectors),
             rotation_rate=rotation_rate)
         self.last_reading = reading
+        if fused_angle is not None:
+            self.last_fused_angle = fused_angle
         return reading
+
+    ######################################################################
+    # The angle from vertical
+    ######################################################################
+    def measure_vertical(self, settle_time=None, sample_time=None):
+        # The head's angle from vertical, in degrees - always the fused
+        # one.  This is the only measurement G28 B, the endstop checks,
+        # CHECK=1 and the drive ratio calibration act on; see "WHICH
+        # ANGLE IS ACTED ON" in the header.
+        if not self.has_gyro:
+            raise self.printer.command_error(
+                "%s: '%s' has no gyroscope, so there is no fused angle to"
+                " measure B from vertical with.  B is only homed, checked"
+                " and calibrated on the fused angle - use an IMU such as a"
+                " [bmi160] with its gyroscope enabled.  B_MEASURE still"
+                " reports the accelerometer-only angle"
+                % (self.name, self.chip_name))
+        reading = self.measure(settle_time, sample_time, fusion=True)
+        if reading.fused_angle is None:
+            raise self.printer.command_error(
+                "%s: the measurement was not fused, so it cannot be used"
+                " as B" % (self.name,))
+        return reading.fused_angle
 
     ######################################################################
     # Homing without an endstop (called by rotary_axis.BaseRotaryAxis.home)
@@ -656,7 +699,7 @@ class AccelBHoming:
         # after it has been driven through a soft limit.
         self._energise(axis)
         pos_min, pos_max = axis.get_range()
-        angle = self.measure().angle
+        angle = self.measure_vertical()
         axis.set_measured_position(angle)
         note = ""
         if angle < pos_min or angle > pos_max:
@@ -685,7 +728,7 @@ class AccelBHoming:
                 target = min(max(target, pos_min), pos_max)
             axis.move_axis(target)
             moves += 1
-            new_angle = self.measure().angle
+            new_angle = self.measure_vertical()
             commanded = target - angle
             if not confirmed and abs(commanded) >= MIN_DIRECTION_CHECK:
                 self._check_response(angle, new_angle, commanded)
@@ -705,8 +748,7 @@ class AccelBHoming:
     ######################################################################
     def choose_homing_direction(self, position_endstop, position_min,
                                 position_max):
-        reading = self.measure()
-        angle, tol = reading.angle, self.homing_tolerance
+        angle, tol = self.measure_vertical(), self.homing_tolerance
         distance = position_endstop - angle
         if abs(distance) > tol:
             positive_dir = distance > 0.
@@ -731,8 +773,8 @@ class AccelBHoming:
     def verify_home(self, position_endstop):
         if not self.verify_home_enabled:
             return
-        reading = self.measure()
-        error = wrap180(reading.angle - position_endstop)
+        angle = self.measure_vertical()
+        error = wrap180(angle - position_endstop)
         if abs(error) > self.homing_tolerance:
             raise self.printer.command_error(
                 "%s: B homed, but the head measures %.2f deg where the"
@@ -741,7 +783,7 @@ class AccelBHoming:
                 " endstop needs G4 P2000 before G28 B), or positive_vector"
                 " and the motors disagree about which way is +B - check"
                 " positive_vector, then invert_b_direction in [printer]"
-                % (self.name, reading.angle, position_endstop, error,
+                % (self.name, angle, position_endstop, error,
                    self.homing_tolerance))
 
     ######################################################################
@@ -769,11 +811,14 @@ class AccelBHoming:
                'rotation_axis': AXIS_NAMES[self.oop_index],
                'accel_chip': self.chip_name}
         res['has_gyro'] = self.has_gyro
-        res['fusion'] = self.fusion and self.has_gyro
         res['fusion_tau'] = self.fusion_tau
         res['rotation_axis_sign'] = self.gyro_coefficient
+        # measured_b is only ever a fused angle from vertical: the last
+        # one measured, even if a B_MEASURE FUSION=0 has run since.  The
+        # accelerometer-only angle of the latest reading is accel_b.
+        res['measured_b'] = self.last_fused_angle
         reading = self.last_reading
-        res['measured_b'] = None if reading is None else reading.angle
+        res['accel_b'] = None if reading is None else reading.accel_angle
         res['rotation_rate'] = (None if reading is None
                                 else reading.rotation_rate)
         res['fusion_disagreement'] = (None if reading is None
@@ -783,14 +828,30 @@ class AccelBHoming:
     def cmd_B_MEASURE(self, gcmd):
         settle = gcmd.get_float('SETTLE', self.settle_time, minval=0.)
         window = gcmd.get_float('SAMPLE_TIME', self.sample_time, minval=.05)
-        fusion = gcmd.get_int('FUSION', None, minval=0, maxval=1)
-        reading = self.measure(settle, window,
-                               None if fusion is None else bool(fusion))
+        fusion = gcmd.get_int('FUSION', 1, minval=0, maxval=1)
+        check = gcmd.get_int('CHECK', 0, minval=0, maxval=1)
+        if check and not fusion:
+            raise gcmd.error("%s: CHECK=1 compares the fused angle, so it"
+                             " cannot be combined with FUSION=0"
+                             % (self.name,))
+        if check:
+            # Refuses a chip with no gyroscope before sampling anything
+            self.measure_vertical(settle, window)
+            reading = self.last_reading
+        else:
+            reading = self.measure(settle, window, bool(fusion))
         x, y, z = reading.vector
         dx, dy, dz = reading.deviation
-        lines = [
-            "%s: B = %.3f deg (%d samples)"
-            % (self.name, reading.angle, reading.count),
+        if reading.fused_angle is not None:
+            angle = reading.fused_angle
+            lines = ["%s: B = %.3f deg from vertical, fused (%d samples)"
+                     % (self.name, angle, reading.count)]
+        else:
+            angle = reading.accel_angle
+            lines = ["%s: B = %.3f deg, accelerometer only (%d samples) -"
+                     " not fused, so not an angle G28 B or CHECK=1 acts on"
+                     % (self.name, angle, reading.count)]
+        lines += [
             "  vector x/y/z = %.1f / %.1f / %.1f mm/s^2,"
             " |a| = %.1f (%.4f g)"
             % (x, y, z, reading.magnitude, reading.magnitude / FREEFALL_ACCEL),
@@ -805,13 +866,12 @@ class AccelBHoming:
                          % (reading.rotation_rate, self.max_rotation_rate))
         if reading.fused_angle is not None:
             lines.append(
-                "  fused %.3f deg, accelerometer alone %.3f, tail"
-                " difference %+.3f (tau %.3f s)"
-                % (reading.fused_angle, reading.accel_angle,
+                "  accelerometer alone %.3f deg, tail difference %+.3f"
+                " (tau %.3f s)"
+                % (reading.accel_angle,
                    reading.disagreement
                    if reading.disagreement is not None else float('nan'),
                    self.fusion_tau))
-        check = gcmd.get_int('CHECK', 0, minval=0, maxval=1)
         if not self.is_b_homed():
             # Report the measurement either way - it is the useful part
             # of the answer, and the whole point of the command
@@ -822,7 +882,7 @@ class AccelBHoming:
                                  " angle while B is unhomed" % (self.name,))
             return
         commanded = self.get_commanded_b()
-        error = reading.angle - commanded
+        error = angle - commanded
         lines.append("  commanded B = %.3f deg, error = %+.3f deg"
                      % (commanded, error))
         gcmd.respond_info("\n".join(lines))
@@ -833,7 +893,7 @@ class AccelBHoming:
                 raise gcmd.error(
                     "%s: the head is at %.3f deg but B is commanded to"
                     " %.3f deg (error %+.3f, tolerance %.3f)"
-                    % (self.name, reading.angle, commanded, error, tolerance))
+                    % (self.name, angle, commanded, error, tolerance))
 
 
 def load_config(config):

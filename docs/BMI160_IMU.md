@@ -1,7 +1,7 @@
 # BMI160: an IMU for B homing and Z homing
 
 **Status: architecture.** The sensor layer, the fused B measurement and
-the motion gate are implemented. `B_GYRO_CALIBRATE` and the tap detector
+the motion gate are implemented. `B_GYRO_CHECK` and the tap detector
 of [Accel_Z_Tap.md](Accel_Z_Tap.md) land in the phases at the end of
 this document. Nothing here has run on the machine yet; every number
 quoted from the datasheet is a datasheet number, not a measurement, and
@@ -80,23 +80,37 @@ Gating a B measurement on measured rotation rate replaces an inference
 with an observation, which is the same upgrade the accelerometer itself
 made over counting steps.
 
-### 3. Rotation sense and degrees-per-step, measured rather than assumed
+### 3. Degrees-per-step from the fused angle, and a check on the gyroscope
 
-The rotation sense of B on this machine is still unverified - see
-[Accel_B_Homing.md](Accel_B_Homing.md) on `positive_vector` being
-*declared* rather than fitted. Integrating the gyro's on-axis rate over a
-commanded move answers it directly:
+**The drive ratio is calibrated on the fused angle from vertical, and on
+nothing else.** `B_STEP_CALIBRATE` in
+[Accel_B_Homing.md](Accel_B_Homing.md) commands a sweep of stations,
+counts the steps the MCU issued, and at each station reads the head
+through `measure_vertical()` - the same fused measurement `G28 B` homes
+on. `b_coupling_ratio` (or `rotation_distance` on a dedicated B stepper)
+is fitted from those angles. The gyroscope's contribution to the
+calibration is the fusion itself: it carries each station reading
+through the ringing after the move, and its motion gate says the head
+was at rest.
+
+Integrating the gyroscope's on-axis rate across a commanded move is
+*not* used for the ratio, even though it looks like the direct answer:
 
     command B +10 degrees, integrate omega over the move
 
-If the integral is +10.0, sense and scale are both confirmed. If it is
--10.0, the sense is inverted. If it is +9.2, `rotation_distance` on the B
-stepper is wrong by 8 %. This measurement does not depend on the
-accelerometer, on the zero reference, on where B was homed, or on the
-head being level - it is a pure observation of the move that just
-happened. The accelerometer cannot do it: over a 10 degree move near
-B = 0 the gravity vector barely changes, which is exactly where a
-single-axis accel reading goes flat.
+That integral is relative rather than referenced to vertical, and it
+carries the gyroscope's own sensitivity error and its zero-rate offset
+multiplied by the length of the move - neither of which a fit against
+step counts can separate from a ratio error. Fusion bounds both, because
+the accelerometer pins the angle to gravity at every station.
+
+What the integral *is* good for is the one question fusion cannot answer
+on a parked head: whether the gyroscope's sign is right (see "What checks
+this on the machine" below). `B_GYRO_CHECK` runs it as a check - +10.0
+confirms sense and scale, -10.0 means the sign is inverted - and writes
+nothing to the config. The rotation sense of B itself is still
+unverified on this machine; `G28 B`'s capped check move already refuses
+a head that turns the wrong way.
 
 ### 4. A gravity-free channel for tap detection
 
@@ -172,7 +186,7 @@ over-trust:
 
 The definitive check is therefore a *deliberate* move - turn B by a
 known amount and confirm the fused angle tracks it - which is exactly
-what `B_GYRO_CALIBRATE` automates in phase 3. Until that lands, do it by
+what `B_GYRO_CHECK` automates in phase 3. Until that lands, do it by
 hand once during commissioning.
 
 ## The accelerometer half, on the numbers
@@ -242,8 +256,8 @@ Four layers, and the seams between them are the architecture:
     - accel view    gyro view
         |               |                    |
         v               v                    v
-  [accel_b_homing]  (motion gate,        [accel_z_tap]      (phase 5)
-  [resonance_tester] B_GYRO_CALIBRATE)
+  [accel_b_homing]  (fused angle,        [accel_z_tap]      (phase 5)
+  [resonance_tester] motion gate)
 ```
 
 The rule that shapes all of it: **the chip object knows about the chip
@@ -603,10 +617,15 @@ capture, and reports both:
         rotation_rate = mean |omega| over the window   -> motion gate
         disagreement  = fused_angle - trailing accel angle -> sanity check
 
-`angle` - the number `CHECK=1` compares against the commanded B, and the
-number in `get_status()` - is the fused one when a gyroscope is present.
-`accel_angle` is kept alongside it, unchanged in meaning, so the old and
-new estimators can be compared on the machine rather than trusted.
+The reading carries the two under their own names and has no field
+meaning "whichever was available". **Everything that acts on B reads
+`measure_vertical()`**, which returns only `fused_angle` and refuses a
+chip without a gyroscope: `G28 B`, the endstop direction and
+verification, `CHECK=1`, and the drive ratio calibration. `measured_b`
+in `get_status()` is only ever a fused angle. `accel_angle` is kept
+alongside - reported by `B_MEASURE` and as `accel_b` in the status - so
+the two estimators can be compared on the machine rather than trusted,
+but nothing acts on it.
 
 The filter deliberately stops at the **end of the measurement window**
 rather than the end of the capture. The trailing `batch_margin` is
@@ -614,11 +633,12 @@ delivery slack that the user did not ask to measure, and running the
 filter through it would leave the fused angle and the accelerometer tail
 it is checked against describing different instants.
 
-Everything degrades cleanly without a gyroscope. An `[adxl345]` or a
-`[lis2dw]` exposes no gyroscope client, so fusion and the gate are both
-skipped, `angle` is `accel_angle`, and the module behaves exactly as it
-did before. That matters: the module is useful to people who do not have
-a BMI160.
+Without a gyroscope the module is a diagnostic only. An `[adxl345]` or
+a `[lis2dw]` exposes no gyroscope client, so fusion and the gate are both
+skipped and `B_MEASURE` reports the accelerometer-only angle, labelled as
+not fused - but `G28 B` and `CHECK=1` refuse, since there is no fused
+angle to act on. There is no config option to turn fusion off, for the
+same reason; `B_MEASURE FUSION=0` does it for one diagnostic reading.
 
 ### What this does not yet buy
 
@@ -633,13 +653,21 @@ moving head by default and will need raising or disabling first - they
 answer "was this a static tilt?", which is a different question from
 "what is the angle?".
 
-`B_GYRO_CALIBRATE` - job 3 above - remains new work: start the stream,
-run a commanded B move, integrate the on-axis rate across it, report
-swept angle against commanded angle. Of `[accel_b_homing]` today only
-`G28 B` moves the machine, and it measures a parked head before and after
-each move, so it checks the accelerometer's sense of rotation but not the
-gyroscope's. It is `B_GYRO_CALIBRATE` that finally verifies the
-gyroscope's sign, per the limits noted above.
+`B_GYRO_CHECK` - job 3 above - remains new work: start the stream, run
+a commanded B move, integrate the on-axis rate across it, report swept
+angle against commanded angle. It is a check, not a calibration: it
+writes nothing, and the drive ratio comes from fused station angles in
+`B_STEP_CALIBRATE`. Of `[accel_b_homing]` today only `G28 B` moves the
+machine, and it measures a parked head before and after each move, so it
+checks the fused angle's sense of rotation but not the gyroscope's sign
+on its own. It is `B_GYRO_CHECK` that finally verifies that sign, per
+the limits noted above.
+
+The fused angle also inherits the gyroscope's zero-rate offset as a
+fixed bias of offset x `fusion_tau` (see "Open questions"), which
+`max_fusion_disagreement` is far too loose to notice. Since `G28 B` now
+acts on that angle, run `BMI160_CALIBRATE GYRO=1` after every power
+cycle before homing.
 
 ## The Z homing path
 
@@ -783,10 +811,11 @@ measurement at 3200 Hz.
    filter, the derived gyroscope axis and sign, `max_rotation_rate` and
    `max_fusion_disagreement` in `[accel_b_homing]`. All skipped when the
    chip has no gyroscope. *Implemented.*
-3. **`B_GYRO_CALIBRATE`.** Integrate rate across a commanded move;
-   report sense and scale. Settles the rotation-sense question in
-   [Accel_B_Homing.md](Accel_B_Homing.md), and is the definitive check
-   on the gyroscope's sign.
+3. **`B_GYRO_CHECK`.** Integrate rate across a commanded move; report
+   sense and scale. The definitive check on the gyroscope's sign, which
+   the fused angle depends on. It writes nothing: the drive ratio is
+   calibrated on fused station angles by `B_STEP_CALIBRATE`
+   ([Accel_B_Homing.md](Accel_B_Homing.md)).
 4. **Commissioning `fusion_tau` and `settle_time`.** Measure the head's
    ringing, pick `tau`, and find how far `settle_time` can come down.
    This is the phase that actually collects the benefit of phase 2.

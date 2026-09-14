@@ -5,9 +5,13 @@
 > gyroscope is combined with the accelerometer through a complementary
 > filter: the accelerometer keeps the angle absolute over long
 > timescales, the gyroscope carries it through the ringing that follows
-> a move. The fused angle is the authoritative one; the
-> accelerometer-only angle this document describes is still computed
-> and still reported beside it. The same gyroscope supplies the motion
+> a move. **The fused angle is the only angle from vertical that B is
+> homed, checked or calibrated on** - `G28 B`, the endstop direction
+> and verification, `B_MEASURE CHECK=1` and `B_STEP_CALIBRATE` all read
+> it through `measure_vertical()`, which refuses a chip without a
+> gyroscope. The accelerometer-only angle this document describes is
+> still computed, but only as a diagnostic that `B_MEASURE` reports
+> beside the fused one. The same gyroscope supplies the motion
 > gate (`max_rotation_rate`) - a direct test that the head was at rest,
 > where `max_sample_deviation` below can only infer it.
 >
@@ -362,8 +366,8 @@ silently did not move is tens of degrees out, not tenths.
 
 | Command | Does |
 | --- | --- |
-| `B_MEASURE [SETTLE=] [SAMPLE_TIME=]` | *(implemented)* Report measured B, the raw vector, the in-plane and out-of-plane components, the noise stats, and the error against commanded B. Read-only, safe any time the head is still. |
-| `B_MEASURE CHECK=1 [TOLERANCE=]` | *(implemented)* As above, but raise an error if measured and commanded B disagree. For `PRINT_START` and layer macros - it catches belt slip and a silently failed home. Requires B homed, since an unhomed B has no commanded angle to compare against. |
+| `B_MEASURE [SETTLE=] [SAMPLE_TIME=] [FUSION=0]` | *(implemented)* Report measured B (the fused angle from vertical; `FUSION=0` reports the accelerometer-only angle instead, labelled as not fused), the raw vector, the in-plane and out-of-plane components, the noise stats, and the error against commanded B. Read-only, safe any time the head is still. |
+| `B_MEASURE CHECK=1 [TOLERANCE=]` | *(implemented)* As above, but raise an error if the fused angle and commanded B disagree. Refuses `FUSION=0` and a chip without a gyroscope. For `PRINT_START` and layer macros - it catches belt slip and a silently failed home. Requires B homed, since an unhomed B has no commanded angle to compare against. |
 | `G28 B` | *(implemented)* Measure B, set it, and turn the head to B = 0 - see [Algorithm: homing](#algorithm-homing). |
 | `B_SET_ZERO` | Declare the current physical pose to be B = 0. Run it with the head referenced mechanically - square against the bed, or with the probe pin hanging vertical. |
 | `B_SENSOR_CALIBRATE [START=] [END=] [STEPS=]` | Sweep the arc, fit offsets and gain, report conditioning. |
@@ -383,10 +387,23 @@ measure(settle, window) -> TiltReading
   4. reject if: no samples, count < 0.5 * expected,
                 stddev(any axis) > max_sample_deviation,
                 | |a| - 1g | > max_magnitude_error
-  5. mean -> (u, w, v); B = atan2(u, w)
+  5. mean -> (u, w, v); accel_angle = atan2(u, w)
+     with a gyroscope: fused_angle = complementary filter over the
+     combined stream, settle included, ending at the window's end
      (phase two: apply offsets, gain_ratio, zero_offset, level_offset)
-  6. return B, raw mean, stddev, in-plane and out-of-plane parts, count
+  6. return accel_angle, fused_angle, raw mean, stddev, in-plane and
+     out-of-plane parts, count
+
+measure_vertical() -> fused_angle
+  refuse a chip without a gyroscope; otherwise measure(fusion=True) and
+  return its fused_angle.  The only entry point for anything that acts
+  on B.
 ```
+
+The reading deliberately has no field meaning "whichever angle was
+available". An earlier version did, and it let `G28 B` home on the
+accelerometer alone whenever fusion was off or the chip had no
+gyroscope, without saying so.
 
 Three details that matter:
 
@@ -423,7 +440,9 @@ G28 B
   1. refuse unless the transforms are off (PrinterHoming's own check)
   2. energise both gantry motors - a head that can droop unpowered must
      be held before it is measured
-  3. measure -> B ; set_measured_position(B)      (B is now homed)
+  3. measure_vertical -> B ; set_measured_position(B)   (B is now homed)
+     (every measurement below is measure_vertical too - the fused
+     angle, refused outright on a chip without a gyroscope)
      report it, and say so if it is outside the soft limits
   4. while |B| > zero_tolerance:
        if max_homing_moves moves have been made: raise "not converging"
@@ -534,7 +553,9 @@ B_STEP_CALIBRATE START=-40 END=90 STEPS=14 RETURN=1
   2. for each station i:
        move to the commanded B
        record n_i = the integer MCU step counters (see below)
-       settle, measure -> phi_i (corrected angle, not commanded B)
+       phi_i = measure_vertical()  (the fused angle from vertical - not
+               commanded B, not the accelerometer-only angle, and not
+               an integral of the gyroscope rate across the move)
   3. unwrap phi, then least squares  phi_i = alpha * n_i + beta
        alpha = degrees per step        <- the answer
   4. residuals: report RMS and max
