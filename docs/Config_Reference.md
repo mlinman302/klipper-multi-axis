@@ -2067,8 +2067,9 @@ gyroscope is for.
 #   1600 Hz, and the headerless FIFO mode this driver uses requires
 #   every enabled sensor to share a rate. The default is 1600, which
 #   needs a fast bus: on I2C it takes about half of a 400 kHz bus and
-#   cannot work at 100 kHz. A window average such as B_MEASURE loses
-#   nothing at a lower rate.
+#   cannot work at 100 kHz, while on SPI at 1 MHz it takes about a
+#   sixth. A window average such as B_MEASURE loses nothing at a lower
+#   rate.
 #accel_range: 2
 #   Accelerometer full scale in g - one of 2, 4, 8 or 16. The chip is
 #   16 bit at every range, so this is a straight resolution-for-
@@ -2087,21 +2088,27 @@ gyroscope is for.
 #   default is accel_z.
 ```
 
-On a Raspberry Pi (or other Linux host) reading the chip through a
-`[mcu rpi]` host MCU, `i2c_speed` is ignored: the bus speed is the
-kernel's, set with `dtparam=i2c_arm_baudrate=400000` in `config.txt`, and
-a Pi defaults to 100 kHz. Use `rate: 400` or lower on I2C unless the bus
-is known to be at 400 kHz and the host has headroom:
+On a Raspberry Pi (or other Linux host), prefer SPI. Enable it with
+`dtparam=spi=on` in `config.txt`, wire the chip to SPI0 with its chip
+select on CE0, and let the kernel drive chip select through a
+`[mcu rpi]` host MCU:
 
 ```
 [mcu rpi]
 serial: /tmp/klipper_host_mcu
 
 [bmi160]
-i2c_mcu: rpi
-i2c_bus: i2c.1
-rate: 400
+cs_pin: rpi:None
+spi_bus: spidev0.0
 ```
+
+The Linux SPI driver honours `spi_speed`, so the default 1600 Hz rate
+needs only a sixth of the default 1 MHz clock, and what limits the rate
+is the host's CPU rather than the bus. On I2C, by contrast, `i2c_speed`
+is ignored on a Linux host: the bus speed is the kernel's, set with
+`dtparam=i2c_arm_baudrate=400000`, and a Pi defaults to 100 kHz. Use
+`rate: 400` or lower there (`i2c_mcu: rpi`, `i2c_bus: i2c.1`) unless the
+bus is known to be at 400 kHz and the host has headroom.
 
 The driver reports a possible FIFO overflow whenever the chip's FIFO is
 too full to take another frame - in the headerless mode used here the

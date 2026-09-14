@@ -444,9 +444,10 @@ class AccelBHoming:
                 "%s: '%s' reported %d possible fifo overflows during the"
                 " measurement - the link to the chip cannot keep up with"
                 " its data rate, so samples were lost and the rest are"
-                " mistimed.  Lower the chip's rate, or on i2c raise the bus"
-                " speed (on a Raspberry Pi host that is"
-                " dtparam=i2c_arm_baudrate in config.txt; i2c_speed is"
+                " mistimed.  Lower the chip's rate.  On spi the wire is"
+                " rarely the limit, so look for a loaded host; on i2c"
+                " also check the bus speed (on a Raspberry Pi host that"
+                " is dtparam=i2c_arm_baudrate in config.txt; i2c_speed is"
                 " ignored there)" % (self.name, self.chip_name, lost))
         # AccelQueryHelper trims to the request window but knows nothing
         # about the settle dwell, so drop that part here.  Samples are

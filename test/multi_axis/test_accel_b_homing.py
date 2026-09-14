@@ -565,7 +565,8 @@ class TestOverflows(unittest.TestCase):
             with self.assertRaises(ConfigError) as cm:
                 obj.measure()
             self.assertIn("2 possible fifo overflows", str(cm.exception))
-            self.assertIn("i2c_arm_baudrate", str(cm.exception))
+            self.assertIn("Lower the chip's rate", str(cm.exception))
+            self.assertIn("On spi", str(cm.exception))
     def test_the_unfused_gyroscope_stream_is_checked_too(self):
         obj = build({'fusion': False}, chip=FakeIMUChip(overflows=1))
         with self.assertRaises(ConfigError):

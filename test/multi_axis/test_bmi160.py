@@ -294,6 +294,75 @@ class TestBusErrors(unittest.TestCase):
         self.assertIn("address 105", str(cm.exception))
 
 
+# A BMI160 on the far end of an SPI bus.  It powers up in I2C mode and
+# only answers SPI once it has seen a rising edge on CSB - which, with
+# the kernel driving chip select, is the end of the first transfer.
+class FakeSPIChip:
+    def __init__(self, present=True):
+        self.present = present
+        self.spi_mode = False
+        self.registers = {bmi160.REG_CHIPID: bmi160.BMI160_DEV_ID}
+        self.transfers = []
+    def spi_transfer(self, data, minclock=0):
+        data = list(data)
+        self.transfers.append(tuple(data))
+        response = [0] * len(data)
+        if self.present and self.spi_mode:
+            reg = data[0] & 0x7f
+            if data[0] & bmi160.REG_MOD_READ:
+                response[1] = self.registers.get(reg, 0)
+            else:
+                self.registers[reg] = data[1]
+        if self.present:
+            self.spi_mode = True
+        return {'response': bytearray(response)}
+
+def build_spi(chip_on_bus, values=None):
+    vals = {'cs_pin': 'rpi:None', 'spi_bus': 'spidev0.0'}
+    vals.update(values or {})
+    chip = build(vals)
+    chip.mcu.is_fileoutput = lambda: False
+    chip.bus.spi_transfer = chip_on_bus.spi_transfer
+    return chip
+
+class TestSPIBus(unittest.TestCase):
+    def test_a_cs_pin_selects_spi(self):
+        # The corertheta machine: SPI0 on the Pi, chip select by the kernel
+        chip = build({'cs_pin': 'rpi:None', 'spi_bus': 'spidev0.0'})
+        self.assertEqual(chip.bus_type, 'spi')
+        self.assertIn("bus_oid_type=spi", chip.mcu.config_cmds[0])
+    def test_the_id_check_first_switches_the_chip_to_spi(self):
+        fake = FakeSPIChip()
+        chip = build_spi(fake)
+        chip._check_id()
+        # A read of an unused register, then the chip id with the read bit
+        self.assertEqual(fake.transfers, [(0xff, 0x00), (0x80, 0x00)])
+    def test_an_absent_chip_is_an_invalid_id_not_a_crash(self):
+        # SPI has no acknowledge: a missing chip reads back as zeros
+        chip = build_spi(FakeSPIChip(present=False))
+        with self.assertRaises(ConfigError) as cm:
+            chip._check_id()
+        self.assertIn("Invalid bmi160 id", str(cm.exception))
+    def test_a_register_write_is_sent_without_the_read_bit_and_verified(self):
+        fake = FakeSPIChip()
+        chip = build_spi(fake)
+        chip._check_id()
+        del fake.transfers[:]
+        chip.set_reg(bmi160.REG_ACC_CONF, 0x2A)
+        self.assertEqual(fake.transfers, [(0x40, 0x2A), (0xC0, 0x00)])
+        self.assertEqual(fake.registers[bmi160.REG_ACC_CONF], 0x2A)
+    def test_a_write_that_does_not_hold_is_refused(self):
+        fake = FakeSPIChip()
+        chip = build_spi(fake)
+        chip._check_id()
+        # The write is clocked out, but nothing comes back on MISO
+        chip.bus.spi_transfer = lambda data, minclock=0: {
+            'response': bytearray(len(data))}
+        with self.assertRaises(ConfigError) as cm:
+            chip.set_reg(bmi160.REG_ACC_CONF, 0x2A)
+        self.assertIn("Failed to set BMI160 register", str(cm.exception))
+
+
 class TestRegisters(unittest.TestCase):
     def test_the_default_accel_conf_matches_the_old_driver(self):
         # 0x2C: acc_bwp=0b010 (normal mode), acc_odr=0b1100 (1600 Hz)

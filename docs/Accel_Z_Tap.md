@@ -9,11 +9,11 @@
 > `src/sensor_bmi160.c`. Path B, and everything else below, stands.
 >
 > **The latency budget below assumed a USB board's RP2040.** On the
-> corertheta machine the BMI160 is on the Raspberry Pi Zero W's I2C1,
+> corertheta machine the BMI160 is on the Raspberry Pi Zero W's SPI0,
 > so the detector runs in klipper_mcu and the trigger is relayed to the
-> LPC1769. Detection delay - dominated by the poll interval, which the
-> I2C bus caps at 400 Hz - biases the recorded Z; the relay only adds
-> overshoot. See [BMI160_IMU.md](BMI160_IMU.md), "On this machine: the
+> LPC1769. Detection delay - dominated by the poll interval, which
+> shrinks with `rate` up to 1600 Hz, as far as the Pi can keep up -
+> biases the recorded Z; the relay only adds overshoot. See [BMI160_IMU.md](BMI160_IMU.md), "On this machine: the
 > detector runs in a Linux process".
 
 **Status: design outline only.** Nothing in this document is
