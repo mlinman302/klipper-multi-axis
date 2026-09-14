@@ -16,10 +16,18 @@
 > biases the recorded Z; the relay only adds overshoot. See [BMI160_IMU.md](BMI160_IMU.md), "On this machine: the
 > detector runs in a Linux process".
 
-**Status: design outline only.** Nothing in this document is
-implemented. It is the same kind of document
-[Accel_B_Homing.md](Accel_B_Homing.md) started as, and it assumes that
-module's hardware and mounting work as read.
+**Status: phase 2 implemented, phase 0 not yet run.** `[accel_z_tap]`
+(`klippy/extras/accel_z_tap.py`) is Path B below on a BMI160: the
+endstop, a probe command, and `ACCEL_TAP_QUERY`, `ACCEL_TAP_TEST` and
+`ACCEL_TAP_CALIBRATE`. It is host-tested only
+(`test/multi_axis/test_accel_z_tap.py`) and has never touched a bed.
+Every number in its config is still the starting point this document
+proposes, so phase 0 - does a contact stand out of the background at
+all - is the first thing to do on the machine, and the commands exist to
+do it. See "What was built" at the end for where the implementation
+settled questions this outline left open. It assumes
+[Accel_B_Homing.md](Accel_B_Homing.md)'s hardware and mounting work as
+read.
 
 The idea is short: drive Z down until the nozzle touches the bed, detect
 the contact as a mechanical shock in the ADXL345 already bolted to the
@@ -518,3 +526,61 @@ test against real recorded taps is worth more than any synthetic one.
   geometry, the slope is the latency.
 * Should the tap module refuse to run unless `[accel_b_homing]` confirms
   B is at zero, or merely warn?
+
+## What was built
+
+`[accel_z_tap]`, reference in
+[Config_Reference.md](Config_Reference.md#accel_z_tap). Where it departs
+from, or pins down, the outline above:
+
+* **Gravity is removed by offset, not only by the high pass.** The sos
+  filter's `auto_offset` subtracts the first sample the detector
+  processes after it arms. A Z move does not tilt the head, so the
+  filter starts from rest whatever B is; without it, a high pass fed a
+  1 g step at arming would ring straight through the threshold. The high
+  pass (50 Hz, second order, by default) is still there, for drift and
+  slow structure, and can be turned off.
+* **The filter runs on raw counts in Q10, not in physical units.** The
+  first version worked in Q16 of g, and a host test that runs a Python
+  copy of `sos_filter_apply()` against the float model showed a 5 Hz
+  fourth-order high pass drifting 12 mg from it - rounding amplified by
+  poles close to the unit circle. Q10 counts is 256 times finer and
+  still leaves 32x of int32 headroom over a full-scale swing. The
+  threshold is configured in g (or deg/s) and converted.
+* **The filter is designed without SciPy.** Butterworth sections by the
+  bilinear transform are a dozen lines, and a Pi Zero W should not need
+  SciPy to home Z. The test suite checks them against
+  `scipy.signal.butter` where SciPy is installed.
+* **Arming is computed, not just delayed.** The detector arms at the
+  move's start plus `HOMING_START_DELAY`, plus the time to reach speed
+  at `min(max_accel, max_z_accel)`, plus `arm_delay`. The trsync still
+  starts with the move. That makes a *blind distance* - 0.67 mm at
+  5 mm/s on this machine - which `ACCEL_TAP_QUERY` reports and which
+  every retract distance is checked against.
+* **The sensor monitor is sized to the FIFO, not the sample rate.**
+  `trigger_analog` counts ticks of one sample period between samples,
+  but a BMI160 delivers four frames at a time and klipper_mcu adds Linux
+  jitter, so the tick is `max(one FIFO poll, sensor_timeout / 5)`.
+* **It is an ordinary endstop, not a probe endstop.** It has no
+  `get_position_endstop()`, so G28 Z runs the normal rail home with
+  `position_endstop` from `[stepper_z]`, and two taps with a
+  `homing_retract_dist`. The two trigger positions must agree within
+  `samples_tolerance` - the "require them to agree" defence, applied to
+  homing itself.
+* **B is checked on the commanded angle by default.** Homed, and within
+  `b_tolerance` of 0. `measure_b: True` adds a fused measurement from
+  `[accel_b_homing]` before each command, which answers the last open
+  question above with "refuse", at the cost of a second or so.
+* **A hot nozzle is refused** above `max_extruder_temp` (150 C), current
+  temperature or target.
+* **`ACCEL_TAP_CALIBRATE` measures rather than sweeps.** Sweeping the
+  threshold means crashing into the bed at thresholds known to be too
+  high. Instead it captures a descent through the air at the probing
+  speed and a few real taps, runs both through the filter on the host,
+  and reports the contact-to-background ratio - the phase 0 deliverable -
+  suggesting the geometric middle of the gap as the threshold.
+
+Not built: the phase 3 cross-check against the BLTouch as a command
+(`ACCEL_TAP_PROBE` then `PROBE` at the same point does it by hand),
+back-dating the trigger to the sample time (BMI160_IMU.md), a CSV dump
+of the tap capture, and tapping at angle.

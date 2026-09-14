@@ -459,6 +459,45 @@ class TestConversion(unittest.TestCase):
 
 
 ######################################################################
+# The tap channel, as the detector and the host each see it
+######################################################################
+
+class TestTapChannel(unittest.TestCase):
+    # The firmware detector reads raw frame bytes; the host reads samples
+    # that went through axes_map.  accel_z_tap compares the two, so the
+    # raw count must be recoverable from a host sample for every mounting.
+    RAW = (1., 1312, -656, 262, 8192, -4096, 16384)
+    def _check_round_trip(self, values):
+        chip = build(values)
+        sample = convert(chip, [self.RAW])[0]
+        sensor, axis = chip.tap_channel.split('_')
+        base = 1 if sensor == 'gyro' else 4
+        expected = self.RAW[base + 'xyz'.index(axis)]
+        self.assertAlmostEqual(chip.raw_trigger_channel(sample), expected,
+                               places=2)
+    def test_every_channel_round_trips_through_the_identity_map(self):
+        for channel in bmi160.TAP_CHANNELS:
+            self._check_round_trip({'tap_channel': channel})
+    def test_raw_counts_survive_a_rotating_and_a_reflecting_map(self):
+        for axes_map in ('z, -y, x', '-x, -y, z', 'x, -y, z', 'y, z, x'):
+            for channel in bmi160.TAP_CHANNELS:
+                self._check_round_trip({'tap_channel': channel,
+                                        'axes_map': axes_map})
+    def test_accel_only_frames(self):
+        chip = build({'gyro': False, 'axes_map': 'y, x, -z'})
+        sample = convert(chip, [(1., 100, 200, 16384)])[0]
+        self.assertAlmostEqual(chip.raw_trigger_channel(sample), 16384.,
+                               places=2)
+    def test_channel_units_follow_the_range(self):
+        chip = build({'accel_range': 16})
+        self.assertEqual(chip.get_trigger_channel_info(),
+                         ('accel_z', 'g', 2048.))
+        chip = build({'tap_channel': 'gyro_y', 'gyro_range': 500})
+        self.assertEqual(chip.get_trigger_channel_info(),
+                         ('gyro_y', 'deg/s', 65.6))
+
+
+######################################################################
 # The two views of one stream
 ######################################################################
 

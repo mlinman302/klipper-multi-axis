@@ -364,6 +364,31 @@ class BMI160:
         if sensor == 'accel' and self.enable_gyro:
             base = 6
         return base + 2 * 'xyz'.index(axis)
+    def get_trigger_channel_info(self):
+        # The watched channel, its unit, and the raw counts per unit the
+        # firmware hands trigger_analog - which is what a detector needs
+        # to put its threshold in physical units
+        if self.tap_channel.startswith('gyro'):
+            return (self.tap_channel, 'deg/s',
+                    GYRO_RANGES[self.gyro_range][1])
+        return self.tap_channel, 'g', ACCEL_RANGES[self.accel_range][1]
+    def raw_trigger_channel(self, sample):
+        # The raw count of the watched channel, recovered from a sample
+        # of start_internal_tap_client().  The host samples went through
+        # axes_map; the firmware detector did not, so undo it to see what
+        # the detector saw.  None if the map dropped that axis.
+        sensor, axis = self.tap_channel.split('_')
+        raw_index = 'xyz'.index(axis)
+        if sensor == 'gyro':
+            axes_map, first_column = self.gyro_axes_map, 1
+        else:
+            axes_map, first_column = self.axes_map, 1
+            if self.enable_gyro:
+                first_column = 4
+        for i, (index, scale) in enumerate(axes_map):
+            if index == raw_index and scale:
+                return sample[first_column + i] / scale
+        return None
 
     ######################################################################
     # Register access
@@ -521,6 +546,12 @@ class BMI160:
         iqh = IMUQueryHelper(self.printer)
         self.batch_bulk.add_client(iqh.handle_batch)
         return iqh
+    def start_internal_tap_client(self):
+        # Whatever stream carries the tap channel - see
+        # raw_trigger_channel()
+        if self.enable_gyro:
+            return self.start_internal_imu_client()
+        return self.start_internal_client()
     def has_gyro(self):
         return self.enable_gyro
     def get_mcu(self):

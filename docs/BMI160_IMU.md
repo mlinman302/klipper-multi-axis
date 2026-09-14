@@ -1,9 +1,9 @@
 # BMI160: an IMU for B homing and Z homing
 
-**Status: architecture.** The sensor layer, the fused B measurement and
-the motion gate are implemented. `B_GYRO_CHECK` and the tap detector
-of [Accel_Z_Tap.md](Accel_Z_Tap.md) land in the phases at the end of
-this document. Nothing here has run on the machine yet; every number
+**Status: architecture.** The sensor layer, the fused B measurement,
+the motion gate and the tap detector of [Accel_Z_Tap.md](Accel_Z_Tap.md)
+(`[accel_z_tap]`) are implemented. `B_GYRO_CHECK` lands in the phases at
+the end of this document. Nothing here has run on the machine yet; every number
 quoted from the datasheet is a datasheet number, not a measurement, and
 `fusion_tau` in particular is a starting point rather than a result.
 
@@ -570,7 +570,10 @@ dispatch, the sensor-quiet monitor - already exists and is shared with
 the load cell and eddy current probes.
 
 This is a seam, not a feature: it is the interface `[accel_z_tap]` plugs
-into in phase 5. No host code calls it yet.
+into. That module reads the channel's unit and scale back with
+`get_trigger_channel_info()`, and recovers the raw count the detector saw
+from an `axes_map`ped host sample with `raw_trigger_channel()`, so the
+capture it checks a tap against is the detector's own input.
 
 ### Offset calibration
 
@@ -829,7 +832,9 @@ measurement at 3200 Hz.
    maximises it, and - on this machine - a verdict on whether the tap
    needs 1600 Hz and whether the Pi can serve it. Measure the tap scatter
    at two speeds: its slope is the detection jitter above.
-6. **`[accel_z_tap]`.** The detector, the endstop, the probe session.
+6. **`[accel_z_tap]`.** The detector, the endstop, the probe command.
+   *Implemented, host-tested only* - see Accel_Z_Tap.md, "What was
+   built". Phase 5 is still what decides whether to home on it.
 
 ## Testing
 
