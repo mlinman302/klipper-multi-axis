@@ -630,7 +630,8 @@ additional_axes: b
 #b_coupling_ratio: 1.0
 #   The travel of a gantry motor (in the units of [stepper_r]) produced
 #   by one degree of B rotation. The default is 1.0, which makes the
-#   differential a plain CoreXY-style sum.
+#   differential a plain CoreXY-style sum. With [accel_b_homing],
+#   B_STEP_CALIBRATE measures it and writes it for SAVE_CONFIG.
 #invert_b_direction: False
 #   Set this to True if the B axis rotates the wrong way while R already
 #   moves in the correct direction. The differential only fixes the two
@@ -3142,6 +3143,34 @@ a gain ratio outside 0.8 to 1.25 or an in-plane radius outside 0.8 to
 fit residuals, and how far the head that measured B=0 before now is from
 B=0. The new calibration is used straight away, and an endstop-less B is
 homed again on it; run `SAVE_CONFIG` to keep it.
+
+`B_STEP_CALIBRATE [START=<deg>] [END=<deg>] [STEPS=<n>] [SETTLE=<s>]
+[SAMPLE_TIME=<s>] [RETURN=0|1]` measures the drive ratio - on corertheta
+`b_coupling_ratio` in `[printer]`, on a dedicated `[stepper_b]` its
+`rotation_distance`. B must be homed, RTCP and the bed-frame B projection
+off, and the sensor calibrated with `B_SENSOR_CALIBRATE` first, since an
+uncorrected offset bends the angle in a way a ratio fit would absorb. The
+head swings through the whole range, so make sure it clears the bed. It
+turns the head to `STEPS` evenly spaced stations from `START` to `END`
+(default: 5 degrees inside `position_min` and `position_max`, 13
+stations), approaching all of them from the same side after 5 degrees of
+over-travel, which must fit inside the soft limits. At each station it
+waits `SETTLE` (default 1.0), measures the fused angle for `SAMPLE_TIME`
+(default 1.0), and reads the angle the motors' step counters imply - on
+corertheta the sum of both gantry motors, so the radius cancels. It fits
+a straight line through them: the slope is how far the head turns per
+commanded degree, and `b_coupling_ratio` is divided by it
+(`rotation_distance` multiplied). `RETURN=1` visits the stations again in
+the opposite direction and reports the backlash, keeping it out of the
+ratio. The sweep must cover at least 20 degrees; a slope outside 0.5 to 2
+is refused, changing nothing, and a failure parks the head at B=0. It
+reports every station's residual - their shape is the diagnostic, see
+[Accel_B_Homing.md](Accel_B_Homing.md). The new ratio takes effect only
+after `SAVE_CONFIG` restarts klippy, and B must then be homed again.
+
+`B_STEP_CALIBRATE MODE=QUICK [ANGLE=<deg>]` is a two-point spot check
+from B=0 to `ANGLE` (default 90) that reports the slope and writes
+nothing.
 
 Measuring works with `[rtcp]` and `[b_projection]` enabled - it reads a
 physical angle, so no frame has to be switched off. The comparison

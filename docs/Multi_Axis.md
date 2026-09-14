@@ -801,12 +801,13 @@ the touching.
 * **Rotational limits in the kinematics classes**, so `axis_minimum` /
   `axis_maximum` and the front-end status describe the rotational axes
   too.
-* **Drive-ratio calibration against the head IMU** - design outline in
+* **Run the drive-ratio calibration on the machine.**
+  `B_STEP_CALIBRATE` is implemented - see
   [Accel_B_Homing.md](Accel_B_Homing.md), which also covers the
-  gravity-referenced B home that is already implemented: the corertheta
-  B axis has no endstop, `G28 B` measures the head and turns it to
-  B = 0, and `[stepper_tilt]`'s range is a soft limit.  The calibration
-  would make `b_coupling_ratio` measured rather than nominal.
+  gravity-referenced B home: the corertheta B axis has no endstop,
+  `G28 B` measures the head and turns it to B = 0, and
+  `[stepper_tilt]`'s range is a soft limit.  Until it has run,
+  `b_coupling_ratio` is nominal rather than measured.
 * **Accelerometer Z homing by tapping the bed with the nozzle**, using
   the same head-mounted IMU - design outline in
   [Accel_Z_Tap.md](Accel_Z_Tap.md).  Contact is detected on the

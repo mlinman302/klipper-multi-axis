@@ -264,6 +264,12 @@ class FakeGCmd:
         if default is Ellipsis:
             raise ConfigError("Missing %s" % (name,))
         return default
+    def get(self, name, default=Ellipsis):
+        if name in self.params:
+            return str(self.params[name])
+        if default is Ellipsis:
+            raise ConfigError("Missing %s" % (name,))
+        return default
     def respond_info(self, msg):
         self.responses.append(msg)
 
@@ -904,9 +910,18 @@ class FakeStepperEnable:
 # turns per commanded degree: 1 is a correct b_coupling_ratio, 0.9 a
 # drive that falls short, -1 a positive_vector that disagrees with the
 # motors, and 0 a head the motors are not driving.
+#
+# backlash is a dead band, in degrees of commanded B, that the motors
+# have to take up whenever they reverse before the head follows.  steps
+# is where the step counters stand, as an angle with an arbitrary zero -
+# set_measured_position() books a new B but does not step anything.
 class FakeMeasuredAxis:
-    def __init__(self, chip, ratio=1., rng=(-45., 100.)):
+    def __init__(self, chip, ratio=1., rng=(-45., 100.), backlash=0.):
         self.chip, self.ratio, self.rng = chip, ratio, rng
+        self.backlash = backlash
+        self.lash = 0.
+        self.steps = 1000.
+        self.drive_options = [('printer', 'b_coupling_ratio', 1., True)]
         self.position = None
         self.is_homed = False
         self.moves = []
@@ -934,8 +949,24 @@ class FakeMeasuredAxis:
         if angle < lo or angle > hi:
             raise ConfigError("Rotary axis B move out of range")
         self.moves.append(angle)
-        self.chip.angle += self.ratio * (angle - self.position)
+        # The head follows the motors through the dead band: d is where
+        # the drive holds the head, in commanded degrees
+        half = .5 * self.backlash
+        d_old = self.position + self.lash
+        if angle > self.position:
+            d_new = max(d_old, angle - half)
+        elif angle < self.position:
+            d_new = min(d_old, angle + half)
+        else:
+            d_new = d_old
+        self.chip.angle += self.ratio * (d_new - d_old)
+        self.lash = d_new - angle
+        self.steps += angle - self.position
         self.position = angle
+    def get_step_position(self):
+        return self.steps
+    def get_drive_ratio_options(self):
+        return list(self.drive_options)
 
 def build_home(head_angle, ratio=1., config_values=None, rng=(-45., 100.)):
     chip = FakeIMUChip(angle=head_angle)
@@ -1610,6 +1641,283 @@ class TestSensorCalibrationCommand(unittest.TestCase):
         with self.assertRaises(ConfigError) as cm:
             self._run(obj, gcmd)
         self.assertIn("B_SENSOR_CALIBRATE must run", str(cm.exception))
+        self.assertEqual(axis.moves, [])
+
+
+######################################################################
+# Drive ratio calibration: the fit, the step hooks and B_STEP_CALIBRATE
+######################################################################
+
+class TestDriveFit(unittest.TestCase):
+    def test_one_leg_recovers_the_scale(self):
+        pts = [(t, .97 * t + 3.2, 0) for t in (-40., -10., 25., 60., 90.)]
+        scale, offsets, residuals = abh.fit_drive_sweep(pts)
+        self.assertAlmostEqual(scale, .97, places=9)
+        self.assertAlmostEqual(offsets[0], 3.2, places=9)
+        for r in residuals:
+            self.assertAlmostEqual(r, 0., places=9)
+    def test_two_legs_share_the_scale_and_split_the_offset(self):
+        ts = [-40., 0., 45., 90.]
+        pts = ([(t, 1.02 * t - .2, 0) for t in ts]
+               + [(t, 1.02 * t + .2, 1) for t in reversed(ts)])
+        scale, offsets, residuals = abh.fit_drive_sweep(pts)
+        self.assertAlmostEqual(scale, 1.02, places=9)
+        self.assertAlmostEqual(offsets[1] - offsets[0], .4, places=9)
+    def test_the_zero_of_the_step_counters_does_not_matter(self):
+        pts = [(t + 12345., 1.01 * t, 0) for t in (-40., 0., 40., 80.)]
+        self.assertAlmostEqual(abh.fit_drive_sweep(pts)[0], 1.01, places=7)
+    def test_too_few_stations_are_refused(self):
+        with self.assertRaises(ValueError):
+            abh.fit_drive_sweep([(0., 0., 0.)])
+
+# A step counter with a known resolution, for the kinematics hooks
+class FakeCountingStepper(FakeStepper):
+    def __init__(self, name, mcu_position, step_dist, rotation_distance=40.):
+        FakeStepper.__init__(self, name)
+        self.mcu_position, self.step_dist = mcu_position, step_dist
+        self.rotation_distance = rotation_distance
+    def get_mcu_position(self):
+        return self.mcu_position
+    def get_step_dist(self):
+        return self.step_dist
+    def get_rotation_distance(self):
+        return self.rotation_distance, 200
+
+class FakeStepperRail:
+    def __init__(self, steppers):
+        self.steppers = steppers
+    def get_steppers(self):
+        return list(self.steppers)
+
+class TestStepHooks(unittest.TestCase):
+    def _kin(self, n_r, n_tilt, b_coeff=1., b_ratio=1.):
+        from kinematics import corertheta
+        kin = corertheta.CoreRThetaKinematics.__new__(
+            corertheta.CoreRThetaKinematics)
+        kin.b_coeff, kin.b_ratio = b_coeff, b_ratio
+        kin.rail_r = FakeStepperRail(
+            [FakeCountingStepper('stepper_r', n_r, .01)])
+        kin.rail_b = FakeStepperRail(
+            [FakeCountingStepper('stepper_tilt', n_tilt, .01)])
+        return kin
+    def test_corertheta_counts_b_from_the_sum_of_the_motors(self):
+        # B = 10 deg at a ratio of 2 is 20 mm of belt on both motors, and
+        # a radius of 30 mm moves them 30 mm apart
+        kin = self._kin(n_r=(20. - 30.) / .01, n_tilt=(20. + 30.) / .01,
+                        b_coeff=2., b_ratio=2.)
+        self.assertAlmostEqual(kin.get_axis_step_position('b'), 10.)
+        other = self._kin(n_r=(20. - 80.) / .01, n_tilt=(20. + 80.) / .01,
+                          b_coeff=2., b_ratio=2.)
+        self.assertAlmostEqual(other.get_axis_step_position('b'), 10.)
+        self.assertIsNone(kin.get_axis_step_position('r'))
+    def test_corertheta_counts_through_invert_b_direction(self):
+        kin = self._kin(n_r=-2000, n_tilt=-2000, b_coeff=-2., b_ratio=2.)
+        self.assertAlmostEqual(kin.get_axis_step_position('b'), 10.)
+    def test_corertheta_names_b_coupling_ratio(self):
+        kin = self._kin(0, 0, b_coeff=-1.5, b_ratio=1.5)
+        self.assertEqual(kin.get_axis_drive_ratio('b'),
+                         [('printer', 'b_coupling_ratio', 1.5, True)])
+    def test_a_dedicated_stepper_counts_its_own_steps(self):
+        ra = rotary_axis.BaseRotaryAxis()
+        ra.steppers = [FakeCountingStepper('stepper_b', 450, .2, 72.)]
+        self.assertAlmostEqual(ra.get_step_position(), 90.)
+        self.assertEqual(ra.get_drive_ratio_options(),
+                         [('stepper_b', 'rotation_distance', 72., False)])
+    def test_a_coupled_axis_asks_the_kinematics(self):
+        printer = FakePrinter()
+        toolhead = FakeToolhead()
+        kin = self._kin(1000, 1000)
+        toolhead.get_kinematics = lambda: kin
+        printer.add_object('toolhead', toolhead)
+        ra = rotary_axis.CoupledRotaryAxis.__new__(
+            rotary_axis.CoupledRotaryAxis)
+        ra.printer, ra.axis_letter = printer, 'b'
+        self.assertAlmostEqual(ra.get_step_position(), 10.)
+        self.assertEqual(ra.get_drive_ratio_options()[0][1],
+                         'b_coupling_ratio')
+
+# The sensor is calibrated in these tests, as B_STEP_CALIBRATE requires,
+# and its offsets are real, so that a calibration that was ignored would
+# bend the angles and show up in the fit
+DRIVE_OFFSET = (-980., 0., 150.)
+DRIVE_CALIBRATION = {'offset_u': -980., 'offset_w': 150.}
+
+def build_drive(ratio=1., backlash=0., rng=(-45., 100.), config_values=None,
+                noise=0.):
+    values = dict(DRIVE_CALIBRATION)
+    values.update(config_values or {})
+    chip = FakeIMUChip(angle=0., offset=DRIVE_OFFSET, noise=noise)
+    obj, axis, configfile = build_calibration(chip, ratio, rng, values,
+                                              home=False)
+    axis.backlash = backlash
+    return obj, axis, configfile, chip
+
+class TestDriveCalibration(unittest.TestCase):
+    def _calibrate(self, obj, axis, start=-40., end=95., steps=10,
+                   sweep_back=False, save=True):
+        return obj.calibrate_drive(axis, start, end, steps, 0., .7,
+                                   sweep_back, save)
+    def _responses(self, obj):
+        return "\n".join(obj.printer.lookup_object('gcode').responses)
+    def test_a_short_drive_raises_b_coupling_ratio(self):
+        obj, axis, configfile, chip = build_drive(ratio=.95)
+        scale = self._calibrate(obj, axis)
+        self.assertAlmostEqual(scale, .95, places=6)
+        self.assertEqual(configfile.saved[('printer', 'b_coupling_ratio')],
+                         "%.6f" % (1. / .95,))
+        out = self._responses(obj)
+        self.assertIn("0.95000 deg per commanded degree (-5.000 %)", out)
+        self.assertIn("b_coupling_ratio = 1.052632 in [printer]", out)
+        self.assertIn("SAVE_CONFIG", out)
+        self.assertEqual(axis.moves[-1], 0.)
+    def test_a_correct_drive_writes_the_same_ratio(self):
+        obj, axis, configfile, _ = build_drive(ratio=1.)
+        self._calibrate(obj, axis)
+        self.assertEqual(configfile.saved[('printer', 'b_coupling_ratio')],
+                         "1.000000")
+    def test_rotation_distance_scales_the_other_way(self):
+        obj, axis, configfile, _ = build_drive(ratio=1.04)
+        axis.drive_options = [('stepper_b', 'rotation_distance', 40., False)]
+        self._calibrate(obj, axis)
+        self.assertEqual(configfile.saved[('stepper_b', 'rotation_distance')],
+                         "%.6f" % (40. * 1.04,))
+    def test_every_station_is_approached_from_the_same_side(self):
+        obj, axis, _, _ = build_drive()
+        self._calibrate(obj, axis, -40., 50., 4)
+        self.assertEqual(axis.moves, [-45., -40., -10., 20., 50., 0.])
+        obj, axis, _, _ = build_drive()
+        self._calibrate(obj, axis, 50., -40., 4, sweep_back=True)
+        self.assertEqual(axis.moves, [55., 50., 20., -10., -40., -45., -40.,
+                                      -10., 20., 50., 0.])
+    def test_backlash_stays_out_of_the_ratio(self):
+        obj, axis, configfile, _ = build_drive(ratio=.97, backlash=.6)
+        scale = self._calibrate(obj, axis, sweep_back=True)
+        self.assertAlmostEqual(scale, .97, places=6)
+        self.assertIn("backlash 0.582 deg", self._responses(obj))
+    def test_backlash_is_measured_the_same_on_a_descending_sweep(self):
+        obj, axis, _, _ = build_drive(ratio=.97, backlash=.6)
+        self._calibrate(obj, axis, 95., -40., 10, sweep_back=True)
+        self.assertIn("backlash 0.582 deg", self._responses(obj))
+    def test_noise_leaves_the_ratio_well_inside_a_part_in_a_thousand(self):
+        obj, axis, _, _ = build_drive(ratio=.98, noise=150.)
+        self.assertAlmostEqual(self._calibrate(obj, axis), .98, delta=.001)
+    def test_an_uncalibrated_sensor_is_refused_before_moving(self):
+        obj, axis, configfile, _ = build_drive(
+            config_values={'offset_u': 0., 'offset_w': 0.})
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis)
+        self.assertIn("B_SENSOR_CALIBRATE first", str(cm.exception))
+        self.assertEqual(axis.moves, [])
+        self.assertEqual(configfile.saved, {})
+    def test_a_short_arc_is_refused_before_moving(self):
+        obj, axis, _, _ = build_drive()
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis, 0., 15.)
+        self.assertIn("at least 20", str(cm.exception))
+        self.assertEqual(axis.moves, [])
+    def test_no_room_to_over_travel_is_refused_before_moving(self):
+        obj, axis, _, _ = build_drive()
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis, -45., 95.)
+        self.assertIn("from START=-45.00 that reaches -50.00",
+                      str(cm.exception))
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis, -40., 100., sweep_back=True)
+        self.assertIn("from END=100.00 that reaches 105.00",
+                      str(cm.exception))
+        self.assertEqual(axis.moves, [])
+    def test_a_reversed_head_is_refused_and_parked(self):
+        obj, axis, configfile, _ = build_drive(ratio=-1., rng=(-100., 100.))
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis, -40., 40., 5)
+        self.assertIn("disagree about which way is +B", str(cm.exception))
+        self.assertEqual(axis.moves[-1], 0.)
+        self.assertEqual(configfile.saved, {})
+    def test_a_head_that_does_not_follow_is_refused(self):
+        obj, axis, configfile, _ = build_drive(ratio=.3)
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis)
+        self.assertIn("not following the motors", str(cm.exception))
+        self.assertEqual(configfile.saved, {})
+    def test_a_failed_measurement_parks_the_head(self):
+        obj, axis, configfile, chip = build_drive()
+        moves = []
+        real_move = axis.move_axis
+        def move_then_break(angle, speed=None):
+            real_move(angle, speed)
+            moves.append(angle)
+            if len(moves) == 3:
+                chip.overflows = 4
+            elif angle == 0.:
+                chip.overflows = 0
+        axis.move_axis = move_then_break
+        with self.assertRaises(ConfigError) as cm:
+            self._calibrate(obj, axis)
+        self.assertIn("fifo overflows", str(cm.exception))
+        self.assertEqual(axis.moves[-1], 0.)
+        self.assertEqual(configfile.saved, {})
+    def test_a_spot_check_changes_nothing(self):
+        obj, axis, configfile, _ = build_drive(ratio=.95)
+        scale = self._calibrate(obj, axis, 0., 90., 2, save=False)
+        self.assertAlmostEqual(scale, .95, places=6)
+        self.assertEqual(configfile.saved, {})
+        self.assertIn("nothing was changed", self._responses(obj))
+    def test_it_reads_the_fused_angle(self):
+        obj, axis, _, _ = build_drive()
+        calls = []
+        real = obj.measure_vertical
+        def spy(*args):
+            calls.append(args)
+            return real(*args)
+        obj.measure_vertical = spy
+        self._calibrate(obj, axis, -40., 50., 4)
+        self.assertEqual(len(calls), 4)
+
+class TestDriveCalibrationCommand(unittest.TestCase):
+    def _build(self, **params):
+        obj, axis, configfile, _ = build_drive(ratio=.95)
+        obj.b_axis = axis
+        params.setdefault('SETTLE', 0.)
+        params.setdefault('SAMPLE_TIME', .7)
+        return obj, axis, configfile, FakeGCmd(params)
+    def _run(self, obj, gcmd):
+        obj.printer.lookup_object('gcode').commands['B_STEP_CALIBRATE'](gcmd)
+    def test_it_sweeps_inside_the_soft_limits_by_default(self):
+        obj, axis, configfile, gcmd = self._build(STEPS=4)
+        self._run(obj, gcmd)
+        self.assertEqual(axis.moves, [-45., -40., 5., 50., 95., 0.])
+        self.assertIn(('printer', 'b_coupling_ratio'), configfile.saved)
+    def test_return_sweeps_back(self):
+        obj, axis, _, gcmd = self._build(STEPS=4, RETURN=1)
+        self._run(obj, gcmd)
+        self.assertEqual(axis.moves[5:], [100., 95., 50., 5., -40., 0.])
+    def test_quick_mode_is_a_two_point_check(self):
+        obj, axis, configfile, gcmd = self._build(MODE='quick', ANGLE=60.)
+        self._run(obj, gcmd)
+        self.assertEqual(axis.moves, [-5., 0., 60., 0.])
+        self.assertEqual(configfile.saved, {})
+    def test_an_unknown_mode_is_refused(self):
+        obj, axis, _, gcmd = self._build(MODE='SLOW')
+        with self.assertRaises(ConfigError):
+            self._run(obj, gcmd)
+        self.assertEqual(axis.moves, [])
+    def test_it_needs_b_homed(self):
+        obj, axis, _, gcmd = self._build()
+        axis.is_homed = False
+        with self.assertRaises(ConfigError) as cm:
+            self._run(obj, gcmd)
+        self.assertIn("G28 B", str(cm.exception))
+        self.assertEqual(axis.moves, [])
+    def test_it_refuses_with_b_projection_on(self):
+        class Projection:
+            def check_disabled(self, what):
+                raise ConfigError("%s must run with the B projection off"
+                                  % (what,))
+        obj, axis, _, gcmd = self._build()
+        obj.printer.add_object('b_projection', Projection())
+        with self.assertRaises(ConfigError) as cm:
+            self._run(obj, gcmd)
+        self.assertIn("B_STEP_CALIBRATE must run", str(cm.exception))
         self.assertEqual(axis.moves, [])
 
 

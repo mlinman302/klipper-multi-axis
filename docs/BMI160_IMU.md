@@ -661,8 +661,8 @@ answer "was this a static tilt?", which is a different question from
 a commanded B move, integrate the on-axis rate across it, report swept
 angle against commanded angle. It is a check, not a calibration: it
 writes nothing, and the drive ratio comes from fused station angles in
-`B_STEP_CALIBRATE`. Of `[accel_b_homing]` today only `G28 B` moves the
-machine, and it measures a parked head before and after each move, so it
+`B_STEP_CALIBRATE`. Everything in `[accel_b_homing]` that moves the
+machine measures a parked head before and after each move, so it
 checks the fused angle's sense of rotation but not the gyroscope's sign
 on its own. It is `B_GYRO_CHECK` that finally verifies that sign, per
 the limits noted above.

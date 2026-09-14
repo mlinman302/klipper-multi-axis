@@ -148,6 +148,28 @@ class CoreRThetaKinematics:
         if axis_name == 'r':
             return self.rail_r
         return None
+    def get_axis_step_position(self, axis_name):
+        # The B angle the gantry motors' integer step counters imply, for
+        # B_STEP_CALIBRATE to fit the measured head angle against.  As in
+        # calc_position() the sum of the two motors is B alone - the
+        # radius cancels - so the arm may move during a sweep without
+        # disturbing it.  The counters survive set_position() unchanged,
+        # but their zero is arbitrary: only differences mean anything.
+        if axis_name != 'b':
+            return None
+        travel = 0.
+        for rail in (self.rail_r, self.rail_b):
+            s = rail.get_steppers()[0]
+            travel += s.get_mcu_position() * s.get_step_dist()
+        return .5 * travel / self.b_coeff
+    def get_axis_drive_ratio(self, axis_name):
+        # The options that set how far B turns per step, as (section,
+        # option, value, per_degree).  b_coupling_ratio is belt travel per
+        # degree, so a head that turns further than commanded needs less
+        # of it - see [accel_b_homing] B_STEP_CALIBRATE.
+        if axis_name != 'b':
+            return None
+        return [('printer', 'b_coupling_ratio', self.b_ratio, True)]
     def calc_position(self, stepper_positions):
         bed_angle = stepper_positions[self.stepper_bed.get_name()]
         # stepper_r runs the '-' solver (b*ratio - radius) and

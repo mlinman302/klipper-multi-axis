@@ -175,6 +175,24 @@ class BaseRotaryAxis:
     def get_drive_steppers(self):
         # Every motor that has to be energised to hold this axis still
         return list(self.steppers)
+    def get_step_position(self):
+        # The axis angle the integer step counters imply - what the
+        # motors were actually stepped to, rounding included, rather than
+        # the commanded float.  Its zero is arbitrary, so only differences
+        # mean anything.  None if the steps cannot be counted.
+        if not self.steppers:
+            return None
+        s = self.steppers[0]
+        return s.get_mcu_position() * s.get_step_dist()
+    def get_drive_ratio_options(self):
+        # The config options that set how far the axis turns per step, as
+        # a list of (section, option, value, per_degree): per_degree is
+        # True for drive travel per degree, which a head turning further
+        # than commanded needs less of, and False for degrees per
+        # revolution, which it needs more of.
+        return [(s.get_name(), 'rotation_distance',
+                 s.get_rotation_distance()[0], False)
+                for s in self.steppers]
     def set_homing_source(self, source):
         # Something that can measure the axis - [accel_b_homing] is one.
         # It does two jobs, depending on the rail:
@@ -384,6 +402,16 @@ class CoupledRotaryAxis(BaseRotaryAxis):
         self._register()
     def get_drive_steppers(self):
         return list(self.drive_steppers)
+    def get_step_position(self):
+        # The rail's own stepper counts only part of a coupled drive, so
+        # the kinematics, which knows how the motors mix, answers instead
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        get_pos = getattr(kin, 'get_axis_step_position', None)
+        return get_pos(self.axis_letter) if get_pos is not None else None
+    def get_drive_ratio_options(self):
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        get_ratio = getattr(kin, 'get_axis_drive_ratio', None)
+        return (get_ratio(self.axis_letter) or []) if get_ratio else []
 
 
 # Called from toolhead.add_printer_objects() once the toolhead exists

@@ -165,6 +165,31 @@
 # Repeatability was always much better than accuracy - a stationary head
 # re-measures to a few hundredths of a degree - and the calibration is
 # what closes the gap.
+#
+# DRIVE RATIO CALIBRATION
+#
+# B_STEP_CALIBRATE answers how far the head really turns per step.  It
+# sweeps B through a row of stations and at each one records two angles:
+# the one the integer step counters imply (axis.get_step_position(), on
+# corertheta the sum of both gantry motors, so the radius cancels) and
+# the fused angle from vertical.  A drive ratio that is off by a factor
+# makes the head turn that factor per commanded degree, so the fit is a
+# straight line,
+#
+#   measured = scale * step_angle + offset
+#
+# and scale is the correction: b_coupling_ratio (belt travel per degree)
+# is divided by it, a dedicated stepper's rotation_distance (degrees per
+# revolution) multiplied.  Neither the zero of the sensor nor that of the
+# step counters matters - both land in the offset.  The sensor's gain and
+# offsets do matter, since they bend the angle non-linearly, so the
+# sensor must be calibrated first.
+#
+# Every station is approached from the same side, after an over-travel
+# of STEP_TAKEUP, so backlash is a constant in the offset rather than
+# noise in the scale.  RETURN=1 sweeps back the other way too, and the two
+# legs are fitted with one common scale and an offset each: the
+# difference of those offsets is the backlash.
 import collections, logging, math
 import stepper
 
@@ -230,6 +255,18 @@ MAX_FIT_RADIUS = 1.2 * FREEFALL_ACCEL
 # offsets it fits are worth degrees, so the noise on them should not be
 CALIBRATE_SETTLE_TIME = 1.
 CALIBRATE_SAMPLE_TIME = 1.
+
+# Drive ratio calibration.  The over-travel before each leg of a sweep,
+# in degrees - far more than belt backlash - so every station is
+# approached from the same side.
+STEP_TAKEUP = 5.
+# The ratio error is roughly the angle noise divided by the arc, so a
+# short arc is refused rather than fitted
+MIN_STEP_ARC = 20.
+MIN_STEP_STATIONS = 3
+# Above this the residuals are worth a warning - see "Reading the
+# residuals" in docs/Accel_B_Homing.md
+STEP_RESIDUAL_WARNING = .2
 
 # Levi-Civita symbol, for the cross product in gyro_axis_coefficient()
 LEVI_CIVITA = {(0, 1, 2): 1., (1, 2, 0): 1., (2, 0, 1): 1.,
@@ -360,6 +397,27 @@ def fit_ellipse(points, fit_gain):
         raise ValueError("the points do not lie on an ellipse")
     return (u0 * scale, w0 * scale, 1. / math.sqrt(b),
             math.sqrt(radius_sq) * scale)
+
+def fit_drive_sweep(points):
+    # points are (step_angle, measured_angle, leg), leg 0 for the outbound
+    # sweep and 1 for the return.  Fits
+    #   measured = scale * step_angle + offsets[leg]
+    # with one scale shared by every leg.  Returns (scale, offsets,
+    # residuals), residuals in the order of the points.
+    legs = sorted(set([leg for t, phi, leg in points]))
+    column = dict((leg, i) for i, leg in enumerate(legs))
+    design = []
+    for t, phi, leg in points:
+        row = [t] + [0.] * len(legs)
+        row[1 + column[leg]] = 1.
+        design.append(row)
+    if len(points) < len(design[0]):
+        raise ValueError("too few stations to fit")
+    solution = least_squares(design, [phi for t, phi, leg in points])
+    scale = solution[0]
+    offsets = dict((leg, solution[1 + column[leg]]) for leg in legs)
+    residuals = [phi - (scale * t + offsets[leg]) for t, phi, leg in points]
+    return scale, offsets, residuals
 
 def unwrap_angles(angles):
     # Angles in visiting order, unwrapped so a sweep through +/-180 stays
@@ -559,6 +617,9 @@ class AccelBHoming:
         gcode.register_command('B_SENSOR_CALIBRATE',
                                self.cmd_B_SENSOR_CALIBRATE,
                                desc=self.cmd_B_SENSOR_CALIBRATE_help)
+        gcode.register_command('B_STEP_CALIBRATE',
+                               self.cmd_B_STEP_CALIBRATE,
+                               desc=self.cmd_B_STEP_CALIBRATE_help)
     def _get_axis(self, config, option):
         try:
             return parse_signed_axis(config.get(option))
@@ -1110,6 +1171,150 @@ class AccelBHoming:
         return calibration
 
     ######################################################################
+    # Drive ratio calibration
+    ######################################################################
+    def _return_to_zero(self, axis):
+        # Leaves the head at a defined angle on an error path, without
+        # letting a failure to get there hide the error that got here
+        try:
+            axis.move_axis(0.)
+        except self.printer.command_error:
+            logging.exception("%s: could not return B to 0", self.name)
+    def _check_drive_scale(self, scale):
+        if MIN_RESPONSE_RATIO <= scale <= MAX_RESPONSE_RATIO:
+            return
+        if scale <= -MIN_RESPONSE_RATIO:
+            hint = ("positive_vector and the motors disagree about which way"
+                    " is +B - check positive_vector, then invert_b_direction"
+                    " in [printer]")
+        elif scale > MAX_RESPONSE_RATIO:
+            hint = ("that is too far off to be fitted safely - correct the"
+                    " drive ratio by hand first")
+        else:
+            hint = ("the head is not following the motors - check that they"
+                    " are driving it, and that the sensor is on the rotating"
+                    " part of the head")
+        raise self.printer.command_error(
+            "%s: the head turned %.3f deg per commanded degree over the"
+            " sweep, so nothing was changed: %s" % (self.name, scale, hint))
+    def calibrate_drive(self, axis, start, end, steps, settle_time,
+                        sample_time, sweep_back=False, save=True):
+        # Sweeps B from start to end (and back, with sweep_back), fits the
+        # measured head angle against the angle the step counters imply,
+        # and writes the corrected drive ratio for SAVE_CONFIG.  With
+        # save=False it is a spot check that changes nothing.  Returns
+        # the scale: degrees the head turned per commanded degree.
+        error = self.printer.command_error
+        options = axis.get_drive_ratio_options()
+        if axis.get_step_position() is None or not options:
+            raise error("%s: the B drive does not report its step counters"
+                        " or its drive ratio, so it cannot be calibrated"
+                        % (self.name,))
+        if self.calibration == IDENTITY_CALIBRATION:
+            raise error(
+                "%s: the sensor is uncalibrated.  Its offsets bend the"
+                " measured angle, which a drive ratio fit would book as"
+                " ratio error - run B_SENSOR_CALIBRATE first" % (self.name,))
+        pos_min, pos_max = axis.get_range()
+        for name, value in (('START', start), ('END', end)):
+            if not pos_min <= value <= pos_max:
+                raise error(
+                    "%s: %s=%.2f is outside the soft limits of %.2f to %.2f"
+                    % (self.name, name, value, pos_min, pos_max))
+        if abs(end - start) < MIN_STEP_ARC:
+            raise error(
+                "%s: a sweep from %.2f to %.2f is too short to fit a drive"
+                " ratio on - it needs to cover at least %.0f deg"
+                % (self.name, start, end, MIN_STEP_ARC))
+        if steps < 2:
+            raise error("%s: a drive ratio needs at least 2 stations"
+                        % (self.name,))
+        # Over-travel before each leg, so every station on it is approached
+        # from the same side and backlash stays out of the scale
+        direction = 1. if end > start else -1.
+        approach = start - direction * STEP_TAKEUP
+        overshoot = end + direction * STEP_TAKEUP
+        turns = [('START', start, approach)]
+        if sweep_back:
+            turns.append(('END', end, overshoot))
+        for name, value, turn in turns:
+            if not pos_min <= turn <= pos_max:
+                raise error(
+                    "%s: every station is approached from the same side,"
+                    " after %.0f deg of over-travel, and from %s=%.2f that"
+                    " reaches %.2f - outside the soft limits of %.2f to %.2f."
+                    "  Move %s at least %.0f deg inside the limit"
+                    % (self.name, STEP_TAKEUP, name, value, turn, pos_min,
+                       pos_max, name, STEP_TAKEUP))
+        stations = [start + (end - start) * i / (steps - 1.)
+                    for i in range(steps)]
+        plan = [(approach, None)] + [(s, 0) for s in stations]
+        if sweep_back:
+            plan += [(overshoot, None)] + [(s, 1) for s in reversed(stations)]
+        self._energise(axis)
+        records = []
+        try:
+            for commanded, leg in plan:
+                axis.move_axis(commanded)
+                if leg is None:
+                    continue
+                step_angle = axis.get_step_position()
+                measured = self.measure_vertical(settle_time, sample_time)
+                records.append((commanded, leg, step_angle, measured))
+            angles = unwrap_angles([r[3] for r in records])
+            try:
+                scale, offsets, residuals = fit_drive_sweep(
+                    [(r[2], phi, r[1]) for r, phi in zip(records, angles)])
+            except ValueError as e:
+                raise error("%s: the drive fit failed: %s - the head was"
+                            " likely moving during the sweep" % (self.name, e))
+            self._check_drive_scale(scale)
+        except error:
+            self._return_to_zero(axis)
+            raise
+        lines = ["%s: drive calibration from B = %.1f to %.1f, %d stations%s"
+                 % (self.name, start, end, steps,
+                    " and back" if sweep_back else "")]
+        for (commanded, leg, step_angle, measured), phi, residual in zip(
+                records, angles, residuals):
+            lines.append("  B %7.2f %s: measured %8.3f deg, residual %+.3f"
+                         % (commanded, "back" if leg else "out ", phi,
+                            residual))
+        rms = math.sqrt(sum([r * r for r in residuals]) / len(residuals))
+        lines.append("  the head turns %.5f deg per commanded degree (%+.3f %%)"
+                     % (scale, 100. * (scale - 1.)))
+        if sweep_back:
+            # Each leg lags behind the motors in its own direction, so the
+            # return leg reads further back along the sweep
+            backlash = direction * (offsets[1] - offsets[0])
+            lines.append("  backlash %.3f deg, from the offset between the"
+                         " outbound and return sweeps" % (backlash,))
+        lines.append("  residual rms %.3f deg, max %.3f"
+                     % (rms, max([abs(r) for r in residuals])))
+        if rms > STEP_RESIDUAL_WARNING:
+            lines.append("  The residuals are large for a head measured at"
+                         " rest: look at their shape before trusting the"
+                         " ratio (see docs/Accel_B_Homing.md)")
+        configfile = self.printer.lookup_object('configfile')
+        for section, option, value, per_degree in options:
+            new_value = value / scale if per_degree else value * scale
+            lines.append("  %s = %.6f in [%s] (was %.6f)"
+                         % (option, new_value, section, value))
+            if save:
+                configfile.set(section, option, "%.6f" % (new_value,))
+        if save:
+            lines.append("  Run SAVE_CONFIG to keep it.  The drive does not"
+                         " change until the restart that follows, and B must"
+                         " be homed again after it.")
+        else:
+            lines.append("  A spot check - nothing was changed.  Run"
+                         " B_STEP_CALIBRATE without MODE=QUICK to fit and"
+                         " save the ratio.")
+        self._respond("\n".join(lines))
+        axis.move_axis(0.)
+        return scale
+
+    ######################################################################
     # Comparison against the commanded angle
     ######################################################################
     def is_b_homed(self):
@@ -1169,6 +1374,36 @@ class AccelBHoming:
         fit_gain = gcmd.get_int('GAIN', 1, minval=0, maxval=1)
         self.calibrate_sensor(self.b_axis, start, end, steps, settle, window,
                               bool(fit_gain))
+    cmd_B_STEP_CALIBRATE_help = ("Sweep B and fit the drive ratio against the"
+                                 " measured head angle")
+    def cmd_B_STEP_CALIBRATE(self, gcmd):
+        # Moves B, in the machine frame, through the stations
+        for name in ('rtcp', 'b_projection'):
+            obj = self.printer.lookup_object(name, None)
+            if obj is not None:
+                obj.check_disabled("B_STEP_CALIBRATE")
+        if not self.is_b_homed():
+            raise gcmd.error("%s: B_STEP_CALIBRATE turns the head, so B must"
+                             " be homed first (G28 B)" % (self.name,))
+        settle = gcmd.get_float('SETTLE', CALIBRATE_SETTLE_TIME, minval=0.)
+        window = gcmd.get_float('SAMPLE_TIME', CALIBRATE_SAMPLE_TIME,
+                                minval=.05)
+        mode = gcmd.get('MODE', 'FULL').upper()
+        if mode == 'QUICK':
+            angle = gcmd.get_float('ANGLE', 90.)
+            self.calibrate_drive(self.b_axis, 0., angle, 2, settle, window,
+                                 save=False)
+            return
+        if mode != 'FULL':
+            raise gcmd.error("%s: MODE must be FULL or QUICK, not '%s'"
+                             % (self.name, mode))
+        pos_min, pos_max = self.b_axis.get_range()
+        start = gcmd.get_float('START', pos_min + STEP_TAKEUP)
+        end = gcmd.get_float('END', pos_max - STEP_TAKEUP)
+        steps = gcmd.get_int('STEPS', 13, minval=MIN_STEP_STATIONS)
+        sweep_back = gcmd.get_int('RETURN', 0, minval=0, maxval=1)
+        self.calibrate_drive(self.b_axis, start, end, steps, settle, window,
+                             bool(sweep_back))
     cmd_B_MEASURE_help = "Measure the B axis angle against gravity"
     def cmd_B_MEASURE(self, gcmd):
         settle = gcmd.get_float('SETTLE', self.settle_time, minval=0.)

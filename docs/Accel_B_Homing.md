@@ -24,9 +24,9 @@
 > until power cycle - so the offsets are fitted in software instead, by
 > `B_SENSOR_CALIBRATE`. See [BMI160_IMU.md](BMI160_IMU.md).
 
-**Status: phases one, two (sensor calibration) and four are
-implemented** - `[accel_b_homing]`, the `B_MEASURE` and
-`B_SENSOR_CALIBRATE` commands, and homing
+**Status: phases one, two (sensor calibration), three and four are
+implemented** - `[accel_b_homing]`, the `B_MEASURE`,
+`B_SENSOR_CALIBRATE` and `B_STEP_CALIBRATE` commands, and homing
 (`klippy/extras/accel_b_homing.py`).
 **B has no endstop by default.** `G28 B` measures the head, books the
 measurement as B and turns it to B = 0, measuring and correcting until
@@ -35,8 +35,9 @@ limits that keep the filament tube from kinking, not physical stops. See
 [Algorithm: homing](#algorithm-homing) and `[accel_b_homing]` in
 Config_Reference.md. Phase two's offset and gain fit is implemented, so
 after `B_SENSOR_CALIBRATE` the head homes to gravity's vertical; its
-`B_SET_ZERO` (a fine zero against a physical reference) and phases three
-and five are still design. A `[stepper_tilt]` that does
+`B_SET_ZERO` (a fine zero against a physical reference) and phase five
+are still design. `B_STEP_CALIBRATE` measures `b_coupling_ratio` - see
+[Algorithm: B step calibration](#algorithm-b-step-calibration). A `[stepper_tilt]` that does
 have an `endstop_pin` still sweeps into it, with the measurement picking
 the direction and confirming the result.
 
@@ -70,7 +71,7 @@ B on the corertheta machine is the awkward axis:
 * Its drive ratio is not directly measurable with a ruler. B is coupled:
   both gantry motors turn for a B move, through a differential, and the
   belt travel per degree is the `b_coupling_ratio` option of `[printer]`.
-  It is currently a nominal `1.0`, unverified against the machine.
+  It is a nominal `1.0` until `B_STEP_CALIBRATE` has measured it.
 
 An accelerometer at rest reads the gravity vector. A gravity vector in
 the head's own frame *is* the head's tilt, absolutely, with no reference
@@ -246,7 +247,7 @@ The module splits into three layers, deliberately:
 1. **Pure functions** (module level, no printer dependency):
    `parse_signed_axis()`, `out_of_plane_index()`, `measure_angle()`,
    `summarize()` today, joined by `fit_gravity_ellipse()`, `unwrap()` and
-   `fit_deg_per_step()` in the later phases. All the mathematics lives
+   `fit_drive_sweep()` in the later phases. All the mathematics lives
    here so it can be unit tested on a host that cannot run klippy -
    which, on the Windows dev box, is all of them.
 2. **The measurement primitive**: `measure()` - dwell, sample, filter,
@@ -384,8 +385,8 @@ silently did not move is tens of degrees out, not tenths.
 | `G28 B` | *(implemented)* Measure B, set it, and turn the head to B = 0 - see [Algorithm: homing](#algorithm-homing). |
 | `B_SET_ZERO` | Declare the current physical pose to be B = 0. Run it with the head referenced mechanically - square against the bed, or with the probe pin hanging vertical. |
 | `B_SENSOR_CALIBRATE [START=] [END=] [STEPS=] [SETTLE=] [SAMPLE_TIME=] [GAIN=0]` | *(implemented)* Sweep the arc, fit offsets and gain, report each station and the residuals, apply the result and home B again on it. `SAVE_CONFIG` keeps it. |
-| `B_STEP_CALIBRATE [START=] [END=] [STEPS=] [RETURN=1]` | The drive ratio routine. `RETURN=1` sweeps back to measure backlash. |
-| `B_STEP_CALIBRATE MODE=QUICK ANGLE=90` | Two-point spot check. Requires a valid sensor calibration. |
+| `B_STEP_CALIBRATE [START=] [END=] [STEPS=] [SETTLE=] [SAMPLE_TIME=] [RETURN=1]` | *(implemented)* The drive ratio routine: sweep, fit, report the residuals, write `b_coupling_ratio` for `SAVE_CONFIG`. `RETURN=1` sweeps back to measure backlash. |
+| `B_STEP_CALIBRATE MODE=QUICK [ANGLE=90]` | *(implemented)* Two-point spot check from B = 0 to `ANGLE`; writes nothing. |
 
 ## Algorithm: the measurement primitive
 
@@ -575,27 +576,64 @@ The question is *degrees of real head rotation per motor step*. The
 routine answers it by commanding a rotation, counting the steps the MCU
 actually issued, and measuring the rotation that resulted.
 
+*(Implemented, as below - `AccelBHoming.calibrate_drive()`. `START` and
+`END` default to 5 degrees inside the soft limits, `STEPS` to 13.)*
+
 ```
-B_STEP_CALIBRATE START=-40 END=90 STEPS=14 RETURN=1
-  0. preconditions: transforms off, Z above min_safe_z, motors on,
-     sensor calibration valid, START/END inside pos_min/pos_max
-  1. move to START, then over-travel and come back, so every station in
-     the sweep is approached from the same direction (backlash out of
-     the primary fit)
+B_STEP_CALIBRATE START=-40 END=95 STEPS=14 RETURN=1
+  0. preconditions, all checked before the first move: transforms off,
+     B homed, sensor calibration loaded (not the identity), START/END
+     inside pos_min/pos_max, an arc of at least 20 deg, and room for the
+     over-travel below inside the soft limits
+  1. energise the drive, move to START - 5 deg, so every station in the
+     sweep is approached from the same direction (backlash out of the
+     scale)
   2. for each station i:
        move to the commanded B
-       record n_i = the integer MCU step counters (see below)
+       t_i   = axis.get_step_position()  (the angle the integer step
+               counters imply, under the current ratio)
        phi_i = measure_vertical()  (the fused angle from vertical - not
                commanded B, not the accelerometer-only angle, and not
                an integral of the gyroscope rate across the move)
-  3. unwrap phi, then least squares  phi_i = alpha * n_i + beta
-       alpha = degrees per step        <- the answer
-  4. residuals: report RMS and max
-  5. if RETURN=1, sweep back and report the offset between the two fits
-     at matching stations - that is the backlash, in degrees
-  6. convert alpha to the config parameter the machine actually has,
-     and offer it through SAVE_CONFIG
+  3. if RETURN=1: move to END + 5 deg, and visit the stations again in
+     reverse
+  4. unwrap phi, then least squares with one scale shared by both legs
+     and one offset per leg:
+       phi_i = scale * t_i + offset[leg_i]
+  5. refuse, changing nothing, a scale outside 0.5 to 2 (the same bounds
+     as G28 B's check move - negative is positive_vector against the
+     motors, small is a head not following them)
+  6. report every station's residual, the RMS and max, and with RETURN=1
+     the backlash: offset[return] - offset[outbound]
+  7. write the corrected ratio with configfile.set(), and park at B = 0
 ```
+
+Any failure after the first move - a refused fit, or a measurement the
+gates reject - parks the head at B = 0 before the error is raised.
+
+Two departures from the original outline, both deliberate:
+
+* **The fit is against step-implied degrees, not raw step counts.** The
+  scale is then dimensionless - "degrees the head turned per commanded
+  degree" - and the same routine serves a coupled and a dedicated drive;
+  the kinematics does the step-to-degree conversion it already knows.
+  Rounding to whole steps is still in `t_i`.
+* **Both legs share one scale.** The outline fitted the outbound sweep
+  alone and compared the return against it. Fitting a common scale with
+  an offset per leg keeps backlash just as far out of the ratio, uses
+  every station for it, and makes backlash a fitted number rather than
+  an average of differences.
+
+The sensor calibration is required, not recommended: an uncorrected
+offset bends the measured angle (100 mg is worth degrees near B = 0 and
+almost nothing near B = 90), and a straight-line fit books that
+curvature as a ratio error. The zero of the sensor does not matter - it
+lands in the offsets, as does the arbitrary zero of the step counters.
+
+The ratio is not changed live: the kinematics bakes it into the stepper
+solvers at startup, so the new value takes effect on the restart that
+`SAVE_CONFIG` performs, and B is homed again after it like after any
+restart. Until then the drive and B's booked position are unchanged.
 
 ### Counting the steps actually applied
 
@@ -606,12 +644,20 @@ ultimately *about*. Klipper exposes it per stepper:
 
 ```python
 mcu_pos = mcu_stepper.get_mcu_position()                    # integer steps
-pos_mm  = mcu_stepper.mcu_to_commanded_position(mcu_pos)    # signed, in mm
+pos_mm  = mcu_pos * mcu_stepper.get_step_dist()              # signed, in mm
 ```
 
-`mcu_to_commanded_position()` already folds in `dir_pin` inversion and
-step distance, so it is the safe converter. (`rotary_axis.py` uses the
-same pair in `find_past_position()`.)
+The counter already runs in the commanded sense, `dir_pin` inversion
+included. As implemented it is scaled by the step distance directly
+rather than through `mcu_to_commanded_position()`: that one subtracts an
+offset which `set_position()` rewrites, while the integer counter itself
+survives it, so the scaled counter keeps one arbitrary zero for the life
+of the session. Only differences are ever used.
+
+The hooks are `BaseRotaryAxis.get_step_position()` and
+`get_drive_ratio_options()`. A dedicated stepper answers them itself; a
+coupled axis delegates to the kinematics' `get_axis_step_position()` and
+`get_axis_drive_ratio()`.
 
 **The coupled case has a property worth exploiting.** On corertheta the
 two gantry solvers are
@@ -627,13 +673,15 @@ The radius cancels exactly. The calibration therefore reads both gantry
 step counters, sums them, and is immune to any radial motion during the
 sweep - including whatever the arm does while getting out of the way.
 That is much better than trying to hold R perfectly still.
+`CoreRThetaKinematics.get_axis_step_position('b')` is that sum, divided
+by the signed coupling coefficient so `invert_b_direction` is folded in.
 
 ### What gets written
 
 * **corertheta / coupled B.** The parameter is `b_coupling_ratio` in
   `[printer]` - belt millimetres per degree:
 
-      ratio_new = ratio_old * (B_commanded_span / B_measured_span)
+      ratio_new = ratio_old / scale
 
   Nothing else needs touching. The degree-valued `position_endstop`,
   `position_min` and `position_max` of `[stepper_tilt]` are independent
@@ -644,8 +692,9 @@ That is much better than trying to hold R perfectly still.
 * **A dedicated `[stepper_b]`.** The parameter is `rotation_distance`
   (degrees per motor revolution):
 
-      rotation_distance_new = rotation_distance_old
-                              * (B_measured_span / B_commanded_span)
+      rotation_distance_new = rotation_distance_old * scale
+
+  written for every stepper in the rail.
 
 ### How accurate is it
 
@@ -733,7 +782,9 @@ left unhomed.
 | Magnitude far from 1 g | the head is moving, or the chip is misconfigured |
 | `v` varies across the sweep | `zero_vector`/`positive_vector` are wrong - here is the pair that did vary |
 | In-plane radius well below 1 g | the B axis is not in the fitted plane - remount or re-run the sweep |
-| Refine loop will not converge | *(implemented)* `b_coupling_ratio` is wrong - check it (`B_STEP_CALIBRATE` once it exists) |
+| Refine loop will not converge | *(implemented)* `b_coupling_ratio` is wrong - measure it with `B_STEP_CALIBRATE` |
+| Drive fit scale negative, or below 0.5 | *(implemented)* `positive_vector` against the motors, or the head not following them - nothing is written |
+| Drive fit residuals large | *(implemented)* reported, with a pointer to the residual table - look at their shape |
 | Head turned the wrong way on the check move | *(implemented)* `positive_vector` and the motors disagree about +B - check it, then `invert_b_direction` |
 | Head did not move on the check move | *(implemented)* the motors are not driving the head, or the sensor is not on the rotating part |
 | Head measured outside the soft limits | *(implemented)* reported, and the first move goes to the limit - check the filament tube |
@@ -753,10 +804,13 @@ The dev box cannot run klippy, so the test split follows the code split:
   poses, noise averaging, the `B_MEASURE` report and its
   `b_projection`-aware comparison, and `G28 B` against a simulated head
   whose drive can be exact, short, reversed, stalled or wildly long.
-  Later phases add the fits: synthesise `(u, w)` points with known
-  offsets, gain mismatch and gaussian noise and assert the ellipse fit
-  recovers them; assert the angle unwrap survives a sweep through
-  +/-180; assert `fit_deg_per_step` recovers a known slope.
+  The fits are covered the same way: synthesised `(u, w)` points with
+  known offsets, gain mismatch and gaussian noise for the ellipse fit,
+  an angle unwrap through +/-180, and for `fit_drive_sweep()` a known
+  scale and backlash - both directly and through `B_STEP_CALIBRATE`
+  against a simulated drive with a ratio error and a dead band. The
+  kinematics' step hooks are checked for radius cancellation and
+  `invert_b_direction`.
 * **`test/klippy/`** - a `multi_axis_accel_b.cfg` plus `.test` for config
   parsing through the real config machinery, and for the refusals the
   later phases add. Sensor data cannot be simulated in that harness, so
@@ -791,9 +845,9 @@ Each phase is independently useful and independently shippable.
    write-back. `B_SET_ZERO` is still to come; it is what makes the
    measurement trustworthy against the machine rather than against
    gravity.
-3. **Step calibration.** `B_STEP_CALIBRATE`, step counting, the residual
-   report, the ratio write-back. Uses only phases 1-2 and the existing
-   endstop home.
+3. **Step calibration** - *done*. `B_STEP_CALIBRATE`, step counting
+   through the kinematics, the residual and backlash report, the ratio
+   write-back. Needs phase 2's sensor calibration and a homed B.
 4. **Homing** - *done*, ahead of phases 2 and 3. The `rotary_axis` hook,
    the endstop-less `[stepper_tilt]`, the capped check move and the
    refine loop in `G28 B`, and measured direction and verification for a
