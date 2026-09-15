@@ -75,8 +75,12 @@ GYRO_RANGES = {125: (0x04, 262.4), 250: (0x03, 131.2), 500: (0x02, 65.6),
 # per frame and buys flexibility this driver does not want.
 FIFO_ACC_EN         = 0x40
 FIFO_GYR_EN         = 0x80
-# No FIFO downsampling
-SET_FIFO_DOWNS      = 0x00
+# FIFO_DOWNS: fill the FIFO with filtered data (acc_fifo_filt_data and
+# gyr_fifo_filt_data, bits 7 and 3), with no downsampling.  Clearing the
+# filt_data bits feeds the FIFO pre-filtered data at 1600 Hz accel /
+# 3200 Hz gyro whatever the ODR is, so 'rate' is ignored and the host
+# decodes four times the configured data.  0x88 is the reset value.
+SET_FIFO_DOWNS      = 0x88
 
 # OFFSET[6] enable bits
 OFFSET_GYR_EN       = 0x80
