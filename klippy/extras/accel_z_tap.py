@@ -72,8 +72,6 @@ MAX_FILTER_SECTIONS = 4
 FILTER_ORDERS = [2, 4]
 # A BMI160 sample is a signed 16-bit count
 RAW_MIN, RAW_MAX = -32768, 32767
-# Every Klipper bulk block of a BMI160 is 48 bytes of frames
-BYTES_PER_BLOCK = 48
 # Samples taken this long either side of a trigger are the contact, for
 # ACCEL_TAP_CALIBRATE's peak
 CONTACT_WINDOW = .010
@@ -168,17 +166,16 @@ def blind_distance(speed, accel, arm_delay):
 ######################################################################
 
 # trigger_analog's sensor monitor counts ticks of 1/samples-per-second
-# between samples, but a BMI160 delivers samples in whole fifo blocks
-# every few sample periods, and on a Linux host MCU with jitter on top.
+# between samples, but a BMI160 delivers the frames that reached its fifo
+# once every few sample periods, and on a Linux host MCU with jitter on
+# top.
 # This presents the chip to MCU_trigger_analog with a tick sized to the
 # timeout this module wants.  The filter is designed on the chip's real
 # rate, never on this one.
 class TapSensor:
     def __init__(self, chip, sensor_timeout):
         self.chip = chip
-        rate = chip.get_samples_per_second()
-        frames_per_block = BYTES_PER_BLOCK // chip.get_bytes_per_frame()
-        poll_interval = frames_per_block / float(rate)
+        poll_interval = chip.get_fifo_poll_interval()
         # The monitor fires after MONITOR_MAX + 2 ticks with no sample
         ticks = trigger_analog.MCU_trigger_analog.MONITOR_MAX + 2
         self.monitor_tick = max(poll_interval, sensor_timeout / ticks)

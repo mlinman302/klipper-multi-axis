@@ -158,12 +158,11 @@ class FakeClient:
 # from the accel z column at 16384 counts per g
 class FakeChip:
     def __init__(self, printer, rate=1600, channel=('accel_z', 'g', 16384.),
-                 bytes_per_frame=12):
+                 ):
         self.printer = printer
         self.mcu = FakeMCU(printer)
         self.rate = rate
         self.channel = channel
-        self.bytes_per_frame = bytes_per_frame
         self.attached = []
         self.samples = []
         self.signal = None
@@ -174,8 +173,8 @@ class FakeChip:
         return self.mcu
     def get_samples_per_second(self):
         return self.rate
-    def get_bytes_per_frame(self):
-        return self.bytes_per_frame
+    def get_fifo_poll_interval(self):
+        return 4. / self.rate
     def get_trigger_channel_info(self):
         return self.channel
     def setup_trigger_analog(self, oid):
@@ -623,13 +622,13 @@ class TestConfig(unittest.TestCase):
 
 class TestSensorMonitor(unittest.TestCase):
     def test_the_monitor_tick_is_at_least_a_fifo_poll(self):
-        # 1600 Hz, 4 combined frames per block: a 2.5 ms poll, but the
-        # default 50 ms timeout over 5 ticks is 10 ms
+        # 1600 Hz, a poll every 4 frames: 2.5 ms, but the default 50 ms
+        # timeout over 5 ticks is 10 ms
         tap = build()
         self.assertAlmostEqual(tap.mcu_sensor.monitor_tick, .010)
-        # 200 Hz, 8 accel-only frames per block: a 40 ms poll wins
-        tap = build(chip_kwargs={'rate': 200, 'bytes_per_frame': 6})
-        self.assertAlmostEqual(tap.mcu_sensor.monitor_tick, .040)
+        # 200 Hz: a 20 ms poll wins
+        tap = build(chip_kwargs={'rate': 200})
+        self.assertAlmostEqual(tap.mcu_sensor.monitor_tick, .020)
 
 
 ######################################################################

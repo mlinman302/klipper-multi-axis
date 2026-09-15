@@ -95,6 +95,14 @@ on this head is a measurement - `ACCEL_TAP_CALIBRATE` reports the ratio
 for whichever channel is configured. A gyroscope channel has no default
 threshold.
 
+A tap on an accelerometer channel streams with the gyroscope suspended
+and out of the FIFO, whatever `[bmi160]`'s `gyro` says. That halves the
+bulk data a single-core Pi decodes during the tap, which otherwise
+stalls klippy long enough to deliver homing steps late ("Timer too
+close" on the LPC1769). A gyroscope channel keeps both sensors. See
+"The frame layout is chosen per session" in
+[BMI160_IMU.md](BMI160_IMU.md#the-frame-layout-is-chosen-per-session).
+
 ### It is an endstop, not a probe
 
 The section registers a pin chip, `accel_tap`, so `[stepper_z]` can say

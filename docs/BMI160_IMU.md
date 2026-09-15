@@ -167,6 +167,9 @@ poll interval, and at 400 Hz the chip's filter narrows to about 160 Hz,
 which may soften the contact itself. See "Latency" in
 [Accel_Z_Tap.md](Accel_Z_Tap.md#latency). There is one `[bmi160]` and
 so one rate; the example config runs 400 until tapping is commissioned.
+A tap on an accelerometer channel streams without the gyroscope (see
+"The frame layout is chosen per session"), which halves what 1600 Hz
+costs the Pi during a tap.
 
 ### What a bad link does
 
@@ -224,9 +227,10 @@ with level-shifting transistors on SDA and SCL may not pass 1 MHz; drop
    power or chip select - and anything else is usually SCLK and MOSI
    swapped.
 
-3. **Build klipper_mcu from this tree.** Its `config_bmi160` takes a
-   `bytes_per_frame` argument that stock builds do not know, and a
-   mismatched build is refused at connect. SPI and BMI160 support are on
+3. **Build klipper_mcu from this tree.** Its `query_bmi160` takes
+   `bytes_per_frame` and `frame_offset` arguments that stock builds - and
+   builds of this branch from before the frame layout became per session
+   - do not know, and a mismatched build is refused at connect. SPI and BMI160 support are on
    by default in the Linux process build. Use a separate config and
    output directory so the LPC1769's `.config` is left alone:
 
@@ -348,18 +352,40 @@ With both enabled one frame is twelve bytes:
     gx_lo gx_hi gy_lo gy_hi gz_lo gz_hi ax_lo ax_hi ay_lo ay_hi az_lo az_hi
 
 six little-endian signed 16-bit values, gyroscope first. The host
-converts each frame once and presents three views of the stream:
+converts each frame once and presents views of the stream:
 
 | Client | Samples | Used by |
 | --- | --- | --- |
-| `start_internal_imu_client()` | `(time, gx, gy, gz, ax, ay, az)` | the fused B measurement, the tap capture |
+| `start_internal_imu_client()` | `(time, gx, gy, gz, ax, ay, az)` | the fused B measurement |
 | `start_internal_client()` | `(time, ax, ay, az)` | `ACCELEROMETER_*` commands, `[resonance_tester]`, `B_MEASURE FUSION=0`, `B_SENSOR_CALIBRATE` |
 | `start_internal_gyro_client()` | `(time, gx, gy, gz)` | the motion gate on an unfused measurement |
+| `start_internal_tap_client()` | `(time, ax, ay, az)`, or the IMU sample for a gyroscope `tap_channel` | the tap capture |
 
 The accelerometer and gyroscope views are also dump endpoints
 (`bmi160/dump_bmi160`, `bmi160/dump_bmi160_gyro`). `gyro: False` removes
 the gyroscope from the FIFO, giving six-byte frames; `[accel_b_homing]`
 refuses a chip configured that way.
+
+### The frame layout is chosen per session
+
+The chip streams between the first client and the last, and the layout
+of that session's frames is decided when it starts. If the only client
+is a tap client on an accelerometer `tap_channel`, the gyroscope stays
+suspended and out of the FIFO: six-byte frames, half the SPI traffic,
+no gyroscope conversion in klippy, and twice the FIFO headroom. Every
+other session streams both sensors when `gyro` is enabled.
+
+On the Pi Zero W this is what keeps a Z tap from starving step
+generation. A homing move only plans about 100 ms ahead, and a klippy
+reactor stalled for longer by bulk decoding hands the LPC1769 steps that
+are already due - "Timer too close".
+
+A session's layout cannot change while it runs. A gyroscope or IMU
+client started during an accelerometer-only tap session is refused with
+an error rather than given the wrong frames; accelerometer clients
+join it. A tap client that joins a session already streaming both
+sensors is served from the accelerometer view, and the firmware is
+already watching the right byte of those frames.
 
 ### Block arithmetic
 
@@ -367,10 +393,14 @@ Klipper's `FixedFreqReader` timestamps bulk samples by *counting* them,
 so every bulk message must carry exactly `MAX_BULK_MSG_SIZE // frame`
 frames. `MAX_BULK_MSG_SIZE` is 51: 51 // 12 = 4 frames in combined mode,
 51 // 6 = 8 in accelerometer-only mode. Both are 48 bytes, so
-`BYTES_PER_BLOCK` in the firmware is one constant, and a block read that
-waits for 48 pending bytes never straddles a partial frame or reads the
-0x80 over-read pattern. The firmware polls the FIFO every four sample
-periods.
+`BYTES_PER_BLOCK` in the firmware is one constant. The firmware polls
+the FIFO every four sample periods and reads the whole frames pending
+there, filling the block across polls and sending it once it is full, so
+a read never straddles a partial frame or reads the 0x80 over-read
+pattern. Reading per poll rather than per block keeps the tap detector's
+sample age at four frames in both layouts: waiting for a full block of
+six-byte frames would double it. A partly filled block counts as
+`buffered` in the status report, so the timestamps are unaffected.
 
 ### Lost frames are reported
 
@@ -388,11 +418,16 @@ overflow count rose, naming `rate` as the thing to lower.
 A tap has to be detected on the MCU that owns the chip. The firmware
 exposes
 
-    bmi160_attach_trigger_analog oid=%c trigger_analog_oid=%c frame_offset=%c
+    bmi160_attach_trigger_analog oid=%c trigger_analog_oid=%c
 
-where `frame_offset` is the byte offset of the 16-bit channel to watch
-(from `tap_channel`: 10 for `accel_z` in combined mode, 4 for `gyro_z`).
-That channel is decoded in the block read loop and handed to
+and the channel to watch arrives with each session's start,
+
+    query_bmi160 oid=%c rest_ticks=%u bytes_per_frame=%c frame_offset=%c
+
+where `frame_offset` is the byte offset of the 16-bit channel in that
+session's frames (from `tap_channel`: 10 for `accel_z` in combined
+frames and 4 in accelerometer-only ones, 4 for `gyro_z`). That channel
+is decoded as each read's frames come in and handed to
 `trigger_analog_update()`; the filter, threshold, trsync dispatch and
 sensor-quiet monitor downstream are Klipper's shared `trigger_analog`
 code. `[accel_z_tap]` reads the channel's unit and scale back with

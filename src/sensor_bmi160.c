@@ -24,10 +24,17 @@
 
 // A headerless fifo frame is six bytes with only the accelerometer
 // enabled, and twelve with the gyroscope enabled as well (gyro first -
-// the fifo stores sensor data in data-register order).  Klipper's
+// the fifo stores sensor data in data-register order).  The host picks
+// the layout each time it starts measurements, so it arrives with
+// query_bmi160 rather than at config time.  Klipper's
 // FixedFreqReader timestamps by counting, so every bulk message must
 // carry exactly MAX_BULK_MSG_SIZE (51) / frame_size whole frames:
 // 51/6 = 8 frames and 51/12 = 4 frames, both of which are 48 bytes.
+//
+// Frames are read as they arrive, not a block at a time, and fill the
+// block across reads.  The tap detector sees each frame at the first
+// poll after it lands, so its latency does not grow when a block holds
+// more (smaller) frames.
 #define BYTES_PER_BLOCK 48
 #define BMI_FIFO_SIZE 1024
 
@@ -76,9 +83,6 @@ command_config_bmi160(uint32_t *args)
     struct bmi160 *ax = oid_alloc(args[0], command_config_bmi160
                                    , sizeof(*ax));
     ax->timer.func = bmi160_event;
-    if (args[3] == 0 || BYTES_PER_BLOCK % args[3])
-        shutdown("bytes_per_frame must divide the bulk block size");
-    ax->bytes_per_frame = args[3];
 
     switch (args[2]) {
         case SPI_SERIAL:
@@ -102,23 +106,19 @@ command_config_bmi160(uint32_t *args)
     }
 }
 DECL_COMMAND(command_config_bmi160, "config_bmi160 oid=%c"
-                " bus_oid=%c bus_oid_type=%c bytes_per_frame=%c");
+                " bus_oid=%c bus_oid_type=%c");
 
 // Attach an mcu-side threshold detector to one channel of each frame.
-// frame_offset is the byte offset of the 16-bit channel to watch, so it
-// selects both the sensor and the axis - see docs/BMI160_IMU.md.
+// Which channel is set by query_bmi160's frame_offset, because its byte
+// offset depends on the frame layout - see docs/BMI160_IMU.md.
 void
 command_bmi160_attach_trigger_analog(uint32_t *args)
 {
     struct bmi160 *ax = oid_lookup(args[0], command_config_bmi160);
-    if (args[2] + 2 > ax->bytes_per_frame)
-        shutdown("frame_offset outside of bmi160 frame");
-    ax->frame_offset = args[2];
     ax->ta = trigger_analog_oid_lookup(args[1]);
 }
 DECL_COMMAND(command_bmi160_attach_trigger_analog,
-             "bmi160_attach_trigger_analog oid=%c trigger_analog_oid=%c"
-             " frame_offset=%c");
+             "bmi160_attach_trigger_analog oid=%c trigger_analog_oid=%c");
 
 // Helper code to reschedule the bmi160_event() timer
 static void
@@ -167,70 +167,76 @@ query_fifo_status(struct bmi160 *ax)
     update_fifo_status(ax, fifo_bytes);
 }
 
-// Read 8 samples from FIFO via SPI
+// Read count bytes of whole frames from the FIFO into the block
 static void
-read_fifo_block_spi(struct bmi160 *ax)
+read_fifo_spi(struct bmi160 *ax, uint8_t *dest, uint8_t count)
 {
     uint8_t msg[BYTES_PER_BLOCK + 1] = {0};
     msg[0] = BMI_FIFO_DATA | BMI_AM_READ;
 
-    spidev_transfer(ax->spi, 1, sizeof(msg), msg);
-    memcpy(ax->sb.data, &msg[1], BYTES_PER_BLOCK);
+    spidev_transfer(ax->spi, 1, count + 1, msg);
+    memcpy(dest, &msg[1], count);
 }
 
-// Read 8 samples from FIFO via i2c
 static void
-read_fifo_block_i2c(struct bmi160 *ax)
+read_fifo_i2c(struct bmi160 *ax, uint8_t *dest, uint8_t count)
 {
     uint8_t msg_reg[] = {BMI_FIFO_DATA};
 
-    int ret = i2c_dev_read(ax->i2c, sizeof(msg_reg), msg_reg
-                           , BYTES_PER_BLOCK, ax->sb.data);
+    int ret = i2c_dev_read(ax->i2c, sizeof(msg_reg), msg_reg, count, dest);
     i2c_shutdown_on_err(ret);
 }
 
-// Feed the watched channel of every frame in the block to the detector
+// Feed the watched channel of every frame just read to the detector
 static void
-update_trigger(struct bmi160 *ax)
+update_trigger(struct bmi160 *ax, uint8_t *frames, uint8_t count)
 {
     uint8_t bytes_per_frame = ax->bytes_per_frame;
-    uint8_t *data = ax->sb.data;
     uint8_t i;
-    for (i = ax->frame_offset; i < BYTES_PER_BLOCK; i += bytes_per_frame) {
-        int16_t value = (int16_t)((data[i + 1] << 8) | data[i]);
+    for (i = ax->frame_offset; i < count; i += bytes_per_frame) {
+        int16_t value = (int16_t)((frames[i + 1] << 8) | frames[i]);
         trigger_analog_update(ax->ta, value);
     }
 }
 
-// Read from fifo and transmit data to host
+// Read the whole frames pending in the fifo, up to the end of the block,
+// and transmit the block to the host once it is full
 static void
-read_fifo_block(struct bmi160 *ax, uint8_t oid)
+read_fifo_frames(struct bmi160 *ax, uint8_t oid)
 {
+    uint8_t fill = ax->sb.data_count;
+    uint16_t count = ax->fifo_bytes_pending;
+    count -= count % ax->bytes_per_frame;
+    if (count > BYTES_PER_BLOCK - fill)
+        count = BYTES_PER_BLOCK - fill;
+    uint8_t *dest = &ax->sb.data[fill];
     if (CONFIG_WANT_SPI && ax->bus_type == SPI_SERIAL)
-        read_fifo_block_spi(ax);
+        read_fifo_spi(ax, dest, count);
     else if (CONFIG_WANT_I2C && ax->bus_type == I2C_SERIAL)
-        read_fifo_block_i2c(ax);
+        read_fifo_i2c(ax, dest, count);
     // Detect before reporting - the host transfer is not in the path of
     // a homing decision
     if (ax->ta)
-        update_trigger(ax);
-    ax->sb.data_count = BYTES_PER_BLOCK;
-    sensor_bulk_report(&ax->sb, oid);
-    ax->fifo_bytes_pending -= BYTES_PER_BLOCK;
+        update_trigger(ax, dest, count);
+    ax->sb.data_count = fill + count;
+    ax->fifo_bytes_pending -= count;
+    if (ax->sb.data_count >= BYTES_PER_BLOCK)
+        sensor_bulk_report(&ax->sb, oid);
 }
 
 // Query accelerometer data
 static void
 bmi160_query(struct bmi160 *ax, uint8_t oid)
 {
-    if (ax->fifo_bytes_pending < BYTES_PER_BLOCK)
+    uint8_t bytes_per_frame = ax->bytes_per_frame;
+    if (ax->fifo_bytes_pending < bytes_per_frame)
         query_fifo_status(ax);
 
-    if (ax->fifo_bytes_pending >= BYTES_PER_BLOCK)
-        read_fifo_block(ax, oid);
+    if (ax->fifo_bytes_pending >= bytes_per_frame)
+        read_fifo_frames(ax, oid);
 
-    // check if we need to run the task again (more packets in fifo?)
-    if (ax->fifo_bytes_pending >= BYTES_PER_BLOCK) {
+    // check if we need to run the task again (more frames in fifo?)
+    if (ax->fifo_bytes_pending >= bytes_per_frame) {
         // More data in fifo - wake this task again
         sched_wake_task(&bmi160_wake);
     } else {
@@ -251,13 +257,23 @@ command_query_bmi160(uint32_t *args)
         // End measurements
         return;
 
-    // Start new measurements query
+    // Start new measurements query.  frame_offset is the byte offset of
+    // the 16-bit channel the detector watches, so it selects both the
+    // sensor and the axis.
+    uint8_t bytes_per_frame = args[2], frame_offset = args[3];
+    if (!bytes_per_frame || BYTES_PER_BLOCK % bytes_per_frame)
+        shutdown("bytes_per_frame must divide the bulk block size");
+    if (frame_offset + 2 > bytes_per_frame)
+        shutdown("frame_offset outside of bmi160 frame");
+    ax->bytes_per_frame = bytes_per_frame;
+    ax->frame_offset = frame_offset;
     ax->rest_ticks = args[1];
     ax->fifo_bytes_pending = 0;
     sensor_bulk_reset(&ax->sb);
     bmi160_reschedule_timer(ax);
 }
-DECL_COMMAND(command_query_bmi160, "query_bmi160 oid=%c rest_ticks=%u");
+DECL_COMMAND(command_query_bmi160, "query_bmi160 oid=%c rest_ticks=%u"
+             " bytes_per_frame=%c frame_offset=%c");
 
 void
 command_query_bmi160_status(uint32_t *args)
