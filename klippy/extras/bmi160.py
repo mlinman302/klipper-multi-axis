@@ -25,14 +25,8 @@
 # data rate, and the accelerometer stops at 1600 Hz, so 1600 Hz bounds
 # both.  Running without the gyroscope (gyro: False) gives the older
 # accel-only behaviour and six-byte frames.
-#
-# The frame layout is chosen per measurement session, not per config.  A
-# Z tap on an accelerometer channel starts a session with the gyroscope
-# asleep and out of the FIFO: the tap has no use for it, and on a slow
-# host decoding it can starve step generation.  Everything else streams
-# both sensors whenever the gyroscope is enabled.
 import logging
-import collections, multiprocessing, os, struct
+import collections, multiprocessing, os
 from . import bus, adxl345, bulk_sensor
 
 # BMI160 registers
@@ -96,14 +90,11 @@ OFFSET_ACC_EN       = 0x40
 FREEFALL_ACCEL = adxl345.FREEFALL_ACCEL
 
 # Over-reading the FIFO returns the fixed magic 0x80 in every data byte,
-# which decodes to this value.  The firmware only reads whole frames the
-# FIFO reports pending, so seeing it means something went wrong.
+# which decodes to this value.  The firmware only reads a block once a
+# whole block is pending, so seeing it means something went wrong.
 INVALID_FRAME = -0x7f80
 
 BATCH_UPDATES = 0.100
-
-# The firmware drains the FIFO roughly every this many sample periods
-FIFO_POLL_PERIODS = 4
 
 BMI_I2C_ADDR = 0x69
 
@@ -120,12 +111,6 @@ Gyro_Measurement = collections.namedtuple(
 IMU_Measurement = collections.namedtuple(
     'IMU_Measurement', ('time', 'gyro_x', 'gyro_y', 'gyro_z',
                         'accel_x', 'accel_y', 'accel_z'))
-
-# Which 16-bit channel of a frame the mcu-side tap detector watches.  The
-# value is a byte offset into the frame, so it depends on whether the
-# gyroscope is in the FIFO - see get_trigger_frame_offset().
-TAP_CHANNELS = ('accel_x', 'accel_y', 'accel_z',
-                'gyro_x', 'gyro_y', 'gyro_z')
 
 
 ######################################################################
@@ -152,68 +137,29 @@ def axes_map_determinant(axes_map):
 
 
 ######################################################################
-# Frame reading
-######################################################################
-
-# FixedFreqReader fixes its frame format at construction; this chip
-# changes it between sessions.  Only call this while stopped.
-class FrameReader(bulk_sensor.FixedFreqReader):
-    def set_unpack_format(self, unpack_fmt):
-        unpack = struct.Struct(unpack_fmt)
-        self.unpack_from = unpack.unpack_from
-        self.bytes_per_sample = unpack.size
-        self.samples_per_block = (bulk_sensor.MAX_BULK_MSG_SIZE
-                                  // self.bytes_per_sample)
-
-def unpack_format(with_gyro):
-    return "<hhhhhh" if with_gyro else "<hhh"
-
-
-######################################################################
 # Sample stream views
 ######################################################################
 
-# A three-column view of the chip's sample stream, presented as an
-# independent bulk sensor stream.  The chip converts each frame once,
+# A three-column view of the chip's combined sample stream, presented as
+# an independent bulk sensor stream.  The chip converts each frame once,
 # into one (time, ...) tuple; a view hands its clients the three columns
 # they asked for and drops the rest.  This is what lets one FIFO feed
 # both an accelerometer client and a gyroscope client without either of
 # them knowing the other exists.
-#
-# A session's samples are (time, gx, gy, gz, ax, ay, az) when the
-# gyroscope is in the FIFO and (time, ax, ay, az) when it is not, so the
-# columns are found from each batch's sample width.
 class SampleStreamView:
-    def __init__(self, printer, batch_bulk, sensor, before_add=None):
+    def __init__(self, printer, batch_bulk, first_column):
         self.printer = printer
         self.batch_bulk = batch_bulk
-        self.sensor = sensor
-        self.before_add = before_add
+        self.first_column = first_column
     def _project(self, client_cb):
-        sensor = self.sensor
+        c = self.first_column
         def handle_batch(msg):
-            data = msg['data']
-            if data and len(data[0]) == 4:
-                if sensor == 'accel':
-                    # Already the three columns wanted
-                    return client_cb(msg)
-                # No gyroscope in this session.  before_add keeps a gyro
-                # client out of one, so this is only a safety net.
-                data = []
-            else:
-                c = 1 if sensor == 'gyro' else 4
-                data = [(s[0], s[c], s[c+1], s[c+2]) for s in data]
             view = dict(msg)
-            view['data'] = data
+            view['data'] = [(s[0], s[c], s[c+1], s[c+2]) for s in msg['data']]
             return client_cb(view)
         return handle_batch
-    def add_client(self, client_cb, accel_only=False):
-        if self.before_add is not None:
-            self.before_add()
-        handle_batch = self._project(client_cb)
-        # Whether this client lets the session leave the gyroscope out
-        handle_batch.bmi160_accel_only = accel_only
-        self.batch_bulk.add_client(handle_batch)
+    def add_client(self, client_cb):
+        self.batch_bulk.add_client(self._project(client_cb))
     def add_mux_endpoint(self, path, key, value, header):
         start_resp = {'header': header}
         def add_api_client(web_request):
@@ -224,8 +170,8 @@ class SampleStreamView:
         wh.register_mux_endpoint(path, key, value, add_api_client)
 
 # The accelerometer helper's batching and windowing, with the gyroscope's
-# names.  The names only matter in the CSV header, but a capture of tap
-# data labelled "accel_x" when it is angular rate is worse than useless.
+# names.  The names only matter in the CSV header, but a capture labelled
+# "accel_x" when it is angular rate is worse than useless.
 class GyroQueryHelper(adxl345.AccelQueryHelper):
     def get_samples(self):
         if not self.msgs:
@@ -264,8 +210,7 @@ class GyroQueryHelper(adxl345.AccelQueryHelper):
 # the accelerometer readings the chip took at the same instant, which is
 # the guarantee a sensor fusion needs - hence a client of its own rather
 # than pairing the two split views back up afterwards and hoping they
-# line up.  Its CSV is also the seven column capture format the Z tap
-# work wants.
+# line up.
 class IMUQueryHelper(adxl345.AccelQueryHelper):
     def get_samples(self):
         if not self.msgs:
@@ -342,15 +287,6 @@ class BMI160:
         if determinant is not None and determinant < 0.:
             gyro_map = [(index, -scale) for index, scale in gyro_map]
         self.gyro_axes_map = gyro_map
-        # The mcu-side tap detector watches one channel, named here
-        # because the frame layout is this section's business
-        self.tap_channel = config.getchoice('tap_channel',
-                                            list(TAP_CHANNELS), 'accel_z')
-        if not self.enable_gyro and self.tap_channel.startswith('gyro'):
-            raise config.error(
-                "[%s] tap_channel '%s' needs the gyroscope, but gyro is"
-                " disabled in this section"
-                % (config.get_name(), self.tap_channel))
         # Bus.  cs_pin selects SPI; without it this is an I2C chip.
         if config.get('cs_pin', None) is not None:
             self.bus = bus.MCU_SPI_from_config(config, 0, default_speed=1000000)
@@ -364,19 +300,17 @@ class BMI160:
         self.query_bmi160_cmd = None
         mcu.add_config_cmd(
             "config_bmi160 oid=%d bus_oid=%d bus_oid_type=%s"
-            % (oid, self.bus.get_oid(), self.bus_type))
+            " bytes_per_frame=%d" % (oid, self.bus.get_oid(), self.bus_type,
+                                     self.get_bytes_per_frame()))
         mcu.add_config_cmd("query_bmi160 oid=%d rest_ticks=0"
-                           " bytes_per_frame=0 frame_offset=0"
                            % (oid,), on_restart=True)
         mcu.register_config_callback(self._build_config)
-        # Whether the gyroscope is in the FIFO for the current (or last)
-        # session - see _start_measurements()
-        self.stream_gyro = self.enable_gyro
         # Bulk sample message reading.  One reader for the whole frame;
         # the views below split it.
         chip_smooth = self.data_rate * BATCH_UPDATES * 2
-        self.ffreader = FrameReader(mcu, chip_smooth,
-                                    unpack_format(self.stream_gyro))
+        unpack_fmt = "<hhhhhh" if self.enable_gyro else "<hhh"
+        self.ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth,
+                                                    unpack_fmt)
         self.last_error_count = 0
         self.batch_bulk = bulk_sensor.BatchBulkHelper(
             self.printer, self._process_batch,
@@ -384,16 +318,16 @@ class BMI160:
         # Views.  In combined frames the gyroscope occupies columns 1-3
         # and the accelerometer 4-6; without the gyroscope the
         # accelerometer is back at columns 1-3.
+        accel_col = 4 if self.enable_gyro else 1
         self.accel_stream = SampleStreamView(self.printer, self.batch_bulk,
-                                             'accel')
+                                             accel_col)
         self.accel_stream.add_mux_endpoint(
             "bmi160/dump_bmi160", "sensor", self.name,
             ('time', 'x_acceleration', 'y_acceleration', 'z_acceleration'))
         self.gyro_stream = None
         if self.enable_gyro:
-            self.gyro_stream = SampleStreamView(
-                self.printer, self.batch_bulk, 'gyro',
-                before_add=self._check_gyro_streaming)
+            self.gyro_stream = SampleStreamView(self.printer, self.batch_bulk,
+                                                1)
             self.gyro_stream.add_mux_endpoint(
                 "bmi160/dump_bmi160_gyro", "sensor", self.name,
                 ('time', 'x_rate', 'y_rate', 'z_rate'))
@@ -401,64 +335,15 @@ class BMI160:
     def _build_config(self):
         cmdqueue = self.bus.get_command_queue()
         self.query_bmi160_cmd = self.mcu.lookup_command(
-            "query_bmi160 oid=%c rest_ticks=%u bytes_per_frame=%c"
-            " frame_offset=%c", cq=cmdqueue)
+            "query_bmi160 oid=%c rest_ticks=%u", cq=cmdqueue)
         self.ffreader.setup_query_command("query_bmi160_status oid=%c",
                                           oid=self.oid, cq=cmdqueue)
 
     ######################################################################
     # Frame layout
     ######################################################################
-    # with_gyro: whether the gyroscope is in the FIFO; None means the
-    # config's default, a session that streams both when it can
-    def get_bytes_per_frame(self, with_gyro=None):
-        if with_gyro is None:
-            with_gyro = self.enable_gyro
-        return 12 if with_gyro else 6
-    def get_trigger_frame_offset(self, with_gyro=None):
-        # Byte offset of self.tap_channel within a frame.  Gyroscope
-        # first, then accelerometer, x/y/z within each, two bytes apart.
-        if with_gyro is None:
-            with_gyro = self.enable_gyro
-        sensor, axis = self.tap_channel.split('_')
-        base = 0
-        if sensor == 'accel' and with_gyro:
-            base = 6
-        return base + 2 * 'xyz'.index(axis)
-    def tap_needs_gyro(self):
-        # A tap on an accelerometer channel runs with the gyroscope out
-        return self.tap_channel.startswith('gyro')
-    def get_fifo_poll_interval(self):
-        # How often the firmware reads whatever whole frames are waiting,
-        # which is how stale a frame can be when the tap detector sees it
-        return FIFO_POLL_PERIODS / float(self.data_rate)
-    def get_trigger_channel_info(self):
-        # The watched channel, its unit, and the raw counts per unit the
-        # firmware hands trigger_analog - which is what a detector needs
-        # to put its threshold in physical units
-        if self.tap_channel.startswith('gyro'):
-            return (self.tap_channel, 'deg/s',
-                    GYRO_RANGES[self.gyro_range][1])
-        return self.tap_channel, 'g', ACCEL_RANGES[self.accel_range][1]
-    def raw_trigger_channel(self, sample):
-        # The raw count of the watched channel, recovered from a sample
-        # of start_internal_tap_client().  The host samples went through
-        # axes_map; the firmware detector did not, so undo it to see what
-        # the detector saw.  None if the map dropped that axis.
-        sensor, axis = self.tap_channel.split('_')
-        raw_index = 'xyz'.index(axis)
-        if sensor == 'gyro':
-            axes_map, first_column = self.gyro_axes_map, 1
-        else:
-            axes_map, first_column = self.axes_map, 1
-            # A (time, gx, gy, gz, ax, ay, az) sample, rather than the
-            # accelerometer view a tap client normally gets
-            if len(sample) == 7:
-                first_column = 4
-        for i, (index, scale) in enumerate(axes_map):
-            if index == raw_index and scale:
-                return sample[first_column + i] / scale
-        return None
+    def get_bytes_per_frame(self):
+        return 12 if self.enable_gyro else 6
 
     ######################################################################
     # Register access
@@ -518,30 +403,28 @@ class BMI160:
     ######################################################################
     # Power and configuration
     ######################################################################
-    def _wake_sensors(self, with_gyro):
+    def _wake_sensors(self):
         self.set_reg(REG_CMD, CMD_ACC_PM_NORMAL)
         self.reactor.pause(ACCEL_STARTUP_TIME)
-        if with_gyro:
+        if self.enable_gyro:
             self.set_reg(REG_CMD, CMD_GYR_PM_NORMAL)
             self.reactor.pause(GYRO_STARTUP_TIME)
     def _suspend_sensors(self):
-        # The gyroscope may already be asleep; suspending it again is
-        # harmless and saves tracking it
         if self.enable_gyro:
             self.set_reg(REG_CMD, CMD_GYR_PM_SUSPEND)
             self.reactor.pause(0.002)
         self.set_reg(REG_CMD, CMD_ACC_PM_SUSPEND)
-    def _configure_sensors(self, with_gyro):
+    def _configure_sensors(self):
         # Both sensors run the normal-mode filter at the shared rate;
         # headerless FIFO mode requires the rates to be identical.
         self.set_reg(REG_ACC_CONF, BWP_NORMAL | self.odr_code)
         self.set_reg(REG_ACC_RANGE, self.accel_range_code)
-        if with_gyro:
+        if self.enable_gyro:
             self.set_reg(REG_GYR_CONF, BWP_NORMAL | self.odr_code)
             self.set_reg(REG_GYR_RANGE, self.gyro_range_code)
         self.set_reg(REG_FIFO_DOWNS, SET_FIFO_DOWNS)
         fifo_config = FIFO_ACC_EN
-        if with_gyro:
+        if self.enable_gyro:
             fifo_config |= FIFO_GYR_EN
         self.set_reg(REG_FIFO_CONFIG_1, fifo_config)
     def _flush_fifo(self):
@@ -567,8 +450,8 @@ class BMI160:
                 "bmi160: cannot calibrate '%s' while a measurement is in"
                 " progress" % (self.name,))
         self._check_id()
-        self._wake_sensors(self.enable_gyro)
-        self._configure_sensors(self.enable_gyro)
+        self._wake_sensors()
+        self._configure_sensors()
         foc_conf = 0
         if calibrate_gyro:
             if not self.enable_gyro:
@@ -600,20 +483,6 @@ class BMI160:
         aqh = adxl345.AccelQueryHelper(self.printer)
         self.accel_stream.add_client(aqh.handle_batch)
         return aqh
-    def _check_gyro_streaming(self):
-        # A session's frame layout is fixed once it starts.  (A helper
-        # that is stopping has no clients left, and restarts with the
-        # layout the new client needs.)
-        bb = self.batch_bulk
-        if bb.is_started and bb.client_cbs and not self.stream_gyro:
-            raise self.printer.command_error(
-                "bmi160 '%s': the gyroscope is off while a Z tap measurement"
-                " is running - wait for it to finish" % (self.name,))
-    def _session_needs_gyro(self):
-        if not self.enable_gyro:
-            return False
-        return not all([getattr(cb, 'bmi160_accel_only', False)
-                        for cb in self.batch_bulk.client_cbs])
     def start_internal_gyro_client(self):
         if self.gyro_stream is None:
             raise self.printer.command_error(
@@ -629,34 +498,15 @@ class BMI160:
             raise self.printer.command_error(
                 "bmi160: the gyroscope is disabled in section '%s'"
                 % (self.name,))
-        self._check_gyro_streaming()
         iqh = IMUQueryHelper(self.printer)
         self.batch_bulk.add_client(iqh.handle_batch)
         return iqh
-    def start_internal_tap_client(self):
-        # The stream that carries the tap channel - see
-        # raw_trigger_channel().  An accelerometer channel gets the
-        # accelerometer view, and if the tap is what starts the session
-        # the gyroscope stays out of it.  (One that joins a running
-        # session with the gyroscope in it gets the same view.)
-        if self.tap_needs_gyro():
-            return self.start_internal_imu_client()
-        aqh = adxl345.AccelQueryHelper(self.printer)
-        self.accel_stream.add_client(aqh.handle_batch, accel_only=True)
-        return aqh
     def has_gyro(self):
         return self.enable_gyro
     def get_mcu(self):
         return self.mcu
     def get_samples_per_second(self):
         return self.data_rate
-    def setup_trigger_analog(self, trigger_analog_oid):
-        # The mcu-side seam for accel_z_tap - see docs/BMI160_IMU.md.  The
-        # channel's byte offset goes with each query_bmi160, since it
-        # depends on the session's frame layout.
-        self.mcu.add_config_cmd(
-            "bmi160_attach_trigger_analog oid=%d trigger_analog_oid=%d"
-            % (self.oid, trigger_analog_oid), is_init=True)
     def lookup_sensor_error(self, error_code):
         return "Unknown bmi160 error %d" % (error_code,)
 
@@ -666,7 +516,7 @@ class BMI160:
     def _convert_samples(self, samples):
         (ax_pos, ax_scale), (ay_pos, ay_scale), (az_pos, az_scale) = \
             self.axes_map
-        if not self.stream_gyro:
+        if not self.enable_gyro:
             count = 0
             for ptime, rx, ry, rz in samples:
                 raw = (rx, ry, rz)
@@ -701,25 +551,18 @@ class BMI160:
             count += 1
         del samples[count:]
     def _start_measurements(self):
-        # The layout is decided before anything pauses the reactor, so a
-        # client added meanwhile is checked against it
-        self.stream_gyro = with_gyro = self._session_needs_gyro()
-        self.ffreader.set_unpack_format(unpack_format(with_gyro))
         self._check_id()
-        self._wake_sensors(with_gyro)
-        self._configure_sensors(with_gyro)
+        self._wake_sensors()
+        self._configure_sensors()
         self._flush_fifo()
-        rest_ticks = self.mcu.seconds_to_clock(self.get_fifo_poll_interval())
-        self.query_bmi160_cmd.send([
-            self.oid, rest_ticks, self.get_bytes_per_frame(with_gyro),
-            self.get_trigger_frame_offset(with_gyro)])
-        logging.info("BMI160 starting '%s' measurements%s", self.name,
-                     "" if with_gyro or not self.enable_gyro
-                     else " (accelerometer only)")
+        # Drain the FIFO roughly every four sample periods
+        rest_ticks = self.mcu.seconds_to_clock(4. / self.data_rate)
+        self.query_bmi160_cmd.send([self.oid, rest_ticks])
+        logging.info("BMI160 starting '%s' measurements", self.name)
         self.ffreader.note_start()
         self.last_error_count = 0
     def _finish_measurements(self):
-        self.query_bmi160_cmd.send_wait_ack([self.oid, 0, 0, 0])
+        self.query_bmi160_cmd.send_wait_ack([self.oid, 0])
         self._suspend_sensors()
         self.ffreader.note_end()
         logging.info("BMI160 finished '%s' measurements", self.name)
@@ -738,7 +581,6 @@ class BMI160:
         return {'data_rate': self.data_rate, 'gyro': self.enable_gyro,
                 'accel_range': self.accel_range,
                 'gyro_range': self.gyro_range if self.enable_gyro else None,
-                'tap_channel': self.tap_channel,
                 'axes_handedness': self.axes_handedness}
     def _register_commands(self, config):
         # As AccelCommandHelper does: the named form always, plus the

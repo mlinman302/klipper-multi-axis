@@ -2025,12 +2025,11 @@ BMI160 six-axis IMU - a three-axis accelerometer and a three-axis
 gyroscope in one package, on one bus, sharing one FIFO and one sample
 clock. It can be queried via I2C or SPI bus.
 
-It is the sensor `[accel_b_homing]` and `[accel_z_tap]` require - no
-other chip is supported by either - and it can also serve
-`[resonance_tester]` as `accel_chip: bmi160`. The gyroscope is what lets
-`[accel_b_homing]` fuse a tilt angle that tracks a moving head and
-confirm the head was at rest, and it is a second, gravity-free channel
-for tap detection. See [BMI160_IMU.md](BMI160_IMU.md) for wiring,
+It is the sensor `[accel_b_homing]` requires - no other chip is
+supported - and it can also serve `[resonance_tester]` as
+`accel_chip: bmi160`. The gyroscope is what lets `[accel_b_homing]` fuse
+a tilt angle that tracks a moving head and confirm the head was at rest.
+See [BMI160_IMU.md](BMI160_IMU.md) for wiring,
 bring-up and the driver.
 
 ```
@@ -2082,17 +2081,12 @@ bring-up and the driver.
 #   Accelerometer full scale in g - one of 2, 4, 8 or 16. The chip is
 #   16 bit at every range, so this is a straight resolution-for-
 #   headroom trade: 2 g resolves 0.061 mg per count, 16 g resolves
-#   0.49 mg. Tilt measurement wants 2; resonance testing and tap
-#   detection want the headroom of 16. The default is 2.
+#   0.49 mg. Tilt measurement wants 2; resonance testing wants the
+#   headroom of 16. The default is 2.
 #gyro_range: 250
 #   Gyroscope full scale in deg/s - one of 125, 250, 500, 1000 or 2000.
 #   The default is 250, which resolves 7.6 m deg/s per count and is far
 #   more range than a tilting head ever uses.
-#tap_channel: accel_z
-#   Which single channel the mcu-side tap detector watches, as
-#   accel_x/y/z or gyro_x/y/z. This selects a byte offset within the
-#   FIFO frame, so it is fixed at config time. [accel_z_tap] detects
-#   bed contact on it; nothing else reads it. The default is accel_z.
 ```
 
 On a Raspberry Pi (or other Linux host), prefer SPI. Enable it with
@@ -3035,148 +3029,6 @@ is refused, and a failure parks the head at B=0. The new ratio takes
 effect after `SAVE_CONFIG` restarts klippy, and B must be homed again.
 `B_STEP_CALIBRATE MODE=QUICK [ANGLE=<deg>]` is a two-point check from
 B=0 to `ANGLE` (default 90) that writes nothing.
-
-### [accel_z_tap]
-
-Z homing by tapping the bed with the nozzle. Z is driven down until the
-nozzle touches the bed, the contact is seen as a shock in the IMU on the
-head, and the steppers are stopped by the MCU that reads the IMU - on the
-corertheta machine klipper_mcu on the Pi, relayed to the stepper MCU by
-trsync. The nozzle becomes the Z reference: no probe is deployed and the
-head is not turned to a probe angle. The sensor must be a
-[bmi160](#bmi160). See [Accel_Z_Tap.md](Accel_Z_Tap.md) for how it works,
-commissioning, and what tapping costs.
-
-The detector runs on the MCU, on the one channel of the chip's FIFO
-frame that `[bmi160]`'s `tap_channel` names. Its input is offset by the
-first sample after it arms, which removes gravity (a Z move does not
-tilt the head); it is then high passed and optionally low passed, and it
-triggers when the magnitude reaches `trigger_threshold`.
-
-The section provides a virtual endstop pin. It is not the `probe` chip
-and creates no `probe` object, so a `[bltouch]` can stay configured for
-meshing; whichever pin `[stepper_z]` names homes Z:
-
-```
-[stepper_z]
-endstop_pin: accel_tap:z_virtual_endstop
-# The Z at which the nozzle touches the bed. The detection delay biases
-# it by an amount proportional to speed, so measure it at the
-# homing_speed and second_homing_speed that will be used.
-position_endstop: 0
-homing_speed: 5
-second_homing_speed: 2
-homing_retract_dist: 3
-```
-
-Every tap move is checked:
-
-* The detector arms only once the move has finished accelerating, plus
-  `arm_delay`. The distance covered before then is blind: a nozzle that
-  starts closer to the bed than that is driven into it undetected.
-  `ACCEL_TAP_QUERY` reports the blind distance. G28 Z cannot know how high
-  the nozzle starts, so the nozzle must already clear the bed by more
-  than that.
-* A trigger within `min_trigger_travel` of the start of the move is an
-  error.
-* B must be homed and within `b_tolerance` of B=0, since only then is the
-  nozzle the lowest point of the head. The extruder must be below
-  `max_extruder_temp`.
-* A move faster than `max_speed` is refused.
-* Possible FIFO overflows during the move refuse the result.
-* With a `homing_retract_dist`, G28 Z taps twice and the two contacts must
-  agree within `samples_tolerance`; the retract must be longer than the
-  blind distance at `second_homing_speed` and than `min_trigger_travel`.
-
-```
-[accel_z_tap]
-#accel_chip: bmi160
-#   The [bmi160] section to detect contact with, for example
-#   "bmi160 head". Only a bmi160 section is accepted. The default is
-#   "bmi160".
-#highpass: 50
-#   High pass cutoff in Hz, removing slow structure and drift. 0
-#   disables it. It must be below half the chip's rate. The default is
-#   50.
-#highpass_order: 2
-#lowpass: 0
-#   Low pass cutoff in Hz, removing sensor noise. 0 (the default)
-#   disables it. It must be above highpass and below half the chip's
-#   rate.
-#lowpass_order: 2
-#   Butterworth order of each filter, 2 or 4. The default is 2.
-#trigger_threshold: 0.15
-#   Detector output at which contact is declared, in g for an accel_*
-#   tap_channel or deg/s for a gyro_* one. The default is 0.15 for an
-#   accelerometer channel; a gyroscope channel has no default and must
-#   set it. Measure it with ACCEL_TAP_QUERY and ACCEL_TAP_CALIBRATE.
-#arm_delay: 0.050
-#   Seconds after the move has finished accelerating before the
-#   detector arms. The default is 0.050.
-#min_trigger_travel: 1.0
-#   A trigger this close (in mm) to the start of a move is an error.
-#   The default is 1.0.
-#max_speed: 10.0
-#   Fastest tap move allowed, in mm/s. The default is 10.
-#sensor_timeout: 0.050
-#   The move is aborted if the chip delivers no samples for about this
-#   long (in seconds, never less than one FIFO poll). The default is
-#   0.050.
-#batch_margin: 0.3
-#   Seconds waited after a move for the last samples to reach the host
-#   before the capture is checked. The default is 0.3.
-#b_tolerance: 1.0
-#   How far from B=0 (in degrees) a tap is allowed. The default is 1.0.
-#measure_b: False
-#   If True, also measure the head with [accel_b_homing] before each G28
-#   Z, ACCEL_TAP_PROBE and ACCEL_TAP_CALIBRATE, and refuse if it is
-#   further than b_tolerance from vertical. The default is False.
-#max_extruder_temp: 150
-#   Tapping is refused while the extruder temperature or target is
-#   above this (in Celsius). 0 disables the check. The default is 150.
-#max_overtravel: 2.0
-#   How far below Z=0 (in mm) ACCEL_TAP_PROBE may drive looking for the
-#   bed. The default is 2.0.
-#speed: 5.0
-#lift_speed:
-#samples: 1
-#sample_retract_dist: 2.0
-#samples_result: average
-#samples_tolerance: 0.100
-#samples_tolerance_retries: 0
-#   As in [probe], for ACCEL_TAP_PROBE and ACCEL_TAP_CALIBRATE.
-#   samples_tolerance also bounds how far the two taps of a G28 Z may
-#   disagree.
-```
-
-`ACCEL_TAP_QUERY [TIME=<s>]` captures the tap channel with the machine
-still for `TIME` seconds (default 1), runs it through the same filter on
-the host, and reports the output's rms and peak, how far above that peak
-`trigger_threshold` is, and the blind distance at the probing speed.
-
-`ACCEL_TAP_TEST [TAPS=<n>] [TIMEOUT=<s>]` arms the detector with no
-movement and waits for `TAPS` (default 3) taps on the head by hand,
-reporting each one's print time and peak. A tap not seen within
-`TIMEOUT` seconds (default 30) is an error.
-
-`ACCEL_TAP_PROBE [PROBE_SPEED=<mm/s>] [LIFT_SPEED=<mm/s>] [SAMPLES=<n>]
-[SAMPLE_RETRACT_DIST=<mm>] [SAMPLES_TOLERANCE=<mm>]
-[SAMPLES_TOLERANCE_RETRIES=<n>] [SAMPLES_RESULT=median|average]` taps
-the bed at the current X/Y and reports the Z at which the nozzle touches
-it, lifting by `SAMPLE_RETRACT_DIST` after every tap. Z must be homed,
-and RTCP and the bed-frame B projection off. Tapping the same point with
-the BLTouch gives its `z_offset` as a measurement.
-
-`ACCEL_TAP_CALIBRATE [DISTANCE=<mm>] [TAPS=<n>] [PROBE_SPEED=<mm/s>]`
-compares the detector's background with real contacts. Z must be homed,
-and the nozzle at least `DISTANCE` (default 5) plus
-`sample_retract_dist` above the bed. It descends `DISTANCE` through the
-air at the probing speed, filtering the capture on the host, then taps
-the bed `TAPS` times (default 3) at the current threshold, and reports
-the background peak, each contact's peak and their ratio, with a warning
-below 3. It writes the geometric mean of the background peak and the
-weakest contact as `trigger_threshold` for `SAVE_CONFIG`. The contacts
-are taken at the current threshold, so start from one that detects them.
 
 ### Coupled rotational axes ([carriage] on a/b/c)
 

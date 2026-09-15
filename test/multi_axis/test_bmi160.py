@@ -79,14 +79,7 @@ class FakePrinter:
         raise ConfigError("Unknown config object '%s'" % (name,))
 
 class FakeReactor:
-    NEVER = 9999999999999999.
     def pause(self, delay):
-        pass
-    def monotonic(self):
-        return 0.
-    def register_timer(self, callback, waketime=NEVER):
-        return callback
-    def unregister_timer(self, timer):
         pass
 
 class FakeMCU:
@@ -255,44 +248,13 @@ class TestFrameGeometry(unittest.TestCase):
             self.assertEqual(per_block * frame, 48)
             fmt = "<hhhhhh" if gyro else "<hhh"
             self.assertEqual(struct.calcsize(fmt), frame)
-    def test_trigger_offsets_in_a_combined_frame(self):
-        # Gyroscope first, then accelerometer, x/y/z two bytes apart
-        for channel, offset in (('gyro_x', 0), ('gyro_y', 2), ('gyro_z', 4),
-                                ('accel_x', 6), ('accel_y', 8),
-                                ('accel_z', 10)):
-            chip = build({'tap_channel': channel})
-            self.assertEqual(chip.get_trigger_frame_offset(), offset)
-    def test_trigger_offsets_without_the_gyroscope(self):
-        for channel, offset in (('accel_x', 0), ('accel_y', 2),
-                                ('accel_z', 4)):
-            chip = build({'gyro': False, 'tap_channel': channel})
-            self.assertEqual(chip.get_trigger_frame_offset(), offset)
-            # and in a session that leaves an enabled gyroscope out
-            chip = build({'tap_channel': channel})
-            self.assertEqual(chip.get_trigger_frame_offset(False), offset)
-    def test_the_fifo_poll_is_four_frames_whatever_the_layout(self):
-        # The firmware reads the frames waiting at each poll rather than
-        # a whole block, so a tap's sample age does not depend on how
-        # many frames a block holds
-        self.assertAlmostEqual(build({'rate': 400}).get_fifo_poll_interval(),
-                               .010)
-        self.assertAlmostEqual(build().get_fifo_poll_interval(), .0025)
-    def test_the_frame_layout_is_not_fixed_at_config_time(self):
-        # It goes with each query_bmi160 instead - see TestSessionLayout
+    def test_the_firmware_is_told_the_frame_size(self):
         chip = build()
         cfg = [c for c in chip.mcu.config_cmds if c.startswith('config_bmi160')]
         self.assertEqual(len(cfg), 1)
-        self.assertNotIn("bytes_per_frame", cfg[0])
-        stop = [c for c in chip.mcu.config_cmds if c.startswith('query_bmi160')]
-        self.assertEqual(stop, ["query_bmi160 oid=0 rest_ticks=0"
-                                " bytes_per_frame=0 frame_offset=0"])
-    def test_attaching_a_trigger_names_only_the_detector(self):
-        chip = build({'tap_channel': 'gyro_y'})
-        chip.setup_trigger_analog(7)
-        attach = [c for c in chip.mcu.config_cmds
-                  if c.startswith('bmi160_attach_trigger_analog')]
-        self.assertEqual(attach, ["bmi160_attach_trigger_analog oid=0"
-                                  " trigger_analog_oid=7"])
+        self.assertIn("bytes_per_frame=12", cfg[0])
+        self.assertIn("bytes_per_frame=6",
+                      build({'gyro': False}).mcu.config_cmds[0])
 
 
 ######################################################################
@@ -477,45 +439,6 @@ class TestConversion(unittest.TestCase):
 
 
 ######################################################################
-# The tap channel, as the detector and the host each see it
-######################################################################
-
-class TestTapChannel(unittest.TestCase):
-    # The firmware detector reads raw frame bytes; the host reads samples
-    # that went through axes_map.  accel_z_tap compares the two, so the
-    # raw count must be recoverable from a host sample for every mounting.
-    RAW = (1., 1312, -656, 262, 8192, -4096, 16384)
-    def _check_round_trip(self, values):
-        chip = build(values)
-        sample = convert(chip, [self.RAW])[0]
-        sensor, axis = chip.tap_channel.split('_')
-        base = 1 if sensor == 'gyro' else 4
-        expected = self.RAW[base + 'xyz'.index(axis)]
-        self.assertAlmostEqual(chip.raw_trigger_channel(sample), expected,
-                               places=2)
-    def test_every_channel_round_trips_through_the_identity_map(self):
-        for channel in bmi160.TAP_CHANNELS:
-            self._check_round_trip({'tap_channel': channel})
-    def test_raw_counts_survive_a_rotating_and_a_reflecting_map(self):
-        for axes_map in ('z, -y, x', '-x, -y, z', 'x, -y, z', 'y, z, x'):
-            for channel in bmi160.TAP_CHANNELS:
-                self._check_round_trip({'tap_channel': channel,
-                                        'axes_map': axes_map})
-    def test_accel_only_frames(self):
-        chip = build({'gyro': False, 'axes_map': 'y, x, -z'})
-        sample = convert(chip, [(1., 100, 200, 16384)])[0]
-        self.assertAlmostEqual(chip.raw_trigger_channel(sample), 16384.,
-                               places=2)
-    def test_channel_units_follow_the_range(self):
-        chip = build({'accel_range': 16})
-        self.assertEqual(chip.get_trigger_channel_info(),
-                         ('accel_z', 'g', 2048.))
-        chip = build({'tap_channel': 'gyro_y', 'gyro_range': 500})
-        self.assertEqual(chip.get_trigger_channel_info(),
-                         ('gyro_y', 'deg/s', 65.6))
-
-
-######################################################################
 # The two views of one stream
 ######################################################################
 
@@ -531,8 +454,8 @@ class TestStreamViews(unittest.TestCase):
     def test_a_view_projects_its_three_columns(self):
         printer = FakePrinter()
         batch = FakeBatchBulk()
-        gyro = bmi160.SampleStreamView(printer, batch, 'gyro')
-        accel = bmi160.SampleStreamView(printer, batch, 'accel')
+        gyro = bmi160.SampleStreamView(printer, batch, 1)
+        accel = bmi160.SampleStreamView(printer, batch, 4)
         seen = {}
         gyro.add_client(lambda m: seen.setdefault('gyro', m['data']))
         accel.add_client(lambda m: seen.setdefault('accel', m['data']))
@@ -543,26 +466,13 @@ class TestStreamViews(unittest.TestCase):
     def test_a_view_leaves_the_rest_of_the_message_alone(self):
         printer = FakePrinter()
         batch = FakeBatchBulk()
-        view = bmi160.SampleStreamView(printer, batch, 'accel')
+        view = bmi160.SampleStreamView(printer, batch, 4)
         seen = []
         view.add_client(lambda m: seen.append(m) or True)
         batch.send({'data': [(1., 0., 0., 0., 0., 0., 0.)], 'errors': 3,
                     'overflows': 7})
         self.assertEqual(seen[0]['errors'], 3)
         self.assertEqual(seen[0]['overflows'], 7)
-    def test_an_accelerometer_session_passes_straight_through(self):
-        printer = FakePrinter()
-        batch = FakeBatchBulk()
-        accel = bmi160.SampleStreamView(printer, batch, 'accel')
-        gyro = bmi160.SampleStreamView(printer, batch, 'gyro')
-        seen = {}
-        accel.add_client(lambda m: seen.setdefault('accel', m))
-        gyro.add_client(lambda m: seen.setdefault('gyro', m))
-        msg = {'data': [(1., 20., 21., 22.)], 'errors': 0}
-        batch.send(msg)
-        # the same message, not a copy of it
-        self.assertIs(seen['accel'], msg)
-        self.assertEqual(seen['gyro']['data'], [])
     def test_both_dump_endpoints_are_registered(self):
         chip = build()
         wh = chip.printer.lookup_object('webhooks')
@@ -605,103 +515,6 @@ class TestStreamViews(unittest.TestCase):
 
 
 ######################################################################
-# Choosing each session's frame layout
-######################################################################
-
-class FakeCommand:
-    def __init__(self):
-        self.sent = []
-    def send(self, args, **kwargs):
-        self.sent.append(list(args))
-    def send_wait_ack(self, args, **kwargs):
-        self.sent.append(list(args))
-
-def live(values=None):
-    # A chip whose bulk helper can really start, short of the mcu clock
-    chip = build(values)
-    chip.query_bmi160_cmd = FakeCommand()
-    chip.ffreader.note_start = lambda: None
-    chip.ffreader.note_end = lambda: None
-    return chip
-
-def register_writes(chip, reg):
-    return [w[1] for w in chip.bus.writes if w[0] == reg and len(w) == 2]
-
-class TestSessionLayout(unittest.TestCase):
-    def test_a_tap_session_leaves_the_gyroscope_out(self):
-        chip = live()
-        chip.start_internal_tap_client()
-        self.assertFalse(chip.stream_gyro)
-        rest_ticks = chip.mcu.seconds_to_clock(4. / chip.data_rate)
-        self.assertEqual(chip.query_bmi160_cmd.sent,
-                         [[chip.oid, rest_ticks, 6, 4]])
-        self.assertEqual(register_writes(chip, bmi160.REG_FIFO_CONFIG_1),
-                         [bmi160.FIFO_ACC_EN])
-        self.assertNotIn(bmi160.CMD_GYR_PM_NORMAL,
-                         register_writes(chip, bmi160.REG_CMD))
-        self.assertEqual(register_writes(chip, bmi160.REG_GYR_CONF), [])
-        self.assertEqual(chip.ffreader.bytes_per_sample, 6)
-        self.assertEqual(chip.ffreader.samples_per_block, 8)
-    def test_every_other_session_streams_both_sensors(self):
-        for start in ('start_internal_client', 'start_internal_gyro_client',
-                      'start_internal_imu_client'):
-            chip = live()
-            getattr(chip, start)()
-            self.assertTrue(chip.stream_gyro, start)
-            self.assertEqual(chip.query_bmi160_cmd.sent[0][2:], [12, 10])
-            self.assertEqual(register_writes(chip, bmi160.REG_FIFO_CONFIG_1),
-                             [bmi160.FIFO_ACC_EN | bmi160.FIFO_GYR_EN])
-            self.assertIn(bmi160.CMD_GYR_PM_NORMAL,
-                          register_writes(chip, bmi160.REG_CMD))
-            self.assertEqual(chip.ffreader.bytes_per_sample, 12)
-    def test_a_gyroscope_tap_channel_keeps_it(self):
-        chip = live({'tap_channel': 'gyro_z'})
-        chip.start_internal_tap_client()
-        self.assertTrue(chip.stream_gyro)
-        self.assertEqual(chip.query_bmi160_cmd.sent[0][2:], [12, 4])
-    def test_gyroscope_clients_are_refused_during_a_tap_session(self):
-        chip = live()
-        chip.start_internal_tap_client()
-        with self.assertRaises(ConfigError) as cm:
-            chip.start_internal_gyro_client()
-        self.assertIn("Z tap", str(cm.exception))
-        with self.assertRaises(ConfigError):
-            chip.start_internal_imu_client()
-        # an accelerometer client is welcome
-        chip.start_internal_client()
-        self.assertEqual(len(chip.batch_bulk.client_cbs), 2)
-    def test_a_tap_joining_a_combined_session_gets_the_accel_view(self):
-        chip = live({'axes_map': 'y, x, -z'})
-        chip.start_internal_imu_client()
-        tap = chip.start_internal_tap_client()
-        self.assertTrue(chip.stream_gyro)
-        self.assertEqual(len(chip.query_bmi160_cmd.sent), 1)
-        tap.request_start_time, tap.request_end_time = 0., 10.
-        sample = convert(chip, [(1., 1312, 0, -656, 100, 200, 16384)])
-        for cb in chip.batch_bulk.client_cbs:
-            cb({'data': sample, 'errors': 0})
-        got = tap.get_samples()
-        self.assertEqual(len(got[0]), 4)
-        self.assertAlmostEqual(chip.raw_trigger_channel(got[0]), 16384.,
-                               places=2)
-    def test_the_next_session_picks_its_own_layout(self):
-        chip = live()
-        chip.start_internal_tap_client()
-        chip.batch_bulk._stop()
-        self.assertEqual(chip.query_bmi160_cmd.sent[-1], [chip.oid, 0, 0, 0])
-        chip.start_internal_client()
-        self.assertTrue(chip.stream_gyro)
-        self.assertEqual(chip.query_bmi160_cmd.sent[-1][2:], [12, 10])
-    def test_an_accel_only_session_converts_six_byte_frames(self):
-        chip = build({'axes_map': 'y, x, -z'})
-        chip.stream_gyro = False
-        out = convert(chip, [(1., 100, 200, 16384)])
-        self.assertEqual(len(out[0]), 4)
-        self.assertAlmostEqual(chip.raw_trigger_channel(out[0]), 16384.,
-                               places=2)
-
-
-######################################################################
 # Configuration
 ######################################################################
 
@@ -711,7 +524,6 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(chip.data_rate, 1600)
         self.assertEqual(chip.accel_range, 2)
         self.assertEqual(chip.gyro_range, 250)
-        self.assertEqual(chip.tap_channel, 'accel_z')
         self.assertTrue(chip.has_gyro())
     def test_an_unsupported_rate_is_refused(self):
         with self.assertRaises(ConfigError):
@@ -728,10 +540,6 @@ class TestConfig(unittest.TestCase):
         # without a gyroscope there is no pseudovector to get wrong
         self.assertIsNone(
             build({'gyro': False, 'axes_map': 'x, x, z'}).axes_handedness)
-    def test_a_gyro_tap_channel_needs_the_gyroscope(self):
-        with self.assertRaises(ConfigError) as cm:
-            build({'gyro': False, 'tap_channel': 'gyro_z'})
-        self.assertIn("needs the gyroscope", str(cm.exception))
     def test_the_commands_are_registered(self):
         chip = build()
         gcode = chip.printer.lookup_object('gcode')

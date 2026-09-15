@@ -3,22 +3,17 @@
 The corertheta tilting head carries a Bosch BMI160: a three-axis
 accelerometer and a three-axis gyroscope in one package, on one bus,
 sharing one FIFO and one sample clock. It is the only sensor this fork
-supports for either homing feature:
-
-* **B homing and calibration** - [Accel_B_Homing.md](Accel_B_Homing.md),
-  `[accel_b_homing]`. B is measured against gravity on an angle fused
-  from both sensors.
-* **Z homing by nozzle tap** - [Accel_Z_Tap.md](Accel_Z_Tap.md),
-  `[accel_z_tap]`. A contact is detected on the MCU that reads the chip,
-  from one channel of its FIFO.
+supports for B homing and calibration - [Accel_B_Homing.md](Accel_B_Homing.md),
+`[accel_b_homing]` - where B is measured against gravity on an angle
+fused from both sensors.
 
 This document covers the sensor itself: wiring it to the machine,
 bringing it up, how the driver (`klippy/extras/bmi160.py`,
 `src/sensor_bmi160.c`) presents it, and its calibration. The option
 reference is `[bmi160]` in [Config_Reference.md](Config_Reference.md#bmi160).
 
-**Status.** The driver, the fused B measurement, the motion gate and the
-tap detector are implemented and host-tested. Beyond a first `G28 B`,
+**Status.** The driver, the fused B measurement and the motion gate are
+implemented and host-tested. Beyond a first `G28 B`,
 none of it has been exercised on the machine: every number below is a
 datasheet number or arithmetic on one, not a measurement.
 
@@ -28,7 +23,7 @@ An accelerometer at rest reads gravity, and gravity in the head's frame
 is the head's tilt - but **an accelerometer cannot tell a tilted head
 from an accelerating one**. A head rocking slowly on its belts barely
 moves the sample deviation and still ruins the angle. The gyroscope is
-what closes that gap, three ways:
+what closes that gap, two ways:
 
 1. **A fused angle.** The two sensors fail in opposite directions: the
    accelerometer is absolute but only once the head has stopped moving,
@@ -40,10 +35,6 @@ what closes that gap, three ways:
 2. **A motion gate that observes motion.** A head at rest reads zero
    rotation rate, so `max_rotation_rate` tests directly for the thing a
    deviation threshold can only infer.
-3. **A gravity-free tap channel.** A nozzle strike lands off the head's
-   rotation axis, so it is an angular impulse as well as a linear one,
-   and a rate signal has no 1 g term to remove. `tap_channel` can point
-   the detector at a gyroscope axis instead of an accelerometer one.
 
 The two sensors are **simultaneous by construction**: one FIFO frame
 carries both, sampled on the same clock. A fusion needs an acceleration
@@ -69,13 +60,11 @@ Two consequences to know:
   in headerless mode, which requires every enabled sensor to share an
   output data rate, and the accelerometer stops at 1600 Hz. For
   `[resonance_tester]` that is an 800 Hz Nyquist frequency, well above
-  where input shaping works. For tap detection it bounds the band a
-  contact can be seen in.
+  where input shaping works.
 * **Range trades resolution for headroom.** At +/-2 g a count is
   0.061 mg, about 0.0035 degrees of tilt, which is what a complementary
-  filter wants from each sample. A tap is a shock, which wants headroom.
-  `accel_range` is a config option for that reason; see
-  [Open questions](#open-questions) for whether one chip can serve both.
+  filter wants from each sample. `[resonance_tester]` on a hard-driven
+  head may want more headroom, which is what `accel_range` is for.
 
 ## On this machine: SPI0 of the Pi Zero W
 
@@ -162,14 +151,8 @@ buys margin where the Pi is short:
 * **Fusion.** A 2.5 ms step is still eighty samples per 0.2 s time
   constant.
 
-**The tap wants `rate: 1600`.** Its repeatability scales with the FIFO
-poll interval, and at 400 Hz the chip's filter narrows to about 160 Hz,
-which may soften the contact itself. See "Latency" in
-[Accel_Z_Tap.md](Accel_Z_Tap.md#latency). There is one `[bmi160]` and
-so one rate; the example config runs 400 until tapping is commissioned.
-A tap on an accelerometer channel streams without the gyroscope (see
-"The frame layout is chosen per session"), which halves what 1600 Hz
-costs the Pi during a tap.
+Raise it only for `[resonance_tester]`, whose band of interest needs
+the higher Nyquist frequency.
 
 ### What a bad link does
 
@@ -227,10 +210,9 @@ with level-shifting transistors on SDA and SCL may not pass 1 MHz; drop
    power or chip select - and anything else is usually SCLK and MOSI
    swapped.
 
-3. **Build klipper_mcu from this tree.** Its `query_bmi160` takes
-   `bytes_per_frame` and `frame_offset` arguments that stock builds - and
-   builds of this branch from before the frame layout became per session
-   - do not know, and a mismatched build is refused at connect. SPI and BMI160 support are on
+3. **Build klipper_mcu from this tree.** Its `config_bmi160` takes a
+   `bytes_per_frame` argument that stock builds do not know, and a
+   mismatched build is refused at connect. SPI and BMI160 support are on
    by default in the Linux process build. Use a separate config and
    output directory so the LPC1769's `.config` is left alone:
 
@@ -359,33 +341,11 @@ converts each frame once and presents views of the stream:
 | `start_internal_imu_client()` | `(time, gx, gy, gz, ax, ay, az)` | the fused B measurement |
 | `start_internal_client()` | `(time, ax, ay, az)` | `ACCELEROMETER_*` commands, `[resonance_tester]`, `B_MEASURE FUSION=0`, `B_SENSOR_CALIBRATE` |
 | `start_internal_gyro_client()` | `(time, gx, gy, gz)` | the motion gate on an unfused measurement |
-| `start_internal_tap_client()` | `(time, ax, ay, az)`, or the IMU sample for a gyroscope `tap_channel` | the tap capture |
 
 The accelerometer and gyroscope views are also dump endpoints
 (`bmi160/dump_bmi160`, `bmi160/dump_bmi160_gyro`). `gyro: False` removes
 the gyroscope from the FIFO, giving six-byte frames; `[accel_b_homing]`
 refuses a chip configured that way.
-
-### The frame layout is chosen per session
-
-The chip streams between the first client and the last, and the layout
-of that session's frames is decided when it starts. If the only client
-is a tap client on an accelerometer `tap_channel`, the gyroscope stays
-suspended and out of the FIFO: six-byte frames, half the SPI traffic,
-no gyroscope conversion in klippy, and twice the FIFO headroom. Every
-other session streams both sensors when `gyro` is enabled.
-
-On the Pi Zero W this is what keeps a Z tap from starving step
-generation. A homing move only plans about 100 ms ahead, and a klippy
-reactor stalled for longer by bulk decoding hands the LPC1769 steps that
-are already due - "Timer too close".
-
-A session's layout cannot change while it runs. A gyroscope or IMU
-client started during an accelerometer-only tap session is refused with
-an error rather than given the wrong frames; accelerometer clients
-join it. A tap client that joins a session already streaming both
-sensors is served from the accelerometer view, and the firmware is
-already watching the right byte of those frames.
 
 ### Block arithmetic
 
@@ -393,14 +353,11 @@ Klipper's `FixedFreqReader` timestamps bulk samples by *counting* them,
 so every bulk message must carry exactly `MAX_BULK_MSG_SIZE // frame`
 frames. `MAX_BULK_MSG_SIZE` is 51: 51 // 12 = 4 frames in combined mode,
 51 // 6 = 8 in accelerometer-only mode. Both are 48 bytes, so
-`BYTES_PER_BLOCK` in the firmware is one constant. The firmware polls
-the FIFO every four sample periods and reads the whole frames pending
-there, filling the block across polls and sending it once it is full, so
-a read never straddles a partial frame or reads the 0x80 over-read
-pattern. Reading per poll rather than per block keeps the tap detector's
-sample age at four frames in both layouts: waiting for a full block of
-six-byte frames would double it. A partly filled block counts as
-`buffered` in the status report, so the timestamps are unaffected.
+`BYTES_PER_BLOCK` in the firmware is one constant; the frame size is
+passed at config time as `bytes_per_frame`. The firmware polls the FIFO
+every four sample periods and reads a block only once a whole block is
+pending, so a read never straddles a partial frame or reads the 0x80
+over-read pattern.
 
 ### Lost frames are reported
 
@@ -410,30 +367,8 @@ count cannot exceed the FIFO size. `sensor_bmi160.c` therefore reports a
 possible overflow whenever the FIFO is too full to take another whole
 frame. Because timestamps come from counting, lost frames also leave the
 survivors mistimed, which a fused angle would integrate. `[accel_b_homing]`
-refuses a measurement, and `[accel_z_tap]` a tap, during which the
-overflow count rose, naming `rate` as the thing to lower.
-
-### The trigger seam
-
-A tap has to be detected on the MCU that owns the chip. The firmware
-exposes
-
-    bmi160_attach_trigger_analog oid=%c trigger_analog_oid=%c
-
-and the channel to watch arrives with each session's start,
-
-    query_bmi160 oid=%c rest_ticks=%u bytes_per_frame=%c frame_offset=%c
-
-where `frame_offset` is the byte offset of the 16-bit channel in that
-session's frames (from `tap_channel`: 10 for `accel_z` in combined
-frames and 4 in accelerometer-only ones, 4 for `gyro_z`). That channel
-is decoded as each read's frames come in and handed to
-`trigger_analog_update()`; the filter, threshold, trsync dispatch and
-sensor-quiet monitor downstream are Klipper's shared `trigger_analog`
-code. `[accel_z_tap]` reads the channel's unit and scale back with
-`get_trigger_channel_info()`, and recovers the raw count the detector saw
-from an `axes_map`ped host sample with `raw_trigger_channel()`, so its
-host-side capture is the detector's own input.
+refuses a measurement during which the overflow count rose, naming
+`rate` as the thing to lower.
 
 ## Commands
 
@@ -452,8 +387,7 @@ factors against the datasheet tables, register values for each range and
 rate, frame decoding, `axes_map` on both streams with the determinant
 correction, the stream views, and the invariant that the frames per
 message fill `BYTES_PER_BLOCK`. The fusion and sign convention are
-covered in `test_accel_b_homing.py`, the tap filter in
-`test_accel_z_tap.py`.
+covered in `test_accel_b_homing.py`.
 
 Nothing on the host can check the wiring, the real noise floor and
 zero-rate offset, the right `fusion_tau`, or any threshold. Those are
@@ -461,9 +395,8 @@ machine measurements.
 
 ## Open questions
 
-* Does klipper_mcu keep the FIFO drained while klippy is busy - at
-  400 Hz for B, and at 1600 Hz for the tap? The overflow check answers
-  it.
+* Does klipper_mcu keep the FIFO drained at 400 Hz while klippy is
+  busy? The overflow check answers it.
 * Does the SPI run to the head survive the stepper cables? The symptom
   is an intermittent "Invalid bmi160 id", or `B_MEASURE` results that
   scatter more than the noise floor predicts.
@@ -473,7 +406,3 @@ machine measurements.
 * How large is the gyroscope's zero-rate offset after FOC, and how far
   does it drift over a print's temperature change? It sets
   `max_rotation_rate` and the fused angle's bias.
-* Can one `accel_range` serve both uses? +/-2 g is 1 g of margin over
-  gravity - far above any print move, not above a tap's shock. If taps
-  clip, +/-4 g costs one bit of tilt resolution; a gyroscope
-  `tap_channel` avoids the question.
