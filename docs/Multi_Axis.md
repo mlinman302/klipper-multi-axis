@@ -808,15 +808,14 @@ the touching.
   `G28 B` measures the head and turns it to B = 0, and
   `[stepper_tilt]`'s range is a soft limit.  Until it has run,
   `b_coupling_ratio` is nominal rather than measured.
-* **Accelerometer Z homing by tapping the bed with the nozzle**, using
-  the same head-mounted IMU - design outline in
-  [Accel_Z_Tap.md](Accel_Z_Tap.md).  Contact is detected on the
-  sensor board itself, so the nozzle becomes the Z datum and the
-  probe's `z_offset` becomes measurable rather than assumed.
-* **The head IMU itself** - a BMI160 in place of the ADXL345, so the
-  head carries a gyroscope as well as an accelerometer.  Architecture
-  and phases in [BMI160_IMU.md](BMI160_IMU.md); the sensor layer is
-  implemented, and the gyroscope is what makes the two items above
-  measurements rather than inferences.
+* **Commission Z homing by tapping the bed with the nozzle**, using
+  the same head-mounted IMU - `[accel_z_tap]`, in
+  [Accel_Z_Tap.md](Accel_Z_Tap.md).  Contact is detected on the MCU
+  that reads the sensor, so the nozzle becomes the Z datum and the
+  probe's `z_offset` becomes measurable rather than assumed.  It is
+  implemented but has never touched the bed.
+* **The head IMU** is a BMI160, the only sensor either item above
+  supports - [BMI160_IMU.md](BMI160_IMU.md).  Its gyroscope is what
+  makes them measurements rather than inferences.
 * **Multi-rotation RTCP** (A and C as well as B), if a future head needs
   it — see "Scope" above.

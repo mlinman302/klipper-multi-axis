@@ -1,882 +1,518 @@
-# Gravity-referenced B axis: homing and step calibration
+# B axis homing and calibration
 
-> **The sensor is now a BMI160 IMU**, and the angle is now *fused*.
-> `[accel_b_homing]`'s `accel_chip` defaults to `bmi160`, and the
-> gyroscope is combined with the accelerometer through a complementary
-> filter: the accelerometer keeps the angle absolute over long
-> timescales, the gyroscope carries it through the ringing that follows
-> a move. **The fused angle is the only angle from vertical that B is
-> homed, checked or calibrated on** - `G28 B`, the endstop direction
-> and verification, `B_MEASURE CHECK=1` and `B_STEP_CALIBRATE` all read
-> it through `measure_vertical()`, which refuses a chip without a
-> gyroscope. The accelerometer-only angle this document describes is
-> still computed, but only as a diagnostic that `B_MEASURE` reports
-> beside the fused one. The same gyroscope supplies the motion
-> gate (`max_rotation_rate`) - a direct test that the head was at rest,
-> where `max_sample_deviation` below can only infer it.
->
-> Everything below about mounting and the zero reference is unchanged
-> and chip-independent - and it now does more work, because which
-> gyroscope axis carries dB/dt, and with which sign, is *derived* from
-> `zero_vector` and `positive_vector` rather than separately configured.
-> The BMI160's fast offset compensation can trim the zero-g offset in
-> hardware to 3.9 mg, but only against a pose declared exact, and only
-> until power cycle - so the offsets are fitted in software instead, by
-> `B_SENSOR_CALIBRATE`. See [BMI160_IMU.md](BMI160_IMU.md).
+`[accel_b_homing]` (`klippy/extras/accel_b_homing.py`) measures the
+corertheta tilting head's B angle against gravity with the BMI160 bolted
+to the head, and builds three things on that measurement:
 
-**Status: phases one, two (sensor calibration), three and four are
-implemented** - `[accel_b_homing]`, the `B_MEASURE`,
-`B_SENSOR_CALIBRATE` and `B_STEP_CALIBRATE` commands, and homing
-(`klippy/extras/accel_b_homing.py`).
-**B has no endstop by default.** `G28 B` measures the head, books the
-measurement as B and turns it to B = 0, measuring and correcting until
-it is there; `[stepper_tilt]`'s `position_min` and `position_max` are soft
-limits that keep the filament tube from kinking, not physical stops. See
-[Algorithm: homing](#algorithm-homing) and `[accel_b_homing]` in
-Config_Reference.md. Phase two's offset and gain fit is implemented, so
-after `B_SENSOR_CALIBRATE` the head homes to gravity's vertical; its
-`B_SET_ZERO` (a fine zero against a physical reference) and phase five
-are still design. `B_STEP_CALIBRATE` measures `b_coupling_ratio` - see
-[Algorithm: B step calibration](#algorithm-b-step-calibration). A `[stepper_tilt]` that does
-have an `endstop_pin` still sweeps into it, with the measurement picking
-the direction and confirming the result.
+* **`G28 B`** - B has no endstop. The head is measured, the measurement is
+  booked as B, and the head is turned to B = 0, measured again after each
+  move until it is there.
+* **`B_SENSOR_CALIBRATE`** - fits the sensor's offsets and gain ratio, so
+  B = 0 is gravity's vertical rather than the sensor's.
+* **`B_STEP_CALIBRATE`** - measures the drive ratio, `b_coupling_ratio`.
 
-This document describes how an ADXL345 mounted on the tilting head can
+plus `B_MEASURE`, which reports the measurement and can compare it with
+the commanded angle.
 
-  1. **home the B axis** by *measuring* its absolute angle against gravity
-     instead of sweeping it into an endstop, and
-  2. **calibrate the B drive ratio** - the motor steps that correspond to
-     one degree of head rotation - by commanding known rotations and
-     measuring what actually happened.
+The BMI160 is the only supported sensor, and its gyroscope must be
+enabled. Wiring, bring-up and the driver are in
+[BMI160_IMU.md](BMI160_IMU.md); the option reference is
+[Config_Reference.md](Config_Reference.md#accel_b_homing).
 
-The two features share one primitive (read the head's tilt) and one
-calibration (the sensor's own mounting and offsets), so they belong in a
-single module.
+**Status.** Everything here is implemented and host-tested
+(`test/multi_axis/test_accel_b_homing.py`). Only the first `G28 B` has
+run on the machine - it homed about 7 degrees from a known vertical,
+which an uncalibrated accelerometer offset explains, and
+`B_SENSOR_CALIBRATE` has not yet been run to remove it. Whether a
+positive B really tilts the nozzle outboard is still unverified.
 
-## Why bother
+## Why measure B
 
-B on the corertheta machine is the awkward axis:
+B is the awkward axis on this machine:
 
-* It has **no physical endstop** worth the name. It used to home on a
-  TMC StallGuard virtual endstop shared with the R gantry pair, where a
-  home issued too soon after another move triggered instantly, the axis
-  did not move, no error was raised, and B was still reported homed. Its
-  range ends are not hard stops either - they are where the filament
-  tube starts to kink - so there is nothing it should ever be driven
-  into. A silent wrong home on B is expensive: `[rtcp]` turns every B
-  error into an X/Z error at the nozzle.
-* Its zero is a *physical* claim - "the nozzle points straight down" -
-  that a switch or a stall threshold only approximates. `[rtcp]` and
-  `[bltouch] b_offset` are both built on that claim.
-* Its drive ratio is not directly measurable with a ruler. B is coupled:
-  both gantry motors turn for a B move, through a differential, and the
-  belt travel per degree is the `b_coupling_ratio` option of `[printer]`.
-  It is a nominal `1.0` until `B_STEP_CALIBRATE` has measured it.
+* **It has nothing to home against.** Its range ends are where the
+  filament tube starts to kink, not hard stops. It used to home on a
+  StallGuard virtual endstop shared with the R gantry pair, where a home
+  issued too soon after another move triggered instantly, the axis did
+  not move, and B was still reported homed. `[rtcp]` turns every B error
+  into an X/Z error at the nozzle, so a silent wrong home is expensive.
+* **Its zero is a physical claim** - the nozzle points straight down -
+  that a switch or a stall threshold only approximates. `[rtcp]` and the
+  probe's `b_offset` are both built on it.
+* **Its drive ratio cannot be measured with a ruler.** Both gantry motors
+  turn for a B move, through a differential, and `b_coupling_ratio` is a
+  nominal 1.0 until it is measured.
 
-An accelerometer at rest reads the gravity vector. A gravity vector in
-the head's own frame *is* the head's tilt, absolutely, with no reference
-to where the axis has travelled. That makes homing an observation rather
-than a sweep into a stop, and turns the drive ratio into something
-measurable.
+An accelerometer at rest reads the gravity vector, and gravity in the
+head's own frame *is* the head's tilt - absolutely, whatever the axis
+has done since it was last homed. That makes homing an observation and
+the drive ratio something measurable.
 
-## Hardware
-
-The board in use is a **Fly-ADXL345-USB**: an ADXL345 plus an onboard
-RP2040 that runs Klipper firmware and enumerates as a USB serial device.
-There is nothing to wire - the SPI link to the sensor is internal to the
-board, between the RP2040 and the ADXL345.
-
-That makes it a **secondary Klipper MCU**, not a USB sensor with a driver
-of its own. Three consequences:
-
-* **Flash it from this tree.** The RP2040 runs Klipper firmware built
-  for `rp2040`, and host and MCU should be the same version. Building it
-  from this fork rather than from stock keeps them in step.
-* **It gets an `[mcu]` section**, and `[adxl345]` addresses its pins
-  through that MCU's name. The vendor's configuration uses **software
-  SPI**, not `spi_bus`:
-
-  ```ini
-  [mcu adxl]
-  serial: /dev/serial/by-id/usb-Klipper_rp2040_XXXXXXXXXXXX-if00
-
-  [adxl345]
-  cs_pin: adxl:gpio9
-  spi_software_sclk_pin: adxl:gpio10
-  spi_software_mosi_pin: adxl:gpio11
-  spi_software_miso_pin: adxl:gpio12
-  ```
-
-* **The link adds latency**, which is the one thing in this module that
-  had to change for it - see `batch_margin` below.
-
-None of this reaches `accel_b_homing.py`. The module looks the chip up by
-name and calls `start_internal_client()`; it never touches a bus, a pin
-or an MCU. A USB board, a CAN toolhead and a chip wired straight to the
-mainboard's SPI are all the same to it, and so is a different chip
-entirely - `[lis2dw]`, `[mpu9250]` and `[lis3dh]` all expose the same
-interface and the same `data_rate` attribute.
-
-### What the USB link does change: `batch_margin`
-
-The bulk sensor helpers deliver samples to the host in batches (0.100 s
-in `adxl345.py`), and a secondary MCU adds a link's worth of latency on
-top. `finish_measurements()` waits for the *moves* to finish, not for the
-sensor batches to arrive, so the batch carrying the tail of the averaging
-window has usually not been delivered when the samples are asked for.
-
-The fix is a trailing dwell - `batch_margin`, 0.3 s by default - after
-the averaging window and before `finish_measurements()`, so the window is
-comfortably in the past by the time it is read. Losing the tail is
-harmless on a long window, but a short one on a laggy link loses enough
-of itself to trip the routine's own data-loss check: with a 0.2 s window
-and 0.15 s of delivery lag, three quarters of the window is missing. On a
-chip wired directly to the mainboard the margin costs 0.3 s and changes
-nothing else; it is not worth making the distinction in config.
-
-Mounting:
+## Mounting
 
 * Rigid to the **rotating** part of the head, not the carriage. Any
-  compliance in the mount is measured as head tilt.
-* Mount it **square**: the B rotation axis parallel to one sensor axis,
-   and the other two spanning the plane the head tilts in. Which axis is
-   which does not matter - that is declared, see below - but phase one
-   has no way to take out a skewed mounting, so a sensor glued on two
-   degrees out reads two degrees out.
-* Route the cable so a 145-degree swing does not tug it. A cable that
-  pulls on the head is a systematic angle error, and a USB cable is
-  stiffer than the ribbon a directly-wired sensor would use - this
-  matters more here than it would on a bench.
-* The board is bus powered, so there is no separate supply to route.
+  compliance in the mount is measured as tilt.
+* **Square**: one sensor axis parallel to the B rotation axis, the other
+  two spanning the plane the head tilts in. Which is which is declared,
+  below. A sensor rotated a degree about the B axis reads a degree out,
+  and no calibration here can see it.
+* Route the cable so the 145-degree swing does not tug it. A cable that
+  pulls on the head is a systematic angle error.
 
-The chip can be shared with `[resonance_tester]`; this module does not
-require any particular `axes_map`, so input shaping keeps whatever
-mapping it needs.
+The chip can be shared with `[resonance_tester]`, and no particular
+`axes_map` is required.
 
-## The physics, and the error budget
+## Declaring the zero
 
-With the head at rest the sensor reads `-g` in head coordinates. Pick the
-two sensor axes that span the tilt plane and call them `u` and `w`; the
-third, `v`, is the out-of-plane axis parallel to the B rotation axis. As
-B turns, `(u, w)` traces a circle of radius 1 g and `v` stays constant.
-The head angle is
-
-    phi = atan2(u - u0, w - w0)          (corrected for offsets/gains)
-    B   = sign * (phi - phi_zero)
-
-That is the general form. Phase one runs it with the corrections at their
-identity values and the zero fixed to an axis direction, which is what
-the next section describes.
-
-Using **both** in-plane axes through `atan2` - rather than one axis
-through `asin` - is what makes the resolution uniform across the whole
-range. A single-axis reading goes flat near +/-90 degrees; `atan2` does
-not.
-
-`v` is not wasted: it is the health check. It must stay constant across
-the sweep, and `u^2 + w^2 + v^2` must stay at 1 g.
-
-### Declaring the zero, phase one
-
-The mounting is **declared, not fitted**, and is restricted to the six
-axis-aligned directions. Two signed sensor axes say everything the
-measurement needs:
+Two signed sensor axes, restricted to the six axis-aligned directions,
+say which way is B = 0:
 
     zero_vector      the sensor axis that reads +1 g at B = 0
     positive_vector  the sensor axis that reads +1 g at B = +90
 
 An accelerometer at rest reads the specific force, which points *up*, so
-both of these are "the sensor axis pointing straight up" at their
-respective angles - and both are found by looking rather than by
-measuring anything. Park the head, run `ACCELEROMETER_QUERY`, note which
-axis reads about +9800 mm/s^2, and use the negated name if it reads about
--9800.
-
-Then, with `w` the reading along `zero_vector` and `u` the reading along
-`positive_vector`,
+both name "the sensor axis pointing straight up" at their angle. Find
+them by looking: park the head at B = 0, run `BMI160_QUERY`, and name the
+axis reading about +9800 mm/s^2 (the negated name if it reads -9800).
+Turn the head toward +90 and repeat for `positive_vector`. With `w` the
+reading along `zero_vector` and `u` the reading along `positive_vector`,
 
     B = atan2(u, w)
 
-which is 0 at B = 0 and +90 at B = +90 by construction. That is the whole
-zero reference: no `zero_angle` offset, and no separate inversion flag -
-the sign convention falls out of which direction `positive_vector` names.
-The third axis is the rotation axis, by elimination.
+which is 0 at B = 0 and +90 at B = +90 by construction - no offset angle
+and no inversion flag. Using both in-plane axes keeps the resolution
+uniform across the range, where a single axis through `asin` goes flat
+near +/-90 degrees. The third axis is the rotation axis, by elimination;
+it should barely change as B turns, and it is reported as a health check.
 
-The cost is that the zero is quantised to the six axis directions, so a
-sensor glued on a couple of degrees out is a couple of degrees out. That
-is a phase two problem: the fine offset is one more number on top of this
-reference, not a replacement for it.
+`positive_vector` also fixes the rotation sense the sensor believes in.
+It must agree with the direction the *motors* call +B, or `G28 B` stops
+on its first move (see below). `invert_b_direction` in `[printer]` stays
+the one place the machine's own rotation sense is set.
+
+## The measurement
+
+`B_MEASURE` and everything that moves B read the head through one
+primitive:
+
+```
+measure(settle, window)
+  1. wait for moves; start the BMI160's combined stream
+     dwell(settle + window + batch_margin)
+  2. refuse if the chip reported possible FIFO overflows
+  3. correct every sample by offset_u, offset_w and gain_ratio
+  4. over the window (settle .. settle + window):
+       refuse if no samples, or fewer than half those expected
+       refuse if any axis's sample deviation > max_sample_deviation
+       refuse if | |mean| - 1 g | > max_magnitude_error
+       refuse if mean |omega| > max_rotation_rate
+     accel_angle = atan2(u, w) of the mean acceleration
+  5. over the capture, settle included, to the window's end:
+       fused_angle = complementary filter of the accelerometer angle
+                     and the gyroscope rate about the rotation axis
+       refuse if the capture is shorter than 3 x fusion_tau
+       refuse if fused_angle differs from the accelerometer average over
+                  the last fifth of the window by > max_fusion_disagreement
+```
+
+### The fused angle is the only one acted on
+
+The accelerometer cannot tell a tilted head from an accelerating one; the
+gyroscope sees rotation exactly but cannot say where the head started,
+and its offset makes an integral drift. A complementary filter crosses
+them over at `fusion_tau`:
+
+    predicted = angle + rate * dt
+    angle     = predicted + (1 - alpha) * (accel_angle - predicted)
+    alpha     = tau / (tau + dt)
+
+Above `tau` the accelerometer wins, so the angle is absolute and does not
+drift. Below it the gyroscope wins, so the angle tracks the head through
+the ringing after a move. The blend is written as a correction to the
+prediction, not an average of two angles, so a measurement straddling
++/-180 does not land on the opposite side of the circle. Which gyroscope
+axis carries dB/dt, and its sign, is derived from the two vectors - see
+[BMI160_IMU.md](BMI160_IMU.md#the-gyroscopes-sign-is-derived-not-configured).
+
+**`G28 B`, the endstop direction and verification, `B_MEASURE CHECK=1`
+and `B_STEP_CALIBRATE` act only on the fused angle**, and `measured_b`
+in the status is only ever a fused angle. The accelerometer-only angle is a diagnostic: `B_MEASURE` prints
+it beside the fused one, `FUSION=0` measures with it alone, and the
+status reports it as `accel_b`. `B_SENSOR_CALIBRATE` also reads it,
+because it fits the averaged vector at parked stations, not an angle.
+Fusion cannot be turned off in the config.
+
+### Details that matter
+
+* **Settle, window and margin are separate.** The head hangs on belts and
+  rings after a move, so averaging starts after `settle_time`. The fused
+  angle runs through the settle too, which turns the settle from "wait
+  for the head to stop" into "let the filter converge". `batch_margin`
+  is never sampled: the BMI160 delivers in 0.1 s batches, later still
+  through klipper_mcu, and the margin lets the batch carrying the end of
+  the window arrive before it is read.
+* **Rejection is loud.** A reading taken while the head drifts silently
+  poisons a home, so every gate raises an error naming the setting to
+  change rather than returning a number.
+* **No transform has to be off to measure.** The sensor reads a physical
+  angle. `[rtcp]` moves X and Z, never B. `[b_projection]` changes what
+  the *commanded* B means, so `B_MEASURE` converts the commanded angle
+  with `project_pos()` before comparing. Everything that *moves* B does
+  need both transforms off.
 
 ### What limits accuracy
 
-| Source | Raw magnitude | Angle effect | Handled by |
+| Source | Size | Angle effect | Handled by |
 | --- | --- | --- | --- |
-| Quantisation (3.9 mg/LSB, full-res) | 1 LSB | ~0.22 deg per sample | averaging |
-| Broadband noise at 3200 Hz ODR | ~10-20 mg rms | ~0.9 deg per sample | averaging (~0.02-0.05 deg over 0.5 s) |
-| **Zero-g offset** | **up to +/-150 mg** | **up to ~8.6 deg** | **ellipse fit - mandatory** |
-| Inter-axis gain mismatch | up to ~10 % | several deg, angle dependent | ellipse fit |
-| Cross-axis sensitivity | ~1 % | ~0.5 deg | optional 2x2 fit |
-| Offset drift with temperature | order 1 mg/degC | tenths of a deg | re-zero after heat soak |
-| Residual head motion / ringing | - | unbounded | settle dwell + reject on stddev |
-| Machine frame not level with gravity | - | direct bias | `level_offset` |
+| Quantisation | 0.061 mg/LSB at +/-2 g | 0.0035 deg per sample | nothing needed |
+| Noise | 180 ug/sqrt(Hz) | ~0.01 deg over a 0.5 s window | averaging, fusion |
+| **Accelerometer offset** | **+/-40 mg board, +/-150 mg life** | **up to ~8.5 deg near B = 0** | **`B_SENSOR_CALIBRATE` - required** |
+| Gain mismatch between axes | small | angle dependent | `B_SENSOR_CALIBRATE` |
+| Gyroscope zero-rate offset | +/-3 deg/s uncalibrated | ~offset x `fusion_tau` of bias | `BMI160_CALIBRATE GYRO=1` |
+| Head still moving | - | unbounded | fusion; settle; the gates |
+| Sensor rotated on its mount | - | direct | nothing - a physical reference |
+| Frame not level with gravity | - | direct | nothing |
 
-The row that decides the architecture is the zero-g offset. Uncorrected,
-an ADXL345 can be **eight degrees** wrong about which way is down. Raw
-`atan2` on raw counts is not usable for this job; a per-sensor offset and
-gain calibration is not a refinement, it is a precondition. Everything
-else is comfortably sub-tenth-degree with half a second of averaging -
-which is already better than a belt-driven differential's mechanical
-repeatability.
+The row that decides the design is the accelerometer offset. Near B = 0
+the angle is almost entirely `u / w`, so an offset along
+`positive_vector` moves the zero directly: 100 mg is 5.7 degrees.
+Repeatability is a different matter and is already good - a parked head
+re-measures to a few hundredths of a degree - which is why the gates are
+tight while `check_tolerance` is loose.
 
-## Where the code lives
+## `G28 B`
 
-    klippy/extras/accel_b_homing.py          new - the whole feature
-    klippy/kinematics/rotary_axis.py         small hook: homing source
-    klippy/kinematics/corertheta.py          B rail without an endstop
-    klippy/stepper.py                        need_endstop=False rails
-    config/example-corertheta.cfg            new section, HOME_B rewrite
-    docs/Config_Reference.md                 new section
-    docs/Multi_Axis.md                       cross-reference
-    test/multi_axis/test_accel_b_homing.py   new - host tests
-
-Config section name `[accel_b_homing]`; the printer object is the sensor,
-and the commands it registers are named for the axis (`B_*`).
-
-The module splits into three layers, deliberately:
-
-1. **Pure functions** (module level, no printer dependency):
-   `parse_signed_axis()`, `out_of_plane_index()`, `measure_angle()`,
-   `summarize()` today, joined by `fit_gravity_ellipse()`, `unwrap()` and
-   `fit_drive_sweep()` in the later phases. All the mathematics lives
-   here so it can be unit tested on a host that cannot run klippy -
-   which, on the Windows dev box, is all of them.
-2. **The measurement primitive**: `measure()` - dwell, sample, filter,
-   average, validate, return a `TiltReading`.
-3. **The routines**: homing, sensor calibration, step calibration, and
-   the g-code commands that drive them.
-
-### The hook into `G28 B`
-
-`PrinterHoming.cmd_G28` already ends with `for ea in extra_axes:
-ea.home()`, so the integration is a registration point on
-`BaseRotaryAxis`, as implemented:
-
-```python
-# rotary_axis.py
-def set_homing_source(self, source):  # called by accel_b_homing at connect
-    self.homing_source = source
-    if not self.has_endstop:          # the source becomes the home
-        self.can_home, self.is_homed = True, False
-def home(self):
-    self.is_homed = False
-    if not self.has_endstop:
-        return self._home_by_measurement()   # -> source.home_axis(self)
-    ... endstop sweep, direction from the source if unset ...
-```
-
-The source drives the axis through three small methods on it -
-`get_range()`, `set_measured_position(angle)` (set B and mark it homed)
-and `move_axis(angle)` - plus `get_drive_steppers()`, which on corertheta
-is both gantry motors. No monkeypatching, and `G28 B`, `M400`, the
-homed-state bookkeeping and the error path (`cmd_G28` turns the motors
-off and B is left unhomed) all keep working unchanged.
-
-The rail itself is built with `need_endstop=False`: an `[stepper_tilt]`
-with no `endstop_pin` gets a range and a `homing_speed` but no endstop,
-and refuses `position_endstop` and the other endstop-only options rather
-than ignoring them. A coupled axis always starts unhomed, so without
-`[accel_b_homing]` B can only be placed with `SET_ROTARY_AXIS AXIS=B
-SET_POSITION=`.
-
-## Config surface
-
-Phase one, as implemented:
-
-```ini
-[accel_b_homing]
-zero_vector: +z               # sensor axis reading +1 g at B = 0
-positive_vector: +x           # sensor axis reading +1 g at B = +90
-#accel_chip: adxl345          # any chip exposing start_internal_client()
-#settle_time: 0.250           # dwell before sampling, s
-#sample_time: 0.500           # averaging window, s
-#batch_margin: 0.300          # trailing dwell for late batches, s
-#max_sample_deviation: 500    # mm/s^2; above this the head was moving
-#max_magnitude_error: 1500    # mm/s^2; |a| must be 1 g within this
-#check_tolerance: 5.0         # deg; default for B_MEASURE CHECK=1
-```
-
-Phase four, as implemented:
-
-```ini
-#zero_tolerance: 0.25         # deg; G28 B stops correcting within this
-#max_homing_moves: 5          # moves toward B = 0 before giving up
-#direction_check_move: 5.0    # deg; longest move before the head is seen
-                              #   to follow the motors
-#homing_tolerance: 5.0        # deg; endstop rails only
-#verify_home: True            # endstop rails only
-```
-
-Only the two vectors are required. The two gates are in mm/s^2, the units
-the chips report, and both are disabled by setting them to zero.
-
-`max_magnitude_error` defaults deliberately loose. The sensor
-calibration matches the two in-plane axes to each other, not to 1 g, so a
-chip inside its +/-10 % sensitivity spec still legitimately reads 0.9 to
-1.1 g; the gate is there to catch a head that is accelerating or a chip
-that is not reporting properly, not to grade the sensor.
-`check_tolerance` is loose because it must also cover an uncalibrated
-sensor - see *Accuracy before and after calibration* below.
-
-There is no `home_method` option. Which home runs follows from the rail:
-no `endstop_pin` in `[stepper_tilt]` (the default) is the measured home,
-and an `endstop_pin` is the endstop sweep. The `endstop_then_accel` mode
-the design once proposed is what an endstop rail with `verify_home`
-already does.
-
-Phase two, as implemented so far:
-
-```ini
-# --- sensor calibration (written by B_SENSOR_CALIBRATE / SAVE_CONFIG) ---
-#offset_u: 0.0                # zero-g offset along positive_vector, mm/s^2
-#offset_w: 0.0                # zero-g offset along zero_vector, mm/s^2
-#gain_ratio: 1.0              # amplitude(w) / amplitude(u), 0.8 to 1.25
-```
-
-Phases two, three and five still add:
-
-```ini
-zero_offset: 0.0              # deg; fine offset on top of zero_vector
-level_offset: 0.0             # frame tilt vs gravity, deg (usually 0)
-
-# --- safety ---
-min_safe_z: 40.0              # refuse to swing B below this Z
-```
-
-`zero_offset`, the offsets and `gain_ratio` are outputs of the
-calibration routines, written back through `configfile.set()` and
-`SAVE_CONFIG`, exactly as `PROBE_CALIBRATE` and `delta_calibrate` do.
-`zero_vector` and `positive_vector` are not: they are the coarse frame
-the fitted numbers sit on top of, and they stay hand-declared.
-
-### Accuracy before and after calibration
-
-Uncalibrated, the reading is **uncorrected**. An accelerometer has a
-zero-g offset of up to +/-150 mg and an inter-axis gain tolerance of
-several percent, which together are worth several degrees of absolute
-error. On the corertheta machine the first `G28 B` homed the head about
-7 degrees from a known vertical, and a ~100 mg offset along
-`positive_vector` accounted for most of it. `B_SENSOR_CALIBRATE` removes
-that; what it cannot remove is a sensor rotated on its mount, or a frame
-that is not level, since neither changes the shape of the circle it
-fits.
-
-Repeatability is a different matter, and is already good: a stationary
-head re-measures to a few hundredths of a degree. That is why the noise
-gates are tight while the absolute tolerances are loose, and it is what
-makes `B_MEASURE CHECK=1` useful as a gross-error detector - a home that
-silently did not move is tens of degrees out, not tenths.
-
-## G-code surface
-
-| Command | Does |
-| --- | --- |
-| `B_MEASURE [SETTLE=] [SAMPLE_TIME=] [FUSION=0]` | *(implemented)* Report measured B (the fused angle from vertical; `FUSION=0` reports the accelerometer-only angle instead, labelled as not fused), the raw vector, the in-plane and out-of-plane components, the noise stats, and the error against commanded B. Read-only, safe any time the head is still. |
-| `B_MEASURE CHECK=1 [TOLERANCE=]` | *(implemented)* As above, but raise an error if the fused angle and commanded B disagree. Refuses `FUSION=0` and a chip without a gyroscope. For `PRINT_START` and layer macros - it catches belt slip and a silently failed home. Requires B homed, since an unhomed B has no commanded angle to compare against. |
-| `G28 B` | *(implemented)* Measure B, set it, and turn the head to B = 0 - see [Algorithm: homing](#algorithm-homing). |
-| `B_SET_ZERO` | Declare the current physical pose to be B = 0. Run it with the head referenced mechanically - square against the bed, or with the probe pin hanging vertical. |
-| `B_SENSOR_CALIBRATE [START=] [END=] [STEPS=] [SETTLE=] [SAMPLE_TIME=] [GAIN=0]` | *(implemented)* Sweep the arc, fit offsets and gain, report each station and the residuals, apply the result and home B again on it. `SAVE_CONFIG` keeps it. |
-| `B_STEP_CALIBRATE [START=] [END=] [STEPS=] [SETTLE=] [SAMPLE_TIME=] [RETURN=1]` | *(implemented)* The drive ratio routine: sweep, fit, report the residuals, write `b_coupling_ratio` for `SAVE_CONFIG`. `RETURN=1` sweeps back to measure backlash. |
-| `B_STEP_CALIBRATE MODE=QUICK [ANGLE=90]` | *(implemented)* Two-point spot check from B = 0 to `ANGLE`; writes nothing. |
-
-## Algorithm: the measurement primitive
-
-```
-measure(settle, window) -> TiltReading
-  1. toolhead.wait_moves()
-  2. client = chip.start_internal_client()
-     t0 = toolhead.get_last_move_time()
-     toolhead.dwell(settle + window + batch_margin)
-     client.finish_measurements()
-  3. correct every sample by offset_u, offset_w and gain_ratio, then
-     keep samples with t0 + settle <= t <= t0 + settle + window
-  4. reject if: no samples, count < 0.5 * expected,
-                stddev(any axis) > max_sample_deviation,
-                | |a| - 1g | > max_magnitude_error
-  5. mean -> (u, w, v); accel_angle = atan2(u, w)
-     with a gyroscope: fused_angle = complementary filter over the
-     combined stream, settle included, ending at the window's end
-     (still to come: zero_offset, level_offset)
-  6. return accel_angle, fused_angle, raw mean, stddev, in-plane and
-     out-of-plane parts, count
-
-measure_vertical() -> fused_angle
-  refuse a chip without a gyroscope; otherwise measure(fusion=True) and
-  return its fused_angle.  The only entry point for anything that acts
-  on B.
-```
-
-The reading deliberately has no field meaning "whichever angle was
-available". An earlier version did, and it let `G28 B` home on the
-accelerometer alone whenever fusion was off or the chip had no
-gyroscope, without saying so.
-
-Three details that matter:
-
-* **Neither transform has to be off.** The design started out refusing to
-  measure with `[rtcp]` or `[b_projection]` enabled, following what
-  `homing.py` does. That turned out to be unnecessary and it cost the
-  most useful application - a mid-print sanity check. `[rtcp]` moves x
-  and z, never B, so it does not affect this at all. `[b_projection]`
-  does change the meaning of the commanded B, so the comparison converts:
-  `project_pos()` maps the commanded bed-frame angle onto the plane the
-  head can tilt in, which is exactly the angle the sensor sees. The
-  measurement itself never needed either transform off - it reads a
-  physical head angle - and only the comparison did.
-
-* **The settle window is separate from the averaging window.** The head
-  hangs on belts through a differential; it rings after a move. Sampling
-  starts only after `settle_time`. `AccelQueryHelper` trims samples to
-  the request window on its own, but not to a settle offset, so the
-  filtering in step 3 is explicit.
-* **And so is the trailing margin**, which is not sampled at all - it
-  exists only to let the last batches arrive. See `batch_margin` above.
-* **Rejection is loud.** A reading taken while the head is drifting is
-  worse than no reading, because it silently poisons a home. The stddev
-  and magnitude gates exist to convert "head still moving" into an error
-  rather than a wrong number.
-
-## Algorithm: homing
-
-This is the default, and the only home on a `[stepper_tilt]` without an
-endstop. As implemented (`AccelBHoming.home_axis()`):
+With no `endstop_pin` in `[stepper_tilt]` (the default), `G28 B` is a
+measured home (`AccelBHoming.home_axis()`):
 
 ```
 G28 B
-  1. refuse unless the transforms are off (PrinterHoming's own check)
-  2. energise both gantry motors - a head that can droop unpowered must
-     be held before it is measured
-  3. measure_vertical -> B ; set_measured_position(B)   (B is now homed)
-     (every measurement below is measure_vertical too - the fused
-     angle, refused outright on a chip without a gyroscope)
+  1. refuse unless RTCP and the B projection are off
+  2. energise both gantry motors - a limp head would be measured where it
+     droops, then jump when the motors took hold
+  3. B = measure_vertical(); book it as B (B is now homed)
      report it, and say so if it is outside the soft limits
   4. while |B| > zero_tolerance:
-       if max_homing_moves moves have been made: raise "not converging"
+       refuse after max_homing_moves moves ("not converging")
        until the direction is confirmed:
            target = B moved toward 0 by at most direction_check_move,
                     clamped into [position_min, position_max]
        afterwards:
            target = 0
-       move to target ; measure -> B'
-       first move of at least 1 deg: check (B' - B) / (target - B)
-           <= -0.5      raise: positive_vector vs the motors
-           < 0.5        raise: the head is not following the motors
-           > 2          raise: b_coupling_ratio
-           otherwise    direction confirmed
-       B = B' ; set_measured_position(B)
-  5. move to a commanded B = 0
+       move to target; B' = measure_vertical()
+       on the first move of at least 1 deg, check (B' - B) / (target - B):
+           <= -0.5     refuse: positive_vector and the motors disagree
+           < 0.5       refuse: the head is not following the motors
+           > 2         refuse: b_coupling_ratio is far off
+       B = B'; book it as B
+  5. finish on a commanded B = 0
 ```
 
-Setting the position from the measurement is exact whatever the ratio,
-so step 4 is what makes homing tolerant of a wrong `b_coupling_ratio`:
-the loop closes the gap between "where I said to go" and "where I ended
-up". A 10 % ratio error converges to 0.25 degrees from 60 degrees out in
-three moves after the check move. It is also a diagnostic - if the loop
-does not converge, the ratio is badly wrong, and the message says so.
+Booking the measurement as B is exact whatever the drive ratio, so the
+loop tolerates a wrong `b_coupling_ratio`: a 10 % error converges from
+60 degrees out in three moves after the check move. A loop that does not
+converge means the ratio is badly wrong, and the error says so.
 
 The capped first move is the safety half. Until the head has been seen
 to follow the motors, "toward zero" is an assumption: with
 `positive_vector` or `invert_b_direction` wrong, a straight move to zero
-from B = 80 would drive the head to 160, well past the soft limit and
-into a kinked filament tube. Capping the first move bounds that mistake
-to `direction_check_move` degrees and turns it into an error. Soft limits
-are enforced on the commanded angle only, which is why a head measured
-beyond one has its first move end *on* the limit - that move is then
-longer than the cap, and is still checked.
+from B = 80 drives the head to 160, far past the soft limit. Capping the
+first move bounds that mistake to `direction_check_move` degrees and turns
+it into an error. Soft limits apply to commanded angles only, so a head
+measured beyond one has its first move end *on* the limit - a move longer
+than the cap, still checked.
 
-Nothing here needs a dwell, a stall threshold or a sweep, and the zero is
-absolute rather than relative to a switch. Its accuracy is the sensor's:
-B = 0 is as vertical as `zero_vector`, the mounting and
-`B_SENSOR_CALIBRATE` make it. Uncalibrated, a 100 mg offset along
-`positive_vector` homes the head 5.7 degrees from vertical.
+On any error `G28` turns the motors off and leaves B unhomed.
+`[stepper_tilt]`'s `position_min` and `position_max` are soft limits, and
+`homing_speed` is the speed the head is turned at.
+
+B = 0 is only as vertical as the sensor makes it: uncalibrated, it is the
+sensor's zero, not gravity's. Run `B_SENSOR_CALIBRATE` once.
 
 ### With an endstop
 
-A `[stepper_tilt]` with an `endstop_pin` sweeps into it, and the
-measurement steers the sweep instead: with `homing_positive_dir` unset,
-the head is measured to pick the direction, and measured again after the
-home. If it is not within `homing_tolerance` of `position_endstop` - the
-silent no-op a StallGuard endstop produces when homed too soon after
-another move - B is left unhomed. This is what the design called
-`home_method: endstop_then_accel`.
+A `[stepper_tilt]` that has an `endstop_pin` sweeps into it as usual, and
+the measurement steers and checks the sweep. With `homing_positive_dir`
+unset the head is measured first: below `position_endstop` it homes
+positive, above it negative, and the sweep is the measured distance plus
+`homing_tolerance`. Within `homing_tolerance` of the endstop the side
+cannot be told; an endstop at a range limit is then homed toward that
+limit, and one inside the range is refused. After the home the head is
+measured again (`verify_home`), and B is left unhomed if it is not within
+`homing_tolerance` of `position_endstop` - which catches a sensorless home
+that triggered without moving. Setting `homing_positive_dir` bypasses the
+direction measurement.
 
-## Algorithm: sensor calibration
+### How the home is wired in
 
-The offsets and gains cannot come from the datasheet - they are
-per-device and up to 150 mg. They are fitted from data.
+`PrinterHoming.cmd_G28` ends with `ea.home()` for each extra axis.
+`[accel_b_homing]` registers itself on the B axis at connect with
+`BaseRotaryAxis.set_homing_source()`; a rail without an endstop then
+calls `source.home_axis(axis)`. The source drives the axis through
+`get_range()`, `set_measured_position(angle)`, `move_axis(angle)` and
+`get_drive_steppers()` (both gantry motors on corertheta). The rail is
+built with `need_endstop=False`, so `[stepper_tilt]` without an
+`endstop_pin` refuses `position_endstop` and the other endstop-only
+options rather than ignoring them. Without `[accel_b_homing]`, such an
+axis can only be placed with `SET_ROTARY_AXIS AXIS=B SET_POSITION=`.
 
-*(Implemented, as below. `STEPS` is the number of stations, default
-13, and `START`/`END` default to the soft limits.)*
+## Sensor calibration: `B_SENSOR_CALIBRATE`
 
-```
-B_SENSOR_CALIBRATE START=-40 END=90 STEPS=14
-  for each station:
-      move B, settle, measure raw mean (u, w, v)
-      (measure() corrects by the loaded calibration; undo it exactly)
-  fit the axis-aligned ellipse
-      (u - u0)^2 / Au^2 + (w - w0)^2 / Aw^2 = 1
-  as the linear least squares problem
-      u^2 + B*w^2 + C*u + D*w + E = 0
-  giving u0 = -C/2, w0 = -D/(2B), Au^2 = u0^2 + B*w0^2 - E, Aw = Au/sqrt(B)
-  write offset_u = u0, offset_w = w0, gain_ratio = Aw / Au
-```
+Every sample is corrected before anything else sees it:
 
-Conditioning depends on the arc swept, so the fit is tiered and the
-routine picks the model the data can support:
+    u' = u - offset_u
+    w' = (w - offset_w) / gain_ratio
+    B  = atan2(u', w')
 
-| Arc | Model | Fitted |
-| --- | --- | --- |
-| >= 120 deg | full | both offsets + gain ratio |
-| 60-120 deg | reduced | both offsets, gain ratio forced to 1 |
-| < 60 deg | zero only | refused for now - `zero_offset` belongs to `B_SET_ZERO` |
-
-The arc is the one the head was *measured* to turn through, not the one
-commanded, so a short drive cannot talk the routine into a fit its data
-does not support. The fit itself never uses the commanded angles, which
-is why a wrong `b_coupling_ratio` does not bias it. A fit is refused,
-changing nothing, if an offset exceeds 0.3 g, the gain ratio leaves 0.8
-to 1.25, or the in-plane radius leaves 0.8 to 1.2 g.
-
-Once a fit is accepted it is applied at once and written with
-`configfile.set()`. The head returns to B = 0, and an endstop-less B is
-homed again, since its position was booked on the old calibration; an
-endstop rail's position came from the switch and stands.
-
-The corertheta B range (-45 to 100, ie 145 degrees) supports the full
-fit, which is a happy accident worth stating: this machine can
-self-calibrate its own sensor.
-
-**Bench alternative.** The cleanest calibration is a full 360-degree
-rotation, which the head cannot do but a hand can. Recording the sensor
-while slowly turning it through a complete turn *before* mounting gives
-an unconditionally well-posed fit. If that is done, the on-machine
-routine only has to find `zero_offset`, and `B_SET_ZERO` is the whole
-procedure.
-
-The sweep also **verifies** `zero_vector` and `positive_vector`, which
-stay hand-declared: if an axis other than `v` varied least over the
-sweep it is refused, naming the axis that stayed put and all three
-ranges, and a head whose measured angle ran opposite to commanded B is
-refused as a `positive_vector` that disagrees with the motors. Getting
-those two flags wrong is the most likely setup mistake, so the routine
-says plainly when the data disagrees with what was declared.
-
-## Algorithm: B step calibration
-
-The question is *degrees of real head rotation per motor step*. The
-routine answers it by commanding a rotation, counting the steps the MCU
-actually issued, and measuring the rotation that resulted.
-
-*(Implemented, as below - `AccelBHoming.calibrate_drive()`. `START` and
-`END` default to 5 degrees inside the soft limits, `STEPS` to 13.)*
+The three numbers are fitted, not declared:
 
 ```
-B_STEP_CALIBRATE START=-40 END=95 STEPS=14 RETURN=1
-  0. preconditions, all checked before the first move: transforms off,
-     B homed, sensor calibration loaded (not the identity), START/END
-     inside pos_min/pos_max, an arc of at least 20 deg, and room for the
-     over-travel below inside the soft limits
-  1. energise the drive, move to START - 5 deg, so every station in the
-     sweep is approached from the same direction (backlash out of the
-     scale)
-  2. for each station i:
-       move to the commanded B
-       t_i   = axis.get_step_position()  (the angle the integer step
-               counters imply, under the current ratio)
-       phi_i = measure_vertical()  (the fused angle from vertical - not
-               commanded B, not the accelerometer-only angle, and not
-               an integral of the gyroscope rate across the move)
-  3. if RETURN=1: move to END + 5 deg, and visit the stations again in
-     reverse
-  4. unwrap phi, then least squares with one scale shared by both legs
-     and one offset per leg:
-       phi_i = scale * t_i + offset[leg_i]
-  5. refuse, changing nothing, a scale outside 0.5 to 2 (the same bounds
-     as G28 B's check move - negative is positive_vector against the
-     motors, small is a head not following them)
-  6. report every station's residual, the RMS and max, and with RETURN=1
-     the backlash: offset[return] - offset[outbound]
-  7. write the corrected ratio with configfile.set(), and park at B = 0
+B_SENSOR_CALIBRATE [START=] [END=] [STEPS=13] [SETTLE=1] [SAMPLE_TIME=1] [GAIN=1]
+  preconditions: B homed, RTCP and the B projection off,
+                 START and END inside the soft limits, at least 60 deg apart
+  for each of STEPS stations from START to END (default: the soft limits):
+      move B, measure the accelerometer mean, undo the loaded calibration
+  refuse if an axis other than the rotation axis varied least
+         (the two vectors name the wrong pair)
+  refuse if the measured angle ran opposite to commanded B
+  fit the ellipse the in-plane readings trace,
+      (u - offset_u)^2 + (w - offset_w)^2 / gain_ratio^2 = A^2
+  as a linear least squares problem
+  refuse, changing nothing, if an offset exceeds 0.3 g, gain_ratio leaves
+         0.8 .. 1.25, or the radius A leaves 0.8 .. 1.2 g
+  apply the result, set it for SAVE_CONFIG, report every station,
+  return to B = 0, and home B again on the new calibration
 ```
 
-Any failure after the first move - a refused fit, or a measurement the
-gates reject - parks the head at B = 0 before the error is raised.
+The model depends on the arc the head was *measured* to cover, not the
+arc commanded:
 
-Two departures from the original outline, both deliberate:
+| Measured arc | Fitted |
+| --- | --- |
+| 120 deg or more, 5+ stations | both offsets and the gain ratio |
+| 60 to 120 deg, 4+ stations (or `GAIN=0`) | both offsets; `gain_ratio` held at 1 |
+| less than 60 deg | refused |
 
-* **The fit is against step-implied degrees, not raw step counts.** The
-  scale is then dimensionless - "degrees the head turned per commanded
-  degree" - and the same routine serves a coupled and a dedicated drive;
-  the kinematics does the step-to-degree conversion it already knows.
-  Rounding to whole steps is still in `t_i`.
-* **Both legs share one scale.** The outline fitted the outbound sweep
-  alone and compared the return against it. Fitting a common scale with
-  an offset per leg keeps backlash just as far out of the ratio, uses
-  every station for it, and makes backlash a fitted number rather than
-  an average of differences.
+The fit needs only that gravity is the same size in every pose - never
+the true angle of any station - so neither a wrong `b_coupling_ratio` nor
+a slightly rotated sensor leaks into it. The same property means it
+cannot *see* a rotated sensor or a frame out of level: both keep the
+circle a circle. The corertheta range of -45 to 100 degrees supports the
+full fit.
+
+The report ends with how far the head that measured B = 0 before now is
+from B = 0 - how far the next home will turn it. An endstop rail is not
+homed again, since the switch decided its position.
+
+## Drive ratio calibration: `B_STEP_CALIBRATE`
+
+The question is how far the head really turns per commanded degree:
+
+```
+B_STEP_CALIBRATE [START=] [END=] [STEPS=13] [SETTLE=1] [SAMPLE_TIME=1] [RETURN=0]
+  preconditions, all before the first move: RTCP and the B projection off,
+      B homed, the sensor calibrated (not the identity), START and END
+      inside the soft limits and at least 20 deg apart, and room for 5 deg
+      of over-travel beyond them
+  1. move to START - 5 deg, so every station is approached from the same
+     side and backlash stays out of the scale
+  2. at each station: move; t = axis.get_step_position() (the angle the
+     integer step counters imply); phi = measure_vertical()
+  3. with RETURN=1: move to END + 5 deg and visit the stations in reverse
+  4. unwrap phi, then fit one scale shared by both legs and one offset
+     per leg:   phi = scale * t + offset[leg]
+  5. refuse, changing nothing, a scale outside 0.5 .. 2
+  6. report every residual, their rms and max, and with RETURN=1 the
+     backlash (the difference between the two offsets)
+  7. set the corrected ratio for SAVE_CONFIG; park at B = 0
+```
+
+START and END default to 5 degrees inside the soft limits. A failure
+after the first move parks the head at B = 0 before the error is raised.
+`MODE=QUICK [ANGLE=90]` is a two-station spot check from B = 0 that
+reports the scale and writes nothing.
 
 The sensor calibration is required, not recommended: an uncorrected
-offset bends the measured angle (100 mg is worth degrees near B = 0 and
-almost nothing near B = 90), and a straight-line fit books that
-curvature as a ratio error. The zero of the sensor does not matter - it
-lands in the offsets, as does the arbitrary zero of the step counters.
+offset bends the measured angle - worth degrees near B = 0 and almost
+nothing near B = 90 - and a straight-line fit books that curvature as a
+ratio error. The zero of the sensor and that of the step counters both
+land in the offsets and do not matter.
 
-The ratio is not changed live: the kinematics bakes it into the stepper
-solvers at startup, so the new value takes effect on the restart that
-`SAVE_CONFIG` performs, and B is homed again after it like after any
-restart. Until then the drive and B's booked position are unchanged.
+### Counting steps
 
-### Counting the steps actually applied
-
-The user-visible question is "how many steps did that take", and the
-honest answer is the integer step counter, not the commanded float
-position - it includes step rounding, and it is what the ratio is
-ultimately *about*. Klipper exposes it per stepper:
-
-```python
-mcu_pos = mcu_stepper.get_mcu_position()                    # integer steps
-pos_mm  = mcu_pos * mcu_stepper.get_step_dist()              # signed, in mm
-```
-
-The counter already runs in the commanded sense, `dir_pin` inversion
-included. As implemented it is scaled by the step distance directly
-rather than through `mcu_to_commanded_position()`: that one subtracts an
-offset which `set_position()` rewrites, while the integer counter itself
-survives it, so the scaled counter keeps one arbitrary zero for the life
-of the session. Only differences are ever used.
-
-The hooks are `BaseRotaryAxis.get_step_position()` and
-`get_drive_ratio_options()`. A dedicated stepper answers them itself; a
-coupled axis delegates to the kinematics' `get_axis_step_position()` and
-`get_axis_drive_ratio()`.
-
-**The coupled case has a property worth exploiting.** On corertheta the
-two gantry solvers are
+The fit is against the integer step counters, not the commanded
+position, so step rounding is included and the scale is dimensionless.
+On corertheta the two gantry motors are
 
     stepper_r     p_minus = b * ratio - radius
     stepper_tilt  p_plus  = b * ratio + radius
 
-so their **sum depends only on B**:
-
-    b_belt_mm = 0.5 * (p_plus + p_minus) = b * ratio
-
-The radius cancels exactly. The calibration therefore reads both gantry
-step counters, sums them, and is immune to any radial motion during the
-sweep - including whatever the arm does while getting out of the way.
-That is much better than trying to hold R perfectly still.
-`CoreRThetaKinematics.get_axis_step_position('b')` is that sum, divided
-by the signed coupling coefficient so `invert_b_direction` is folded in.
+so their **sum depends only on B**: `0.5 * (p_plus + p_minus) = b * ratio`.
+`CoreRThetaKinematics.get_axis_step_position('b')` is that sum, divided by
+the signed coupling coefficient so `invert_b_direction` is folded in, and
+the radius cancels exactly - any radial motion during the sweep is
+invisible to the calibration. Each counter is scaled by its step distance
+directly, keeping one arbitrary zero for the session; only differences
+are used.
 
 ### What gets written
 
-* **corertheta / coupled B.** The parameter is `b_coupling_ratio` in
-  `[printer]` - belt millimetres per degree:
+* **corertheta:** `b_coupling_ratio` in `[printer]`, belt millimetres per
+  degree: `ratio_new = ratio_old / scale`. The degree-valued limits of
+  `[stepper_tilt]` are independent of it, and the radius is derived from
+  the *difference* of the gantry positions, so R is unaffected.
+* **A dedicated `[stepper_b]`:** `rotation_distance`, degrees per motor
+  revolution: `rotation_distance_new = rotation_distance_old * scale`,
+  for every stepper in the rail.
 
-      ratio_new = ratio_old / scale
+The ratio is baked into the step solvers at startup, so it takes effect
+on the restart `SAVE_CONFIG` performs, and B must be homed again after it.
 
-  Nothing else needs touching. The degree-valued `position_endstop`,
-  `position_min` and `position_max` of `[stepper_tilt]` are independent
-  of the ratio, and `calc_position()` derives the radius from the
-  *difference* of the two gantry positions, so R is unaffected. Write it
-  with `configfile.set('printer', 'b_coupling_ratio', ...)`.
+### How accurate it is
 
-* **A dedicated `[stepper_b]`.** The parameter is `rotation_distance`
-  (degrees per motor revolution):
-
-      rotation_distance_new = rotation_distance_old * scale
-
-  written for every stepper in the rail.
-
-### How accurate is it
-
-The ratio error is roughly the angle measurement error divided by the arc
-swept. At 0.03 degrees of measurement noise:
-
-* over the full 145-degree range: ~2 parts in 10 000 (0.02 %)
-* over 90 degrees: ~3 parts in 10 000
-* over 20 degrees: ~15 parts in 10 000 (0.15 %)
-
-So **sweep the largest arc the machine allows**, and prefer the
-multi-station fit over a two-point measurement - the extra stations buy
-residuals, which are the only way to tell a wrong ratio from a nonlinear
-drive.
+The ratio error is roughly the angle noise divided by the arc. At
+0.03 degrees of measurement noise: about 2 parts in 10 000 over the full
+145 degrees, 3 over 90 degrees, 15 over 20 degrees. Sweep the largest arc
+the machine allows, and prefer the multi-station fit to `MODE=QUICK` -
+the extra stations buy residuals, the only way to tell a wrong ratio from
+a nonlinear drive.
 
 ### Reading the residuals
 
-The residual pattern is the real diagnostic value of this routine:
-
 | Residual shape | Means |
 | --- | --- |
-| flat, small | ratio is right |
-| linear trend not removed by the fit | wrong zero reference, not a ratio problem |
+| flat, small | the ratio is right |
+| a smooth bow | the sensor calibration is off - re-run `B_SENSOR_CALIBRATE` |
 | one cycle per pulley revolution | pulley eccentricity or a bent shaft |
-| step at the direction reversal | backlash - the `RETURN=1` number |
+| a step at the direction reversal | backlash - the `RETURN=1` number |
 | growing toward one end | belt tension or a binding mount |
-| random and large | the head is not settling; raise `settle_time` |
+| random and large | the head is not settling; raise `SETTLE` |
 
-## Interaction with the rest of the fork
+A residual rms above 0.2 degrees adds a warning to the report.
 
-* **The measured B is the machine B** - the angle the head is really
-  turned to - which is exactly the quantity `[rtcp]` consumes and the
-  quantity `[bltouch] b_offset` is expressed in.
-* **Measuring needs no transform off.** `B_MEASURE` reads a physical
-  angle, so it works in any mode; the *comparison* against the commanded
-  angle converts through `b_projection.project_pos()`. See "the
-  measurement primitive" above.
-* **Every routine that moves B does need both off**, for exactly the
-  reasons `homing.py` already documents: with RTCP on, a B move is also
-  an X/Z move, and with the projection on, a commanded B is scaled by
-  whatever bed angle the arm is over. Those routines reuse
-  `check_disabled()` on both objects and produce the same class of error
-  message.
-* **`invert_b_direction` stays the one place rotation sense is set.** If
-  the sensor disagrees with the machine's sign convention, that is
-  recorded by negating `positive_vector` here - and phase two's sweep
-  reports when the two disagree. The kinematics' own inversion is
-  untouched.
-* **This closes an open verification item.** Whether a positive B really
-  tilts the nozzle outboard is still unverified on the machine.
-  `B_MEASURE` answers it directly, without RTCP in the loop: command a
-  positive B with the transforms off and read which way the head actually
-  went.  This is available now.
+## Commands
+
+| Command | Does |
+| --- | --- |
+| `B_MEASURE [SETTLE=] [SAMPLE_TIME=] [FUSION=0]` | Report the fused angle from vertical, the accelerometer-only angle and their difference, the rotation rate, the mean vector and its magnitude, the in-plane and out-of-plane components, the sample deviation, whether the sensor is calibrated, and - with B homed - the commanded angle and the error. `FUSION=0` measures with the accelerometer alone, labelled as not fused. Moves nothing. |
+| `B_MEASURE CHECK=1 [TOLERANCE=]` | As above, and raise an error if the fused angle is further than `TOLERANCE` (default `check_tolerance`) from commanded B. Needs B homed; refuses `FUSION=0`. For `PRINT_START`: it catches belt slip and a failed home. |
+| `G28 B` | The measured home above. |
+| `B_SENSOR_CALIBRATE [START=] [END=] [STEPS=] [SETTLE=] [SAMPLE_TIME=] [GAIN=0]` | Fit `offset_u`, `offset_w`, `gain_ratio`; apply; re-home. `SAVE_CONFIG` keeps them. |
+| `B_STEP_CALIBRATE [START=] [END=] [STEPS=] [SETTLE=] [SAMPLE_TIME=] [RETURN=1]` | Fit the drive ratio and set it for `SAVE_CONFIG`. |
+| `B_STEP_CALIBRATE MODE=QUICK [ANGLE=90]` | Two-point spot check; writes nothing. |
+
+The status object carries `measured_b` (the last fused angle), `accel_b`,
+`rotation_rate`, `fusion_disagreement`, the declared vectors with the
+derived `rotation_axis` and `rotation_axis_sign`, `fusion_tau`, and the
+calibration.
+
+## Commissioning
+
+In order, with the head clear of the bed at every angle it will visit:
+
+1. **Bring up the BMI160** - [BMI160_IMU.md](BMI160_IMU.md#bringing-it-up).
+   `BMI160_QUERY` shows a 1 g vector.
+2. **Zero the gyroscope:** `BMI160_CALIBRATE GYRO=1` with the head still.
+   Repeat after every power cycle.
+3. **Declare the vectors** by looking, as above.
+4. **Check them without homing.** With RTCP and the B projection off,
+   park the head near vertical, `SET_ROTARY_AXIS AXIS=B SET_POSITION=0`,
+   then `B_MEASURE`: the angle is within a few degrees of zero
+   and the out-of-plane component is small. A small `G1 B` move toward
+   +B, then `B_MEASURE` again: the angle moved the same way. If not, fix
+   `positive_vector` first, then `invert_b_direction`. Check the
+   gyroscope's sign by hand as described in
+   [BMI160_IMU.md](BMI160_IMU.md#the-gyroscopes-sign-is-derived-not-configured).
+5. **Set the gate.** `B_MEASURE` on a parked head reports the rotation
+   rate - that is the noise floor; `max_rotation_rate` belongs just above
+   it.
+6. **`G28 B`** from several resting angles on both sides of zero. Each
+   should finish within `zero_tolerance` in a similar number of moves.
+7. **`B_SENSOR_CALIBRATE`** over the full range, then `SAVE_CONFIG`. The
+   in-plane radius should be within a few percent of 1 g.
+8. **`B_MEASURE` ten times without moving** - the spread should be well
+   under 0.05 degrees.
+9. **`B_STEP_CALIBRATE RETURN=1`**, then `SAVE_CONFIG` and `G28 B` again.
+   Check the residual shape against the table above.
+10. **Tune `fusion_tau` and `settle_time`.** `B_MEASURE` prints the fused
+    and accelerometer-only angles side by side: they agree on a parked
+    head, and lowering `settle_time` until they start to disagree shows
+    how much settle the fusion really needs. `max_sample_deviation` and
+    `max_rotation_rate` reject a moving head and must be relaxed to
+    explore this.
+11. **Add `B_MEASURE CHECK=1` to `PRINT_START`.**
 
 ## Safety
 
-Rotating B swings a tool that hangs ~69 mm below the pivot through an arc
-of up to 145 degrees. Every routine that moves B:
+Turning B swings a tool hanging ~69 mm below the pivot through up to 145
+degrees. `G28 B` runs before Z is homed, so it cannot lift: the head must
+clear the bed at every angle between where it rests and B = 0. Its soft
+limits and capped first move bound a wrong direction, and it finishes on
+a commanded B = 0; on error the motors are turned off and B is unhomed.
 
-* requires Z homed and lifts to `min_safe_z` first, or refuses -
-  `[rtcp_probe]` already does this with `orient_lift_z`, and the same
-  approach applies;
-* range checks `START` and `END` against the axis limits before the first
-  move, not station by station;
-* leaves the head at a defined angle on exit, including on the error
-  path.
+`B_SENSOR_CALIBRATE` and `B_STEP_CALIBRATE` swing the head through the
+whole range and do not lift Z first. They range-check `START` and `END`
+(and the over-travel) before the first move, and leave the head at B = 0,
+including on the error path. Raise the carriage before running them.
 
-`B_MEASURE` moves nothing and needs none of this.
+`B_MEASURE` moves nothing.
 
-`G28 B` does not meet the first point: it runs before Z is homed, so it
-cannot lift, and the head has to clear the bed at every angle between
-where it rests and B = 0 - the same condition the `HOME_Z` macro already
-places on `RTCP_PROBE_ORIENT`. It meets the second through the soft
-limits and the capped first move, and the third by finishing on a
-commanded B = 0; on the error path the motors are turned off and B is
-left unhomed.
+## Troubleshooting
 
-## Failure modes and what the user should see
-
-| Symptom | Message should say |
+| Error or symptom | Cause and fix |
 | --- | --- |
-| No samples | the chip is not responding; try `ACCELEROMETER_QUERY` |
-| Fewer samples than expected | the link is dropping data, or is slow enough that `batch_margin` needs raising |
-| High stddev | the head was still moving; raise `settle_time` |
-| Magnitude far from 1 g | the head is moving, or the chip is misconfigured |
-| `v` varies across the sweep | `zero_vector`/`positive_vector` are wrong - here is the pair that did vary |
-| In-plane radius well below 1 g | the B axis is not in the fitted plane - remount or re-run the sweep |
-| Refine loop will not converge | *(implemented)* `b_coupling_ratio` is wrong - measure it with `B_STEP_CALIBRATE` |
-| Drive fit scale negative, or below 0.5 | *(implemented)* `positive_vector` against the motors, or the head not following them - nothing is written |
-| Drive fit residuals large | *(implemented)* reported, with a pointer to the residual table - look at their shape |
-| Head turned the wrong way on the check move | *(implemented)* `positive_vector` and the motors disagree about +B - check it, then `invert_b_direction` |
-| Head did not move on the check move | *(implemented)* the motors are not driving the head, or the sensor is not on the rotating part |
-| Head measured outside the soft limits | *(implemented)* reported, and the first move goes to the limit - check the filament tube |
-| Endstop and sensor disagree | *(implemented, endstop rails only)* the stall home did not move the axis (the known `G4 P2000` failure) |
-| Measured B drifts between prints | thermal offset drift; re-run `B_SET_ZERO` after heat soak |
+| `accel_chip must name a [bmi160] section` | Only the BMI160 is supported. |
+| `has its gyroscope disabled (gyro: False)` | Remove `gyro: False` from `[bmi160]`. |
+| `no accelerometer samples in the measurement window` | The chip is not responding - try `BMI160_QUERY`, check wiring. |
+| `only N of an expected M accelerometer samples` | The link is dropping data, or `batch_margin` needs raising. |
+| `possible fifo overflows` | klipper_mcu cannot keep up - lower `rate`, or unload the Pi. |
+| `the head was still moving` / `the head was turning` | Raise `settle_time`, or raise the gate if it sits on the noise floor. |
+| `measured N mm/s^2 where gravity is 9807` | The head is accelerating, or the chip is misreporting. |
+| `the capture is shorter than 3 x fusion_tau` | Raise `settle_time` or `sample_time`, or lower `fusion_tau`. |
+| `the fused angle is ... where the accelerometer alone reads ...` | The head was moving, or the gyroscope is inverted or on the wrong axis - check the vectors and `axes_map`. |
+| `B was commanded to turn +X deg and the head turned -Y` | `positive_vector` and the motors disagree about +B. |
+| `the head is not following the motors` | The motors are not driving the head, or the sensor is not on its rotating part. |
+| `still at B = X after N moves` | `b_coupling_ratio` is badly wrong - `B_STEP_CALIBRATE`. |
+| `B homed, but the head measures X where the endstop is at Y` | Endstop rails: a sensorless home triggered without moving (`G4 P2000` first), or `positive_vector` is wrong. |
+| `the sensor is uncalibrated` from `B_STEP_CALIBRATE` | Run `B_SENSOR_CALIBRATE` first. |
+| `the X axis varied least ... they do not name the two axes the head turns through` | `zero_vector`/`positive_vector` name the wrong pair. |
+| `the sensor fit is not believable` | The head moved during the sweep, or the mounting is not the declared one. |
+| B = 0 is visibly off vertical after calibration | The sensor is rotated on its mount or the frame is out of level - neither is fitted. |
+| Measured B drifts between prints | Thermal drift of the offsets; re-run `B_SENSOR_CALIBRATE` after heat soak. |
 
-## Testing
+## Code and tests
 
-The dev box cannot run klippy, so the test split follows the code split:
+    klippy/extras/accel_b_homing.py          the module
+    klippy/extras/bmi160.py                  the sensor
+    klippy/kinematics/rotary_axis.py         set_homing_source(), home()
+    klippy/kinematics/corertheta.py          B rail without an endstop, step hooks
+    klippy/stepper.py                        need_endstop=False rails
+    test/multi_axis/test_accel_b_homing.py   host tests
 
-* **Host, `test/multi_axis/test_accel_b_homing.py`** (run it with
-  `python test/multi_axis/test_accel_b_homing.py`).  It drives the
-  *real* module against a stubbed printer and a synthetic accelerometer,
-  following `test_rtcp_probe.py`, so phases one and four are covered on
-  a host that cannot run klippy - config validation, the sample window
-  and its settle offset, every rejection path, the angle at the reference
-  poses, noise averaging, the `B_MEASURE` report and its
-  `b_projection`-aware comparison, and `G28 B` against a simulated head
-  whose drive can be exact, short, reversed, stalled or wildly long.
-  The fits are covered the same way: synthesised `(u, w)` points with
-  known offsets, gain mismatch and gaussian noise for the ellipse fit,
-  an angle unwrap through +/-180, and for `fit_drive_sweep()` a known
-  scale and backlash - both directly and through `B_STEP_CALIBRATE`
-  against a simulated drive with a ratio error and a dead band. The
-  kinematics' step hooks are checked for radius cancellation and
-  `invert_b_direction`.
-* **`test/klippy/`** - a `multi_axis_accel_b.cfg` plus `.test` for config
-  parsing through the real config machinery, and for the refusals the
-  later phases add. Sensor data cannot be simulated in that harness, so
-  the measurement path itself stays covered by the host test.
-* **On the machine** - the acceptance runs, in order:
-  1. `ACCELEROMETER_QUERY` returns a plausible 1 g vector.
-  2. `B_MEASURE` with the head parked at B = 0 reads near zero, and the
-     out-of-plane component is small - if not, the two vector flags are
-     wrong, and the reported vector says what they should be.
-  3. `B_SENSOR_CALIBRATE` over the full range; the reported in-plane
-     radius is within a few percent of 1 g and `v` is flat.
-  4. `B_MEASURE` repeated ten times without moving - spread under 0.05
-     degrees.
-  5. `B_MEASURE` after commanding several angles - measured tracks
-     commanded to within the ratio error.
-  6. `B_STEP_CALIBRATE`; compare the fitted ratio against the nominal
-     1.0, and check the residual shape against the table above.
-  7. `G28 B` from several resting angles on both sides of zero, including
-     back-to-back: every one should report the head within
-     `zero_tolerance`, in a similar number of moves. Turn the head by
-     hand with the motors off between runs to vary the start.
+The module is split so the mathematics can be tested on a host that
+cannot run klippy: pure functions (`measure_angle()`,
+`gyro_axis_coefficient()`, `ComplementaryFilter`, `fit_ellipse()`,
+`fit_drive_sweep()`, ...), the measurement primitive, and the routines.
+Run the tests with `python test/multi_axis/test_accel_b_homing.py`. They
+drive the real module against a stubbed printer and a synthetic BMI160
+whose accelerometer and gyroscope agree about how the head is turning,
+covering config validation, every gate, the filter and sign convention
+for all 24 mountings, `B_MEASURE`, `G28 B` against a simulated head
+whose drive is exact, short, reversed, stalled or wildly long, both fits
+against known offsets, gain, scale and backlash, and the kinematics'
+step hooks.
 
-## Implementation order
+## Not implemented
 
-Each phase is independently useful and independently shippable.
-
-1. **Read-only** - *done*. `[accel_b_homing]`, the measurement
-   primitive, `B_MEASURE`. Nothing moves; the head can be turned by hand.
-   This alone answers the outstanding rotation-sense question.
-2. **Sensor calibration** - *offset and gain fit done*.
-   `B_SENSOR_CALIBRATE`, the ellipse fit and the `SAVE_CONFIG`
-   write-back. `B_SET_ZERO` is still to come; it is what makes the
-   measurement trustworthy against the machine rather than against
-   gravity.
-3. **Step calibration** - *done*. `B_STEP_CALIBRATE`, step counting
-   through the kinematics, the residual and backlash report, the ratio
-   write-back. Needs phase 2's sensor calibration and a homed B.
-4. **Homing** - *done*, ahead of phases 2 and 3. The `rotary_axis` hook,
-   the endstop-less `[stepper_tilt]`, the capped check move and the
-   refine loop in `G28 B`, and measured direction and verification for a
-   rail that keeps an endstop. It landed early because the machine has no
-   real endstop to fall back on; until `B_SENSOR_CALIBRATE` has run it
-   homes to the sensor's own, uncalibrated, zero.
-5. **Guard rail.** `B_MEASURE CHECK=1` in `PRINT_START`, and optionally a
-   periodic check between layers.
-
-## Open questions
-
-* **Is the frame level with the bed?** The sensor measures against
-  gravity; `[rtcp]` cares about the machine Z. `level_offset` exists to
-  hold the difference, but nothing currently measures it. The bed mesh
-  already knows the bed plane in machine coordinates - deriving
-  `level_offset` from a mesh is possible and would remove a manual step.
-  Left out of this design deliberately; worth revisiting once phase 2 is
-  on the machine.
-* **Should `B_MEASURE CHECK=1` be automatic?** A cheap check before every
-  print start is attractive. It costs about a second and it catches a
-  failure that currently ruins prints silently. That argues for an opt-in
-  config option (`check_before_print: True`) rather than a macro the user
-  has to remember.
-* **Backlash compensation, or just reporting?** The `RETURN=1` sweep
-  measures it. Acting on it is a separate feature and probably belongs in
-  the kinematics, not here.
-* **A finer zero than the six axis directions.** Phase one quantises the
-  zero reference to +/-x/y/z, so a sensor glued on a degree or two out is
-  a degree or two out. `zero_offset` in phase two is the fix, but it
-  needs a physical reference to be set against - a machinist's square on
-  the nozzle face, or the probe pin hanging vertical. Which of those to
-  standardise on is not settled.
+* **A zero against a physical reference.** Nothing takes out a sensor
+  rotated about the B axis or a frame out of level with gravity. A
+  `B_SET_ZERO` - declare B = 0 with the nozzle squared to the bed or the
+  probe pin hanging vertical - would, but which reference to standardise
+  on is not settled.
+* **Automatic checks.** `B_MEASURE CHECK=1` has to be added to
+  `PRINT_START` by hand; an opt-in config option would be harder to
+  forget.
+* **Backlash compensation.** `RETURN=1` measures it; acting on it belongs
+  in the kinematics.
+* **A lift before calibration sweeps.** Raise the carriage by hand, or in
+  a macro.

@@ -8,8 +8,8 @@
 # mechanical shock in the IMU bolted to the head, and stop the steppers
 # from the MCU that reads the IMU.  The nozzle becomes the Z reference,
 # with no probe to deploy and no head turned to a probe angle.  The
-# design, and the reasons behind every guard below, are in
-# docs/Accel_Z_Tap.md; this is its "Path B".
+# reasons behind every guard below are in docs/Accel_Z_Tap.md.  The
+# sensor is a [bmi160], the only one supported.
 #
 # THE DETECTOR RUNS ON THE MCU.  Host-side detection is two orders of
 # magnitude too slow, so the chip's firmware feeds one channel of every
@@ -18,7 +18,7 @@
 # detector - the filter, the threshold, when it arms - and checks the
 # result.  On the corertheta machine the chip is on the Pi's SPI0, so the
 # detector runs in klipper_mcu and the trigger is relayed to the LPC1769
-# (docs/BMI160_IMU.md, "On this machine").
+# (docs/Accel_Z_Tap.md, "Latency").
 #
 # WHAT THE DETECTOR SEES.  The filter input is offset by the first sample
 # processed after arming (the sos filter's auto_offset), which removes
@@ -39,7 +39,7 @@
 # a [bltouch] can stay configured alongside for meshing, and whichever
 # section [stepper_z] names homes Z.
 #
-# THE GUARDS, in the order the design document ranks them:
+# THE GUARDS, most important first:
 #
 #   * The detector arms only once the move is at constant speed, plus
 #     arm_delay, so the start of the move is not taken for a contact.
@@ -58,9 +58,9 @@
 #     quiet.
 #
 # WHAT IS NOT MEASURED YET.  Every threshold and filter number below is a
-# starting point.  Phase 0 of docs/Accel_Z_Tap.md - does the contact
-# stand out of the background at all, and in which band - is what
-# ACCEL_TAP_QUERY and ACCEL_TAP_CALIBRATE capture.
+# starting point.  Whether a contact stands out of the background at
+# all, and in which band, is what ACCEL_TAP_QUERY and ACCEL_TAP_CALIBRATE
+# measure - see "Commissioning" in docs/Accel_Z_Tap.md.
 import logging, math
 import mcu, pins, stepper
 from . import homing, probe, trigger_analog
@@ -267,15 +267,15 @@ class AccelZTap:
         # The chip.  It has to exist at config time: the detector is
         # attached to it in the MCU's config commands.
         self.chip_name = config.get('accel_chip', 'bmi160')
+        if self.chip_name.split()[0] != 'bmi160':
+            raise config.error(
+                "[%s] accel_chip must name a [bmi160] section, not '%s' -"
+                " the BMI160 is the only sensor the tap detector runs on"
+                % (self.name, self.chip_name))
         if not config.has_section(self.chip_name):
             raise config.error("[%s] accel_chip '%s' is not configured"
                                % (self.name, self.chip_name))
         chip = self.printer.load_object(config, self.chip_name)
-        if not hasattr(chip, 'get_trigger_channel_info'):
-            raise config.error(
-                "[%s] '%s' cannot run a tap detector - it needs an"
-                " accelerometer with an mcu-side trigger, such as a [bmi160]"
-                % (self.name, self.chip_name))
         self.chip = chip
         self.sample_rate = chip.get_samples_per_second()
         self.channel, self.unit, self.counts_per_unit = \
@@ -304,8 +304,8 @@ class AccelZTap:
                 'lowpass', self.lowpass_order, self.lowpass,
                 self.sample_rate))
         # The threshold, in the channel's unit.  An accelerometer channel
-        # gets the design document's starting point; a gyroscope channel
-        # has no such number yet, so it must be given.
+        # gets a starting point; a gyroscope channel has no such number
+        # yet, so it must be given.
         if self.unit == 'g':
             self.threshold = config.getfloat('trigger_threshold', .15,
                                              above=0.)

@@ -17,7 +17,7 @@
 #
 # What it cannot check: latency, the real contact signature, and every
 # threshold number in the config.  Those are machine measurements - see
-# docs/Accel_Z_Tap.md, phase 0.
+# "Commissioning" in docs/Accel_Z_Tap.md.
 #
 # Run with:  python test/multi_axis/test_accel_z_tap.py
 import math, os, sys, types, unittest
@@ -587,15 +587,15 @@ class TestConfig(unittest.TestCase):
         self.assertIn("must be above highpass", str(cm.exception))
         with self.assertRaises(CommandError):
             build({'highpass_order': 3})
-    def test_the_chip_must_exist_and_have_a_detector(self):
+    def test_the_chip_must_be_a_configured_bmi160(self):
         with self.assertRaises(CommandError) as cm:
             build(sections=())
         self.assertIn("is not configured", str(cm.exception))
-        printer = FakePrinter()
-        printer.add_object('bmi160', object())
-        with self.assertRaises(CommandError) as cm:
-            azt.AccelZTap(FakeConfig(printer, {}))
-        self.assertIn("cannot run a tap detector", str(cm.exception))
+        for name in ('adxl345', 'lis2dw head'):
+            printer = FakePrinter()
+            with self.assertRaises(CommandError) as cm:
+                azt.AccelZTap(FakeConfig(printer, {'accel_chip': name}))
+            self.assertIn("must name a [bmi160] section", str(cm.exception))
     def test_the_virtual_endstop_pin(self):
         tap = build()
         ppins = tap.printer.lookup_object('pins')

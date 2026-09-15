@@ -4,15 +4,18 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
-# An accelerometer bolted to the *rotating* part of a tilting head reads
-# the gravity vector in the head's own frame, and a gravity vector in the
+# A BMI160 IMU bolted to the *rotating* part of a tilting head reads the
+# gravity vector in the head's own frame, and a gravity vector in the
 # head's frame is the head's tilt - absolutely, with no reference to
 # where the axis has travelled since it was last homed.  That turns
 # measuring B into an observation rather than a move.
 #
 # This module is the measurement primitive of docs/Accel_B_Homing.md,
 # the B_MEASURE command that reports it, and the G28 B home built on it:
-# see "HOMING" below.  B_MEASURE never moves the machine.
+# see "HOMING" below.  B_MEASURE never moves the machine.  The BMI160 is
+# the only supported sensor: B is acted on through an angle fused from
+# its accelerometer and its gyroscope, so a [bmi160] with the gyroscope
+# enabled is required.
 #
 # THE ZERO REFERENCE
 #
@@ -25,7 +28,7 @@
 # An accelerometer at rest reads the specific force, which points *up*,
 # so both of these are "the sensor axis pointing straight up" at their
 # respective angles.  Both are found by looking: park the head, run
-# ACCELEROMETER_QUERY, and note which axis reads about +9800 (use the
+# BMI160_QUERY, and note which axis reads about +9800 (use the
 # negated name if it reads about -9800).
 #
 # Writing the two components as
@@ -107,8 +110,7 @@
 # vertical and refuses when there is none.  The accelerometer-only angle
 # is a diagnostic that B_MEASURE prints beside it: it cannot tell a
 # tilted head from an accelerating one, so acting on it would book a
-# head still ringing on its belts as a static tilt.  A chip without a
-# gyroscope can still run B_MEASURE, but cannot home B.
+# head still ringing on its belts as a static tilt.
 #
 # HOMING
 #
@@ -135,11 +137,11 @@
 #
 # SENSOR CALIBRATION
 #
-# An accelerometer's zero-g offset is up to +/-150 mg and its axes'
-# sensitivities differ by several percent.  Near B = 0 the angle is
-# almost entirely u / w, so an offset along u moves the zero directly:
-# 100 mg is 5.7 degrees.  Every sample is therefore corrected before
-# anything else sees it:
+# The BMI160 accelerometer's zero-g offset is up to +/-150 mg over its
+# life, and its axes' sensitivities are not exactly matched.  Near B = 0
+# the angle is almost entirely u / w, so an offset along u moves the zero
+# directly: 100 mg is 5.7 degrees.  Every sample is therefore corrected
+# before anything else sees it:
 #
 #   u' = u - offset_u
 #   w' = (w - offset_w) / gain_ratio
@@ -193,20 +195,20 @@
 import collections, logging, math
 import stepper
 
-# 1 g in the units the accelerometer chips report (mm/s^2).  Matches
-# adxl345.FREEFALL_ACCEL.
+# 1 g in the units the bmi160 reports (mm/s^2).  Matches
+# bmi160.FREEFALL_ACCEL.
 FREEFALL_ACCEL = 9.80665 * 1000.
 
-# The bulk sensor helpers deliver samples to the host in batches - 0.100 s
-# in adxl345.py - and a chip on a secondary mcu (a USB accelerometer board
-# such as the Fly-ADXL345-USB, or a CAN toolhead) adds a link's worth of
-# latency on top of that.  finish_measurements() waits for the moves to
-# finish, not for the sensor batches to arrive, so without a trailing
-# dwell the batch carrying the tail of the averaging window has usually
-# not been delivered yet.  Losing the tail is harmless on a long window
-# but a short one on a laggy link can drop enough samples to trip the
-# "dropping data" check.  Dwell past the window instead, so it is
-# comfortably in the past before the samples are asked for.
+# The bmi160 delivers samples to the host in 0.100 s batches
+# (bmi160.BATCH_UPDATES), and the link from the mcu that reads it -
+# klipper_mcu and a pty on the corertheta machine - adds latency on top.
+# finish_measurements() waits for the moves to finish, not for the sensor
+# batches to arrive, so without a trailing dwell the batch carrying the
+# tail of the averaging window has usually not been delivered yet.
+# Losing the tail is harmless on a long window but a short one can drop
+# enough samples to trip the "dropping data" check.  Dwell past the
+# window instead, so it is comfortably in the past before the samples are
+# asked for.
 DEFAULT_BATCH_MARGIN = .3
 
 # Index of the B coordinate within a toolhead position vector
@@ -242,10 +244,11 @@ FULL_FIT_ARC = 120.
 REDUCED_FIT_ARC = 60.
 MIN_FULL_FIT_STATIONS = 5
 MIN_REDUCED_FIT_STATIONS = 4
-# Bounds on a fit worth believing.  The datasheets allow 150 mg of
-# offset and 10 % of sensitivity error, so a fit well outside these is
-# describing a head that moved, or a mounting that is not the declared
-# one, rather than the sensor.
+# Bounds on a fit worth believing.  The datasheet allows 150 mg of
+# offset, and the gain bounds are far wider than any real mismatch
+# between two axes of one chip, so a fit well outside these is describing
+# a head that moved, or a mounting that is not the declared one, rather
+# than the sensor.
 MAX_FIT_OFFSET = .3 * FREEFALL_ACCEL
 MIN_GAIN_RATIO = .8
 MAX_GAIN_RATIO = 1.25
@@ -294,7 +297,7 @@ TiltReading = collections.namedtuple('TiltReading', (
 
 def parse_signed_axis(value):
     # A signed sensor axis, restricted to the six axis-aligned
-    # directions.  An arbitrary mounting angle is a phase two problem.
+    # directions.  An arbitrary mounting angle is not supported.
     key = str(value).strip().lower()
     if key not in SIGNED_AXES:
         raise ValueError("invalid sensor axis '%s'" % (value,))
@@ -446,12 +449,12 @@ def magnitude(vector):
     return math.sqrt(sum([c * c for c in vector]))
 
 def overflows_during(client):
-    # Every Klipper accelerometer reports a running count of possible
-    # fifo overflows in each batch it delivers.  An increase across the
-    # batches a client received means frames were lost while it was
-    # listening - and because the bulk sensor helpers timestamp samples
-    # by *counting* them, lost frames also leave the surviving ones
-    # mistimed, which a fused angle integrates straight into its answer.
+    # The bmi160 reports a running count of possible fifo overflows in
+    # each batch it delivers.  An increase across the batches a client
+    # received means frames were lost while it was listening - and
+    # because the bulk sensor helpers timestamp samples by *counting*
+    # them, lost frames also leave the surviving ones mistimed, which a
+    # fused angle integrates straight into its answer.
     counts = [m.get('overflows', 0) for m in getattr(client, 'msgs', [])]
     if len(counts) < 2:
         return 0
@@ -521,6 +524,11 @@ class AccelBHoming:
         self.printer = config.get_printer()
         self.name = config.get_name()
         self.chip_name = config.get('accel_chip', 'bmi160')
+        if self.chip_name.split()[0] != 'bmi160':
+            raise config.error(
+                "[%s] accel_chip must name a [bmi160] section, not '%s' -"
+                " the BMI160 is the only sensor B can be measured with"
+                % (self.name, self.chip_name))
         self.zero_axis = self._get_axis(config, 'zero_vector')
         self.positive_axis = self._get_axis(config, 'positive_vector')
         if self.zero_axis[0] == self.positive_axis[0]:
@@ -538,22 +546,22 @@ class AccelBHoming:
         self.sample_time = config.getfloat('sample_time', .5, minval=.05)
         self.batch_margin = config.getfloat('batch_margin',
                                             DEFAULT_BATCH_MARGIN, minval=0.)
-        # A stationary ADXL345 at 3200 Hz shows roughly 120-180 mm/s^2 of
-        # per-sample noise, so anything much above that is the head still
-        # moving.  Zero disables the check.
+        # From its datasheet noise density, a stationary BMI160 shows
+        # roughly 25 mm/s^2 of per-sample noise at 400 Hz and 45 at
+        # 1600 Hz, so anything approaching this is the head still moving.
+        # Zero disables the check.
         self.max_deviation = config.getfloat('max_sample_deviation', 500.,
                                              minval=0.)
-        # The magnitude gate is deliberately loose: with no gain
-        # calibration yet, a chip within its +/-10 % sensitivity spec can
-        # legitimately read 0.9 to 1.1 g.  It is here to catch a moving
-        # head or a misconfigured chip, not to grade the sensor.
+        # The magnitude gate is deliberately loose: the sensor calibration
+        # matches the two in-plane axes to each other, never to 1 g.  It
+        # is here to catch a moving head or a misconfigured chip, not to
+        # grade the sensor.
         self.max_magnitude_error = config.getfloat('max_magnitude_error',
                                                    1500., minval=0.)
-        # The gyroscope gate, when the chip has a gyroscope.  The
-        # default is provisional: it is meant to sit well above the
-        # sensor's own noise floor and well below any real motion, and
-        # the right value is whatever B_MEASURE reports on a parked head
-        # plus a margin.  Zero disables the gate.
+        # The gyroscope gate.  The default is provisional: it is meant to
+        # sit well above the sensor's own noise floor and well below any
+        # real motion, and the right value is whatever B_MEASURE reports
+        # on a parked head plus a margin.  Zero disables the gate.
         self.max_rotation_rate = config.getfloat('max_rotation_rate', 1.,
                                                  minval=0.)
         # Fusion.  tau is the crossover: shorter trusts the gyroscope
@@ -605,7 +613,6 @@ class AccelBHoming:
             config.getfloat('gain_ratio', 1., minval=MIN_GAIN_RATIO,
                             maxval=MAX_GAIN_RATIO))
         self.chip = self.toolhead = self.b_axis = None
-        self.has_gyro = False
         self.b_projection = None
         self.last_reading = None
         self.last_fused_angle = None
@@ -634,15 +641,12 @@ class AccelBHoming:
             raise self.printer.config_error(
                 "[%s] accel_chip '%s' is not configured"
                 % (self.name, self.chip_name))
-        if not hasattr(chip, 'start_internal_client'):
+        if not chip.has_gyro():
             raise self.printer.config_error(
-                "[%s] '%s' is not an accelerometer"
-                % (self.name, self.chip_name))
+                "[%s] '%s' has its gyroscope disabled (gyro: False), but B"
+                " is measured on the angle fused from the accelerometer and"
+                " the gyroscope - enable it" % (self.name, self.chip_name))
         self.chip = chip
-        # An IMU offers a second stream of angular rate; a plain
-        # accelerometer does not, and the gate below is then skipped
-        self.has_gyro = (hasattr(chip, 'start_internal_gyro_client')
-                         and getattr(chip, 'has_gyro', lambda: True)())
         # The B axis is a rotary axis object, so its homed flag lives
         # there rather than in the toolhead's homed_axes
         for ea in self.toolhead.get_extra_axes():
@@ -667,7 +671,7 @@ class AccelBHoming:
         settle = self.settle_time if settle_time is None else settle_time
         window = self.sample_time if sample_time is None else sample_time
         toolhead = self.toolhead
-        fuse = bool(fusion) and self.has_gyro
+        fuse = bool(fusion)
         toolhead.wait_moves()
         # Fusing reads the combined stream, where each sample carries an
         # acceleration and a rotation rate the chip measured at the same
@@ -678,7 +682,7 @@ class AccelBHoming:
             imu_client = self.chip.start_internal_imu_client()
         else:
             client = self.chip.start_internal_client()
-            if self.has_gyro and self.max_rotation_rate:
+            if self.max_rotation_rate:
                 gyro_client = self.chip.start_internal_gyro_client()
         start_time = toolhead.get_last_move_time()
         # The averaging window is settle..settle+window; the extra margin
@@ -700,9 +704,7 @@ class AccelBHoming:
                 " is dtparam=i2c_arm_baudrate in config.txt; i2c_speed is"
                 " ignored there)" % (self.name, self.chip_name, lost))
         # AccelQueryHelper trims to the request window but knows nothing
-        # about the settle dwell, so drop that part here.  Samples are
-        # (print_time, x, y, z); index rather than name the fields, so
-        # any chip exposing start_internal_client() works.
+        # about the settle dwell, so drop that part here.
         first = start_time + settle
         last = first + window
         # The sensor calibration is applied to every sample, before the
@@ -734,10 +736,10 @@ class AccelBHoming:
         if not vectors:
             raise self.printer.command_error(
                 "%s: no accelerometer samples in the measurement window -"
-                " check that '%s' is responding (try ACCELEROMETER_QUERY)"
+                " check that '%s' is responding (try BMI160_QUERY)"
                 % (self.name, self.chip_name))
-        rate = getattr(self.chip, 'data_rate', None)
-        if rate and len(vectors) < .5 * rate * window:
+        rate = self.chip.data_rate
+        if len(vectors) < .5 * rate * window:
             raise self.printer.command_error(
                 "%s: only %d of an expected %d accelerometer samples -"
                 " the connection to '%s' is dropping data, or is slow"
@@ -853,14 +855,6 @@ class AccelBHoming:
         # one.  This is the only measurement G28 B, the endstop checks,
         # CHECK=1 and the drive ratio calibration act on; see "WHICH
         # ANGLE IS ACTED ON" in the header.
-        if not self.has_gyro:
-            raise self.printer.command_error(
-                "%s: '%s' has no gyroscope, so there is no fused angle to"
-                " measure B from vertical with.  B is only homed, checked"
-                " and calibrated on the fused angle - use an IMU such as a"
-                " [bmi160] with its gyroscope enabled.  B_MEASURE still"
-                " reports the accelerometer-only angle"
-                % (self.name, self.chip_name))
         reading = self.measure(settle_time, sample_time, fusion=True)
         if reading.fused_angle is None:
             raise self.printer.command_error(
@@ -1338,7 +1332,6 @@ class AccelBHoming:
                'positive_vector': signed_axis_name(self.positive_axis),
                'rotation_axis': AXIS_NAMES[self.oop_index],
                'accel_chip': self.chip_name}
-        res['has_gyro'] = self.has_gyro
         res['fusion_tau'] = self.fusion_tau
         res['rotation_axis_sign'] = self.gyro_coefficient
         # measured_b is only ever a fused angle from vertical: the last
@@ -1415,7 +1408,6 @@ class AccelBHoming:
                              " cannot be combined with FUSION=0"
                              % (self.name,))
         if check:
-            # Refuses a chip with no gyroscope before sampling anything
             self.measure_vertical(settle, window)
             reading = self.last_reading
         else:

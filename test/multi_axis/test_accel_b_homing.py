@@ -7,9 +7,9 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
 # This drives the *real* extras/accel_b_homing.py with a stubbed printer
-# and a synthetic accelerometer, so it runs anywhere Python is available
-# (it does not need a compiled c_helper.so, a serial port, an
-# accelerometer, or a Linux host).
+# and a synthetic BMI160, so it runs anywhere Python is available (it
+# does not need a compiled c_helper.so, a serial port, a sensor, or a
+# Linux host).
 #
 # Run with:  python test/multi_axis/test_accel_b_homing.py
 import math, os, random, sys, types, unittest
@@ -68,15 +68,37 @@ class FakeToolhead:
         self.dwells.append(delay)
         self.print_time += delay
 
-# An accelerometer that reports a head sitting at a known angle.  The
-# sensor frame here is the one the tests configure: +z reads 1 g at B=0,
-# +x reads 1 g at B=+90, so y is the rotation axis.
-class FakeAccelChip:
-    data_rate = 3200
+# A BMI160 that reports a head sitting at a known angle.  The sensor
+# frame here is the one the tests configure: +z reads 1 g at B=0, +x
+# reads 1 g at B=+90, so y is the rotation axis.
+#
+# It is also physically self-consistent: if b_rate is non-zero the head
+# really is turning, so the accelerometer angle sweeps at that rate *and*
+# the gyroscope reports the rotation that produces it.  Fusing an
+# accelerometer with a gyroscope that disagrees with it would prove
+# nothing.
+#
+# The B rotation axis is w_hat x u_hat = z_hat x x_hat = +y, and the
+# sensor's own rate about that axis is -dB/dt (see
+# accel_b_homing.gyro_axis_coefficient).  That minus sign is the whole
+# convention under test: if the module got it backwards, the fused angle
+# would run away from the accelerometer instead of tracking it.
+#
+# off_axis_rate spins the chip about its zero_vector axis instead.  That
+# is real motion the gate's magnitude sees, but it does not tilt the
+# head and so must not move the measured angle.
+class FakeBMI160:
+    data_rate = 1600
     def __init__(self, angle=0., noise=0., gain=(1., 1., 1.),
                  offset=(0., 0., 0.), y_bias=0., delivery_lag=0.,
-                 overflows=0):
+                 overflows=0, b_rate=0., off_axis_rate=0.,
+                 invert_gyro=False, gyro_lag=0., gyro=True):
         self.angle, self.noise = angle, noise
+        self.b_rate = b_rate
+        self.off_axis_rate = off_axis_rate
+        self.invert_gyro = invert_gyro
+        self.gyro_lag = gyro_lag
+        self.gyro = gyro
         # Possible fifo overflows the chip reports during a capture, as
         # the running count carried in each bulk batch
         self.overflows = overflows
@@ -84,15 +106,34 @@ class FakeAccelChip:
         self.toolhead = None
         self.dropped = 0.
         # Samples this far back from the end of the dwell have not been
-        # delivered yet - the batching and link latency of a chip on a
-        # secondary mcu, such as a USB accelerometer board
+        # delivered yet - the bulk batching, and the latency of the link
+        # from the mcu reading the chip
         self.delivery_lag = delivery_lag
         self.rng = random.Random(1234)
+    def has_gyro(self):
+        return self.gyro
     def start_internal_client(self):
         return FakeAccelClient(self)
+    def start_internal_gyro_client(self):
+        return FakeGyroClient(self)
+    def start_internal_imu_client(self):
+        return FakeIMUClient(self)
     def angle_at(self, t, start):
-        # A head that is not turning.  FakeIMUChip overrides this.
-        return self.angle
+        return self.angle + self.b_rate * (t - start)
+    def gyro_vector(self):
+        rate = [0., -self.b_rate, self.off_axis_rate]
+        if self.invert_gyro:
+            rate = [-r for r in rate]
+        return tuple(rate)
+    def gyro_samples_over(self, start, end):
+        end -= self.delivery_lag + self.gyro_lag
+        total = int(round((end - start) * self.data_rate))
+        return [(start + (i + .5) / self.data_rate,) + self.gyro_vector()
+                for i in range(max(0, total))]
+    def imu_samples_over(self, start, end):
+        gyro = self.gyro_vector()
+        return [(t,) + gyro + (ax, ay, az)
+                for t, ax, ay, az in self.samples_over(start, end)]
     def samples_over(self, start, end):
         end -= self.delivery_lag
         res = []
@@ -128,53 +169,6 @@ class FakeAccelClient:
         return [{'overflows': 0}, {'overflows': self.chip.overflows}]
     def get_samples(self):
         return self.chip.samples_over(self.start, self.end)
-
-# A BMI160-shaped chip, and a physically self-consistent one: if b_rate
-# is non-zero the head really is turning, so the accelerometer angle
-# sweeps at that rate *and* the gyroscope reports the rotation that
-# produces it.  Fusing an accelerometer with a gyroscope that disagrees
-# with it would prove nothing.
-#
-# These tests mount the chip as zero=+z, positive=+x, so the B rotation
-# axis is w_hat x u_hat = z_hat x x_hat = +y, and the sensor's own rate
-# about that axis is -dB/dt (see accel_b_homing.gyro_axis_coefficient).
-# That minus sign is the whole convention under test: if the module got
-# it backwards, the fused angle would run away from the accelerometer
-# instead of tracking it.
-#
-# off_axis_rate spins the chip about its zero_vector axis instead.  That
-# is real motion the gate's magnitude sees, but it does not tilt the
-# head and so must not move the measured angle.
-class FakeIMUChip(FakeAccelChip):
-    def __init__(self, b_rate=0., off_axis_rate=0., invert_gyro=False,
-                 gyro_lag=0., **kwargs):
-        FakeAccelChip.__init__(self, **kwargs)
-        self.b_rate = b_rate
-        self.off_axis_rate = off_axis_rate
-        self.invert_gyro = invert_gyro
-        self.gyro_lag = gyro_lag
-    def has_gyro(self):
-        return True
-    def angle_at(self, t, start):
-        return self.angle + self.b_rate * (t - start)
-    def gyro_vector(self):
-        rate = [0., -self.b_rate, self.off_axis_rate]
-        if self.invert_gyro:
-            rate = [-r for r in rate]
-        return tuple(rate)
-    def start_internal_gyro_client(self):
-        return FakeGyroClient(self)
-    def start_internal_imu_client(self):
-        return FakeIMUClient(self)
-    def gyro_samples_over(self, start, end):
-        end -= self.delivery_lag + self.gyro_lag
-        total = int(round((end - start) * self.data_rate))
-        return [(start + (i + .5) / self.data_rate,) + self.gyro_vector()
-                for i in range(max(0, total))]
-    def imu_samples_over(self, start, end):
-        gyro = self.gyro_vector()
-        return [(t,) + gyro + (ax, ay, az)
-                for t, ax, ay, az in self.samples_over(start, end)]
 
 class FakeGyroClient(FakeAccelClient):
     def get_samples(self):
@@ -281,7 +275,7 @@ def build(config_values=None, chip=None, b_projection=None):
     printer = FakePrinter()
     toolhead = FakeToolhead()
     printer.add_object('toolhead', toolhead)
-    chip = chip if chip is not None else FakeAccelChip()
+    chip = chip if chip is not None else FakeBMI160()
     chip.toolhead = toolhead
     printer.add_object('bmi160', chip)
     if b_projection is not None:
@@ -366,23 +360,23 @@ class TestConfig(unittest.TestCase):
         self.assertIn("+x, -x, +y, -y, +z or -z", str(cm.exception))
     def test_missing_chip_is_reported(self):
         with self.assertRaises(ConfigError) as cm:
-            build({'accel_chip': 'adxl345 head'})
+            build({'accel_chip': 'bmi160 head'})
         self.assertIn("is not configured", str(cm.exception))
-    def test_a_non_accelerometer_is_reported(self):
-        printer = FakePrinter()
-        toolhead = FakeToolhead()
-        printer.add_object('toolhead', toolhead)
-        printer.add_object('bmi160', object())
-        abh.AccelBHoming(FakeConfig(printer, dict(BASE_CONFIG)))
+    def test_only_a_bmi160_is_accepted(self):
+        for name in ('adxl345', 'lis2dw head', 'mpu9250'):
+            with self.assertRaises(ConfigError) as cm:
+                build({'accel_chip': name})
+            self.assertIn("must name a [bmi160] section", str(cm.exception))
+    def test_a_disabled_gyroscope_is_refused(self):
         with self.assertRaises(ConfigError) as cm:
-            printer.send_event("klippy:connect")
-        self.assertIn("is not an accelerometer", str(cm.exception))
+            build(chip=FakeBMI160(gyro=False))
+        self.assertIn("gyro: False", str(cm.exception))
     def test_a_machine_without_b_is_reported(self):
         printer = FakePrinter()
         toolhead = FakeToolhead()
         toolhead.extra_axes = [FakeExtruder(), None, None]
         printer.add_object('toolhead', toolhead)
-        chip = FakeAccelChip()
+        chip = FakeBMI160()
         chip.toolhead = toolhead
         printer.add_object('bmi160', chip)
         abh.AccelBHoming(FakeConfig(printer, dict(BASE_CONFIG)))
@@ -401,12 +395,12 @@ class TestConfig(unittest.TestCase):
 
 class TestMeasure(unittest.TestCase):
     def test_a_clean_reading(self):
-        obj = build(chip=FakeAccelChip(angle=-32.5))
+        obj = build(chip=FakeBMI160(angle=-32.5))
         reading = obj.measure()
         self.assertAlmostEqual(reading.accel_angle, -32.5, places=9)
-        self.assertIsNone(reading.fused_angle)
+        self.assertAlmostEqual(reading.fused_angle, -32.5, places=6)
         self.assertAlmostEqual(reading.magnitude, G, places=6)
-        self.assertEqual(reading.count, int(3200 * .5))
+        self.assertEqual(reading.count, int(1600 * .5))
         self.assertAlmostEqual(math.hypot(reading.u, reading.w), G, places=6)
         self.assertAlmostEqual(reading.out_of_plane, 0.)
     def test_the_settle_dwell_is_excluded_from_the_average(self):
@@ -416,93 +410,95 @@ class TestMeasure(unittest.TestCase):
         # One dwell covering settle + window + batch margin, but only the
         # window is averaged
         self.assertEqual(toolhead.dwells, [.25 + .5 + .3])
-        self.assertEqual(obj.last_reading.count, int(3200 * .5))
+        self.assertEqual(obj.last_reading.count, int(1600 * .5))
     def test_overridden_sample_time_changes_the_count(self):
         obj = build()
-        self.assertEqual(obj.measure(0., .1).count, 320)
+        self.assertEqual(obj.measure(1., .1).count, 160)
     def test_noise_averages_out(self):
-        # 500 mm/s^2 per sample is well above a real ADXL345 (120-180 is
-        # typical at 3200 Hz).  Averaged over 1600 samples that is
-        # 12.5 mm/s^2 on the mean, or about 0.07 degrees - so a tenth of
-        # a degree is a safe bound, and this is the whole reason the
-        # routine averages rather than taking one sample.
-        chip = FakeAccelChip(angle=20., noise=500.)
+        # 500 mm/s^2 per sample is ten times a stationary BMI160 at
+        # 1600 Hz.  Averaged over 800 samples that is under 18 mm/s^2 on
+        # the mean, or about 0.1 degrees - so 0.15 is a safe bound, and
+        # this is the whole reason the routine averages rather than
+        # taking one sample.
+        chip = FakeBMI160(angle=20., noise=500.)
         obj = build({'max_sample_deviation': 0.}, chip=chip)
-        self.assertAlmostEqual(obj.measure().accel_angle, 20., delta=.1)
+        self.assertAlmostEqual(obj.measure().accel_angle, 20., delta=.15)
     def test_a_moving_head_is_rejected(self):
-        chip = FakeAccelChip(angle=0., noise=900.)
+        chip = FakeBMI160(angle=0., noise=900.)
         obj = build(chip=chip)
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("still moving", str(cm.exception))
         self.assertIn("settle_time", str(cm.exception))
     def test_a_bad_magnitude_is_rejected(self):
-        chip = FakeAccelChip(angle=0., gain=(1., 1., .5))
+        chip = FakeBMI160(angle=0., gain=(1., 1., .5))
         obj = build(chip=chip)
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("where gravity is", str(cm.exception))
-    def test_a_chip_inside_its_gain_spec_is_accepted(self):
-        # +/-10 % sensitivity is within the ADXL345 datasheet spec and
-        # must not trip the magnitude gate - there is no gain
-        # calibration in this phase
+    def test_a_gain_error_is_left_to_the_calibration(self):
+        # A uniform 10 % sensitivity error must not trip the magnitude
+        # gate - matching the axes is B_SENSOR_CALIBRATE's job, and it
+        # never matches them to 1 g
         for gain in (.9, 1.1):
-            chip = FakeAccelChip(angle=0., gain=(gain, gain, gain))
+            chip = FakeBMI160(angle=0., gain=(gain, gain, gain))
             build(chip=chip).measure()
     def test_silence_is_reported_as_a_wiring_problem(self):
-        chip = FakeAccelChip()
+        chip = FakeBMI160()
         chip.dropped = 1.
         obj = build(chip=chip)
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
-        self.assertIn("ACCELEROMETER_QUERY", str(cm.exception))
+        self.assertIn("BMI160_QUERY", str(cm.exception))
     def test_heavy_data_loss_is_reported(self):
-        chip = FakeAccelChip()
+        chip = FakeBMI160()
         chip.dropped = .8
         obj = build(chip=chip)
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("dropping data", str(cm.exception))
     def test_late_batches_still_cover_the_window(self):
-        # A chip on a USB or CAN attached mcu delivers its last batch
-        # after the moves have finished.  The trailing batch_margin dwell
-        # is what keeps the averaging window fully covered.
-        obj = build(chip=FakeAccelChip(angle=8., delivery_lag=.2))
-        self.assertEqual(obj.measure().count, int(3200 * .5))
+        # The bmi160's last batch arrives after the moves have finished,
+        # later still through klipper_mcu.  The trailing batch_margin
+        # dwell is what keeps the averaging window fully covered.
+        obj = build(chip=FakeBMI160(angle=8., delivery_lag=.2))
+        self.assertEqual(obj.measure().count, int(1600 * .5))
     def test_without_the_margin_the_tail_of_the_window_is_lost(self):
-        obj = build({'batch_margin': 0.},
-                    chip=FakeAccelChip(angle=8., delivery_lag=.2))
+        # (a shorter fusion_tau, so the truncated capture can still fuse)
+        obj = build({'batch_margin': 0., 'fusion_tau': .1},
+                    chip=FakeBMI160(angle=8., delivery_lag=.2))
         # 0.2 s of the 0.5 s window never arrives
-        self.assertEqual(obj.measure().count, int(3200 * .3))
+        self.assertEqual(obj.measure().count, int(1600 * .3))
     def test_a_short_window_without_the_margin_trips_the_gate(self):
-        # The failure the margin exists to prevent: on a laggy link a
-        # short window loses enough of itself to look like data loss
-        chip = FakeAccelChip(angle=8., delivery_lag=.15)
-        obj = build({'sample_time': .2, 'batch_margin': 0.}, chip=chip)
+        # The failure the margin exists to prevent: a short window loses
+        # enough of itself to look like data loss
+        chip = FakeBMI160(angle=8., delivery_lag=.15)
+        obj = build({'sample_time': .2, 'batch_margin': 0.,
+                     'fusion_tau': .1}, chip=chip)
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("batch_margin", str(cm.exception))
         # ...and with the margin restored the same window is complete
-        obj = build({'sample_time': .2}, chip=chip)
-        self.assertEqual(obj.measure().count, int(3200 * .2))
+        obj = build({'sample_time': .2, 'fusion_tau': .1}, chip=chip)
+        self.assertEqual(obj.measure().count, int(1600 * .2))
     def test_the_out_of_plane_axis_is_reported(self):
-        chip = FakeAccelChip(angle=0., y_bias=250.)
+        chip = FakeBMI160(angle=0., y_bias=250.)
         obj = build(chip=chip)
         self.assertAlmostEqual(obj.measure().out_of_plane, 250.)
     def test_status_carries_the_last_reading(self):
-        obj = build(chip=FakeIMUChip(angle=15.))
+        obj = build(chip=FakeBMI160(angle=15.))
         obj.measure()
         status = obj.get_status()
         self.assertAlmostEqual(status['measured_b'], 15., places=4)
         self.assertAlmostEqual(status['accel_b'], 15., places=4)
     def test_status_never_reports_an_unfused_angle_as_measured_b(self):
-        obj = build(chip=FakeAccelChip(angle=15.))
-        obj.measure()
+        obj = build(chip=FakeBMI160(angle=15.))
+        obj.measure(fusion=False)
         status = obj.get_status()
         self.assertIsNone(status['measured_b'])
         self.assertAlmostEqual(status['accel_b'], 15., places=9)
         # An unfused diagnostic does not overwrite the last fused angle
-        chip = FakeIMUChip(angle=15.)
+        chip = FakeBMI160(angle=15.)
         obj = build(chip=chip)
         obj.measure()
         chip.angle = 20.
@@ -530,7 +526,7 @@ class TestCommand(unittest.TestCase):
         obj.printer.lookup_object('gcode').commands['B_MEASURE'](gcmd)
         return "\n".join(gcmd.responses)
     def test_report_contents(self):
-        obj = build(chip=FakeAccelChip(angle=-12.))
+        obj = build(chip=FakeBMI160(angle=-12.))
         toolhead = obj.printer.lookup_object('toolhead')
         toolhead.position[abh.B_POS_INDEX] = -12.5
         out = self._run(obj)
@@ -545,7 +541,7 @@ class TestCommand(unittest.TestCase):
         self.assertIn("B is not homed", out)
         self.assertNotIn("commanded B", out)
     def test_check_on_an_unhomed_b_is_an_error(self):
-        obj = build(chip=FakeIMUChip(angle=7.))
+        obj = build(chip=FakeBMI160(angle=7.))
         obj.printer.lookup_object('toolhead').b_axis.is_homed = False
         gcmd = FakeGCmd({'CHECK': 1})
         with self.assertRaises(ConfigError) as cm:
@@ -555,11 +551,11 @@ class TestCommand(unittest.TestCase):
         # the answer even when there is nothing to compare it against
         self.assertIn("B = 7.000 deg", "\n".join(gcmd.responses))
     def test_check_passes_within_tolerance(self):
-        obj = build(chip=FakeIMUChip(angle=30.4))
+        obj = build(chip=FakeBMI160(angle=30.4))
         obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 30.
         self._run(obj, {'CHECK': 1, 'TOLERANCE': .5})
     def test_check_fails_outside_tolerance(self):
-        obj = build(chip=FakeIMUChip(angle=34.))
+        obj = build(chip=FakeBMI160(angle=34.))
         obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 30.
         with self.assertRaises(ConfigError) as cm:
             self._run(obj, {'CHECK': 1, 'TOLERANCE': .5})
@@ -569,20 +565,14 @@ class TestCommand(unittest.TestCase):
         # and the head is really at its projection - which is what the
         # sensor sees.  Comparing against the raw commanded B here would
         # report a 30 degree error that does not exist.
-        obj = build(chip=FakeIMUChip(angle=30.),
+        obj = build(chip=FakeBMI160(angle=30.),
                     b_projection=FakeBProjection(scale=.5))
         obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 60.
         out = self._run(obj, {'CHECK': 1, 'TOLERANCE': .5})
         self.assertIn("commanded B = 30.000 deg", out)
     def test_check_needs_a_fused_angle(self):
-        # A chip with no gyroscope has only the accelerometer angle, and
-        # CHECK=1 does not act on that
-        obj = build(chip=FakeAccelChip(angle=30.))
-        obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 30.
-        with self.assertRaises(ConfigError) as cm:
-            self._run(obj, {'CHECK': 1})
-        self.assertIn("no gyroscope", str(cm.exception))
-        obj = build(chip=FakeIMUChip(angle=30.))
+        # CHECK=1 does not act on the accelerometer-only angle
+        obj = build(chip=FakeBMI160(angle=30.))
         obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 30.
         with self.assertRaises(ConfigError) as cm:
             self._run(obj, {'CHECK': 1, 'FUSION': 0})
@@ -591,7 +581,7 @@ class TestCommand(unittest.TestCase):
         # A head still turning at 4 deg/s: the accelerometer average lags
         # at 2.0 deg, the fused angle is at 3.0.  CHECK judges the latter.
         obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.},
-                    chip=FakeIMUChip(b_rate=4.))
+                    chip=FakeBMI160(b_rate=4.))
         obj.printer.lookup_object('toolhead').position[abh.B_POS_INDEX] = 3.
         out = self._run(obj, {'CHECK': 1, 'TOLERANCE': .1})
         self.assertIn("error = -0.001 deg", out)
@@ -610,33 +600,26 @@ class TestOverflows(unittest.TestCase):
         self.assertEqual(abh.overflows_during(Client()), 0)
         self.assertEqual(abh.overflows_during(object()), 0)
     def test_a_measurement_that_lost_frames_is_refused(self):
-        for chip in (FakeAccelChip(overflows=2),
-                     FakeIMUChip(overflows=2)):
-            obj = build(chip=chip)
-            with self.assertRaises(ConfigError) as cm:
-                obj.measure()
-            self.assertIn("2 possible fifo overflows", str(cm.exception))
-            self.assertIn("Lower the chip's rate", str(cm.exception))
-            self.assertIn("On spi", str(cm.exception))
+        obj = build(chip=FakeBMI160(overflows=2))
+        with self.assertRaises(ConfigError) as cm:
+            obj.measure()
+        self.assertIn("2 possible fifo overflows", str(cm.exception))
+        self.assertIn("Lower the chip's rate", str(cm.exception))
+        self.assertIn("On spi", str(cm.exception))
     def test_the_unfused_gyroscope_stream_is_checked_too(self):
-        obj = build(chip=FakeIMUChip(overflows=1))
+        obj = build(chip=FakeBMI160(overflows=1))
         with self.assertRaises(ConfigError):
             obj.measure(fusion=False)
 
 
 class TestMotionGate(unittest.TestCase):
-    def test_a_chip_without_a_gyroscope_skips_the_gate(self):
-        obj = build()
-        self.assertFalse(obj.has_gyro)
-        self.assertIsNone(obj.measure().rotation_rate)
     def test_a_head_at_rest_passes_and_reports_its_rate(self):
-        obj = build(chip=FakeIMUChip(angle=12.))
-        self.assertTrue(obj.has_gyro)
+        obj = build(chip=FakeBMI160(angle=12.))
         reading = obj.measure()
         self.assertAlmostEqual(reading.fused_angle, 12., places=4)
         self.assertAlmostEqual(reading.rotation_rate, 0.)
     def test_a_turning_head_is_rejected(self):
-        obj = build(chip=FakeIMUChip(b_rate=4.))
+        obj = build(chip=FakeBMI160(b_rate=4.))
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("turning during the measurement", str(cm.exception))
@@ -645,36 +628,35 @@ class TestMotionGate(unittest.TestCase):
         # also spins at 3 deg/s about the axis pointing up, which tilts
         # nothing.  The gate should see 5.
         obj = build({'max_sample_deviation': 0.},
-                    chip=FakeIMUChip(b_rate=4., off_axis_rate=3.))
+                    chip=FakeBMI160(b_rate=4., off_axis_rate=3.))
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("5.000 deg/s", str(cm.exception))
     def test_the_gate_can_be_raised(self):
         obj = build({'max_rotation_rate': 10., 'max_sample_deviation': 0.},
-                    chip=FakeIMUChip(b_rate=4.))
+                    chip=FakeBMI160(b_rate=4.))
         self.assertAlmostEqual(obj.measure().rotation_rate, 4.)
     def test_zero_disables_the_gate_entirely(self):
         obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.,
                      'max_fusion_disagreement': 0.},
-                    chip=FakeIMUChip(b_rate=99.))
+                    chip=FakeBMI160(b_rate=99.))
         self.assertIsNone(obj.measure().rotation_rate)
     def test_a_silent_gyroscope_is_reported(self):
         # The accelerometer arrives but the gyroscope stream does not.
         # Fusion reads one combined stream, so this is the unfused path.
-        obj = build(chip=FakeIMUChip(gyro_lag=5.))
+        obj = build(chip=FakeBMI160(gyro_lag=5.))
         with self.assertRaises(ConfigError) as cm:
             obj.measure(fusion=False)
         self.assertIn("no gyroscope samples", str(cm.exception))
     def test_the_rate_reaches_get_status(self):
         obj = build({'max_sample_deviation': 0.},
-                    chip=FakeIMUChip(b_rate=.25))
-        self.assertTrue(obj.get_status()['has_gyro'])
+                    chip=FakeBMI160(b_rate=.25))
         self.assertIsNone(obj.get_status()['rotation_rate'])
         obj.measure()
         self.assertAlmostEqual(obj.get_status()['rotation_rate'], .25)
     def test_the_rate_is_reported_by_b_measure(self):
         obj = build({'max_sample_deviation': 0.},
-                    chip=FakeIMUChip(b_rate=.25))
+                    chip=FakeBMI160(b_rate=.25))
         gcmd = FakeGCmd()
         obj.cmd_B_MEASURE(gcmd)
         self.assertIn("rotation rate = 0.2500 deg/s", gcmd.responses[0])
@@ -791,15 +773,8 @@ class TestGyroAxis(unittest.TestCase):
 ######################################################################
 
 class TestFusion(unittest.TestCase):
-    def test_a_chip_without_a_gyroscope_does_not_fuse(self):
-        obj = build(chip=FakeAccelChip(angle=7.))
-        reading = obj.measure()
-        self.assertIsNone(reading.fused_angle)
-        self.assertAlmostEqual(reading.accel_angle, 7.)
-        self.assertFalse(obj.get_status()['has_gyro'])
-        self.assertIsNone(obj.get_status()['measured_b'])
     def test_a_stationary_head_fuses_to_the_same_answer(self):
-        obj = build(chip=FakeIMUChip(angle=12.))
+        obj = build(chip=FakeBMI160(angle=12.))
         reading = obj.measure()
         self.assertIsNotNone(reading.fused_angle)
         self.assertAlmostEqual(reading.fused_angle, 12., places=4)
@@ -810,7 +785,7 @@ class TestFusion(unittest.TestCase):
         # the accelerometer average lands at its midpoint (2.0 deg) while
         # the fused angle tracks to the window's end (3.0 deg).
         obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.},
-                    chip=FakeIMUChip(b_rate=4.))
+                    chip=FakeBMI160(b_rate=4.))
         reading = obj.measure()
         self.assertAlmostEqual(reading.accel_angle, 2.0, delta=.02)
         self.assertAlmostEqual(reading.fused_angle, 3.0, delta=.02)
@@ -821,7 +796,7 @@ class TestFusion(unittest.TestCase):
     def test_the_fused_angle_follows_the_sign_of_the_rotation(self):
         for b_rate in (4., -4.):
             obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.},
-                        chip=FakeIMUChip(b_rate=b_rate))
+                        chip=FakeBMI160(b_rate=b_rate))
             reading = obj.measure()
             # fused sits ahead of the accelerometer average in the
             # direction the head is actually turning
@@ -829,43 +804,37 @@ class TestFusion(unittest.TestCase):
                 (reading.fused_angle - reading.accel_angle) * b_rate, 0.)
     def test_an_off_axis_spin_does_not_move_the_angle(self):
         obj = build({'max_rotation_rate': 0.},
-                    chip=FakeIMUChip(angle=12., off_axis_rate=30.))
+                    chip=FakeBMI160(angle=12., off_axis_rate=30.))
         reading = obj.measure()
         self.assertAlmostEqual(reading.fused_angle, 12., places=4)
     def test_an_inverted_gyroscope_is_caught_when_the_head_moves_enough(self):
         obj = build({'max_rotation_rate': 0., 'max_sample_deviation': 0.,
                      'max_magnitude_error': 0.},
-                    chip=FakeIMUChip(b_rate=40., invert_gyro=True))
+                    chip=FakeBMI160(b_rate=40., invert_gyro=True))
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("gyroscope is inverted", str(cm.exception))
     def test_an_inverted_gyroscope_is_invisible_on_a_parked_head(self):
         # Stated as a test because it is a real limitation: with nothing
         # to integrate, the sign cannot be checked.  That needs a
-        # deliberate move (B_GYRO_CHECK, phase 3).
-        obj = build(chip=FakeIMUChip(angle=12., invert_gyro=True))
+        # deliberate move.
+        obj = build(chip=FakeBMI160(angle=12., invert_gyro=True))
         self.assertAlmostEqual(obj.measure().fused_angle, 12., places=4)
-    def test_measure_vertical_refuses_a_chip_without_a_gyroscope(self):
-        obj = build(chip=FakeAccelChip(angle=12.))
-        with self.assertRaises(ConfigError) as cm:
-            obj.measure_vertical()
-        self.assertIn("no gyroscope", str(cm.exception))
-        self.assertIn("B_MEASURE", str(cm.exception))
     def test_fusion_is_not_a_config_option(self):
         self.assertFalse(hasattr(build(), 'fusion'))
     def test_fusion_can_be_turned_off_per_command(self):
-        obj = build(chip=FakeIMUChip(angle=12.))
+        obj = build(chip=FakeBMI160(angle=12.))
         self.assertIsNone(obj.measure(fusion=False).fused_angle)
         self.assertIsNotNone(obj.measure(fusion=True).fused_angle)
     def test_b_measure_reports_both_estimates(self):
-        obj = build(chip=FakeIMUChip(angle=12.))
+        obj = build(chip=FakeBMI160(angle=12.))
         gcmd = FakeGCmd()
         obj.cmd_B_MEASURE(gcmd)
         self.assertIn("B = 12.000 deg from vertical, fused",
                       gcmd.responses[0])
         self.assertIn("accelerometer alone 12.000", gcmd.responses[0])
     def test_b_measure_can_ask_for_the_unfused_angle(self):
-        obj = build(chip=FakeIMUChip(angle=12.))
+        obj = build(chip=FakeBMI160(angle=12.))
         gcmd = FakeGCmd({'FUSION': 0})
         obj.cmd_B_MEASURE(gcmd)
         self.assertIn("accelerometer only", gcmd.responses[0])
@@ -873,14 +842,13 @@ class TestFusion(unittest.TestCase):
         self.assertNotIn("accelerometer alone", gcmd.responses[0])
     def test_a_capture_shorter_than_the_filter_needs_is_refused(self):
         obj = build({'settle_time': 0., 'sample_time': .05,
-                     'fusion_tau': .5}, chip=FakeIMUChip(angle=12.))
+                     'fusion_tau': .5}, chip=FakeBMI160(angle=12.))
         with self.assertRaises(ConfigError) as cm:
             obj.measure()
         self.assertIn("fusion_tau", str(cm.exception))
     def test_the_fusion_state_reaches_get_status(self):
-        obj = build(chip=FakeIMUChip(angle=12.))
+        obj = build(chip=FakeBMI160(angle=12.))
         status = obj.get_status()
-        self.assertTrue(status['has_gyro'])
         self.assertNotIn('fusion', status)
         self.assertAlmostEqual(status['fusion_tau'], .2)
         self.assertEqual(status['rotation_axis_sign'], -1.)
@@ -969,7 +937,7 @@ class FakeMeasuredAxis:
         return list(self.drive_options)
 
 def build_home(head_angle, ratio=1., config_values=None, rng=(-45., 100.)):
-    chip = FakeIMUChip(angle=head_angle)
+    chip = FakeBMI160(angle=head_angle)
     obj = build(config_values, chip=chip)
     enable = FakeStepperEnable()
     obj.printer.add_object('stepper_enable', enable)
@@ -1002,15 +970,6 @@ class TestMeasuredHome(unittest.TestCase):
         self.assertIn("head at B = 33.00", self._responses(obj))
         self.assertAlmostEqual(obj.last_reading.fused_angle, 0., delta=.25)
         self.assertAlmostEqual(obj.last_reading.accel_angle, -1., delta=.25)
-    def test_a_chip_without_a_gyroscope_cannot_home(self):
-        chip = FakeAccelChip(angle=30.)
-        obj = build(chip=chip)
-        axis = FakeMeasuredAxis(chip)
-        with self.assertRaises(ConfigError) as cm:
-            obj.home_axis(axis)
-        self.assertIn("no gyroscope", str(cm.exception))
-        self.assertIsNone(axis.position)
-        self.assertEqual(axis.moves, [])
     def test_the_check_move_heads_toward_zero_from_either_side(self):
         obj, axis, _ = build_home(-20.)
         obj.home_axis(axis)
@@ -1088,58 +1047,50 @@ class TestMeasuredHome(unittest.TestCase):
 
 class TestHomingDirection(unittest.TestCase):
     def test_below_the_endstop_homes_positive(self):
-        obj = build(chip=FakeIMUChip(angle=-20.))
+        obj = build(chip=FakeBMI160(angle=-20.))
         positive, sweep = obj.choose_homing_direction(40., -90., 90.)
         self.assertTrue(positive)
         self.assertAlmostEqual(sweep, 60. + 5., places=3)
         gcode = obj.printer.lookup_object('gcode')
         self.assertIn("homing positive", gcode.responses[-1])
     def test_above_the_endstop_homes_negative(self):
-        obj = build(chip=FakeIMUChip(angle=30.))
+        obj = build(chip=FakeBMI160(angle=30.))
         positive, sweep = obj.choose_homing_direction(-45., -90., 90.)
         self.assertFalse(positive)
         self.assertAlmostEqual(sweep, 75. + 5., places=3)
     def test_a_negated_mounting_flips_the_direction(self):
         # The same physical pose, declared with the opposite +B
-        obj = build({'positive_vector': '-x'}, chip=FakeIMUChip(angle=30.))
+        obj = build({'positive_vector': '-x'}, chip=FakeBMI160(angle=30.))
         positive, _ = obj.choose_homing_direction(0., -90., 90.)
         self.assertTrue(positive)
     def test_near_a_mid_range_endstop_is_refused(self):
-        obj = build(chip=FakeIMUChip(angle=2.))
+        obj = build(chip=FakeBMI160(angle=2.))
         with self.assertRaises(ConfigError) as cm:
             obj.choose_homing_direction(0., -90., 90.)
         self.assertIn("cannot tell which side", str(cm.exception))
     def test_near_an_endstop_at_a_range_limit_homes_toward_it(self):
-        obj = build(chip=FakeIMUChip(angle=-44.))
+        obj = build(chip=FakeBMI160(angle=-44.))
         positive, _ = obj.choose_homing_direction(-45., -45., 100.)
         self.assertFalse(positive)
-        obj = build(chip=FakeIMUChip(angle=98.))
+        obj = build(chip=FakeBMI160(angle=98.))
         positive, _ = obj.choose_homing_direction(100., -45., 100.)
         self.assertTrue(positive)
     def test_the_tolerance_is_configurable(self):
-        obj = build({'homing_tolerance': 1.}, chip=FakeIMUChip(angle=2.))
+        obj = build({'homing_tolerance': 1.}, chip=FakeBMI160(angle=2.))
         positive, sweep = obj.choose_homing_direction(0., -90., 90.)
         self.assertFalse(positive)
         self.assertAlmostEqual(sweep, 3., places=3)
     def test_verify_passes_at_the_endstop(self):
-        obj = build(chip=FakeIMUChip(angle=-44.))
+        obj = build(chip=FakeBMI160(angle=-44.))
         obj.verify_home(-45.)
     def test_verify_fails_away_from_the_endstop(self):
         # A sensorless home that triggered before the head moved
-        obj = build(chip=FakeIMUChip(angle=30.))
+        obj = build(chip=FakeBMI160(angle=30.))
         with self.assertRaises(ConfigError) as cm:
             obj.verify_home(-45.)
         self.assertIn("G4 P2000", str(cm.exception))
-    def test_the_endstop_checks_need_a_fused_angle(self):
-        obj = build(chip=FakeAccelChip(angle=-20.))
-        with self.assertRaises(ConfigError) as cm:
-            obj.choose_homing_direction(40., -90., 90.)
-        self.assertIn("no gyroscope", str(cm.exception))
-        with self.assertRaises(ConfigError) as cm:
-            obj.verify_home(-20.)
-        self.assertIn("no gyroscope", str(cm.exception))
     def test_verify_can_be_disabled(self):
-        obj = build({'verify_home': False}, chip=FakeIMUChip(angle=30.))
+        obj = build({'verify_home': False}, chip=FakeBMI160(angle=30.))
         obj.verify_home(-45.)
 
 
@@ -1430,18 +1381,18 @@ class TestCalibrationHelpers(unittest.TestCase):
 
 class TestCorrectedMeasurement(unittest.TestCase):
     def test_an_offset_moves_an_uncalibrated_zero(self):
-        obj = build(chip=FakeIMUChip(angle=0., offset=(-980., 0., 0.)))
+        obj = build(chip=FakeBMI160(angle=0., offset=(-980., 0., 0.)))
         self.assertAlmostEqual(obj.measure_vertical(), -5.71, places=2)
     def test_the_configured_calibration_corrects_it(self):
         for fusion in (True, False):
             obj = build({'offset_u': -980.},
-                        chip=FakeIMUChip(angle=0., offset=(-980., 0., 0.)))
+                        chip=FakeBMI160(angle=0., offset=(-980., 0., 0.)))
             reading = obj.measure(fusion=fusion)
             angle = reading.fused_angle if fusion else reading.accel_angle
             self.assertAlmostEqual(angle, 0., places=6)
             self.assertAlmostEqual(reading.magnitude, G, places=6)
     def test_the_gain_ratio_corrects_an_intermediate_angle(self):
-        chip = FakeIMUChip(angle=45., gain=(1., 1., 1.05),
+        chip = FakeBMI160(angle=45., gain=(1., 1., 1.05),
                            offset=(0., 0., 70.))
         obj = build({'offset_w': 70., 'gain_ratio': 1.05}, chip=chip)
         self.assertAlmostEqual(obj.measure_vertical(), 45., places=6)
@@ -1491,7 +1442,7 @@ class TestSensorCalibration(unittest.TestCase):
     def test_it_fixes_the_zero_a_home_got_wrong(self):
         # The corertheta symptom: 100 mg of u offset homes the head to
         # about +5.7 deg, and after calibrating it homes to vertical
-        chip = FakeIMUChip(angle=30., offset=(-980., 300., 150.),
+        chip = FakeBMI160(angle=30., offset=(-980., 300., 150.),
                            gain=(1.01, 1., .98))
         obj, axis, configfile = build_calibration(chip)
         self.assertAlmostEqual(chip.angle, 5.66, delta=.3)
@@ -1515,12 +1466,12 @@ class TestSensorCalibration(unittest.TestCase):
         # being measured at the end of the sweep, beyond a soft limit
         self.assertNotIn("outside the soft limits", out)
     def test_the_sweep_visits_every_station_in_order(self):
-        chip = FakeIMUChip(angle=0.)
+        chip = FakeBMI160(angle=0.)
         obj, axis, _ = build_calibration(chip, home=False)
         self._calibrate(obj, axis, -40., 80., 7)
         self.assertEqual(axis.moves[:7], [-40., -20., 0., 20., 40., 60., 80.])
     def test_a_loaded_calibration_does_not_bias_the_next_one(self):
-        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.))
+        chip = FakeBMI160(angle=0., offset=(-980., 0., 150.))
         obj, axis, _ = build_calibration(chip, config_values={
             'offset_u': 400., 'offset_w': -300., 'gain_ratio': 1.1},
             home=False)
@@ -1529,13 +1480,13 @@ class TestSensorCalibration(unittest.TestCase):
         self.assertAlmostEqual(cal[1], 150., places=2)
         self.assertAlmostEqual(cal[2], 1., places=6)
     def test_a_drive_ratio_error_does_not_enter_the_fit(self):
-        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.))
+        chip = FakeBMI160(angle=0., offset=(-980., 0., 150.))
         obj, axis, _ = build_calibration(chip, ratio=.9, home=False)
         cal = self._calibrate(obj, axis)
         self.assertAlmostEqual(cal[0], -980., places=2)
         self.assertAlmostEqual(cal[2], 1., places=6)
     def test_a_medium_arc_fits_offsets_only(self):
-        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.),
+        chip = FakeBMI160(angle=0., offset=(-980., 0., 150.),
                            gain=(1., 1., 1.04))
         obj, axis, _ = build_calibration(chip, home=False)
         cal = self._calibrate(obj, axis, -45., 45., 9)
@@ -1543,26 +1494,26 @@ class TestSensorCalibration(unittest.TestCase):
         self.assertAlmostEqual(cal[0], -980., delta=5.)
         self.assertIn("offsets only fit", self._responses(obj))
     def test_gain_can_be_left_out(self):
-        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.))
+        chip = FakeBMI160(angle=0., offset=(-980., 0., 150.))
         obj, axis, _ = build_calibration(chip, home=False)
         cal = self._calibrate(obj, axis, gain=False)
         self.assertEqual(cal[2], 1.)
         self.assertIn("offsets only fit", self._responses(obj))
     def test_a_short_sweep_is_refused_before_moving(self):
-        obj, axis, configfile = build_calibration(FakeIMUChip(), home=False)
+        obj, axis, configfile = build_calibration(FakeBMI160(), home=False)
         with self.assertRaises(ConfigError) as cm:
             self._calibrate(obj, axis, -20., 20.)
         self.assertIn("at least 60", str(cm.exception))
         self.assertEqual(axis.moves, [])
         self.assertEqual(configfile.saved, {})
     def test_a_sweep_beyond_the_soft_limits_is_refused(self):
-        obj, axis, _ = build_calibration(FakeIMUChip(), home=False)
+        obj, axis, _ = build_calibration(FakeBMI160(), home=False)
         with self.assertRaises(ConfigError) as cm:
             self._calibrate(obj, axis, -90., 100.)
         self.assertIn("START=-90.00 is outside", str(cm.exception))
         self.assertEqual(axis.moves, [])
     def test_a_head_that_turns_less_than_commanded_is_refused(self):
-        obj, axis, configfile = build_calibration(FakeIMUChip(), ratio=.3,
+        obj, axis, configfile = build_calibration(FakeBMI160(), ratio=.3,
                                                   home=False)
         with self.assertRaises(ConfigError) as cm:
             self._calibrate(obj, axis)
@@ -1571,7 +1522,7 @@ class TestSensorCalibration(unittest.TestCase):
         self.assertEqual(obj.calibration, abh.IDENTITY_CALIBRATION)
         self.assertEqual(configfile.saved, {})
     def test_a_reversed_head_is_refused(self):
-        obj, axis, _ = build_calibration(FakeIMUChip(), ratio=-1.,
+        obj, axis, _ = build_calibration(FakeBMI160(), ratio=-1.,
                                          rng=(-100., 100.), home=False)
         with self.assertRaises(ConfigError) as cm:
             self._calibrate(obj, axis, -60., 60., 7)
@@ -1579,7 +1530,7 @@ class TestSensorCalibration(unittest.TestCase):
     def test_vectors_naming_the_wrong_pair_are_refused(self):
         # The head turns in x-z, but the config says x-y
         obj, axis, _ = build_calibration(
-            FakeIMUChip(angle=0.), home=False,
+            FakeBMI160(angle=0.), home=False,
             config_values={'zero_vector': '+z', 'positive_vector': '+y',
                            'max_magnitude_error': 0.})
         with self.assertRaises(ConfigError) as cm:
@@ -1587,7 +1538,7 @@ class TestSensorCalibration(unittest.TestCase):
         self.assertIn("the y axis varied least", str(cm.exception))
         self.assertIn("leave x as the rotation axis", str(cm.exception))
     def test_an_unbelievable_offset_is_refused(self):
-        chip = FakeIMUChip(angle=0., offset=(-4000., 0., 0.))
+        chip = FakeBMI160(angle=0., offset=(-4000., 0., 0.))
         obj, axis, configfile = build_calibration(
             chip, home=False, config_values={'max_magnitude_error': 0.})
         with self.assertRaises(ConfigError) as cm:
@@ -1596,14 +1547,14 @@ class TestSensorCalibration(unittest.TestCase):
         self.assertEqual(obj.calibration, abh.IDENTITY_CALIBRATION)
         self.assertEqual(configfile.saved, {})
     def test_an_endstop_rail_is_not_homed_again(self):
-        chip = FakeIMUChip(angle=0., offset=(-980., 0., 0.))
+        chip = FakeBMI160(angle=0., offset=(-980., 0., 0.))
         obj, axis, _ = build_calibration(chip, home=False)
         axis.has_endstop = True
         self._calibrate(obj, axis)
         self.assertEqual(axis.homes, 0)
         self.assertEqual(axis.moves[-1], 0.)
     def test_noise_leaves_the_zero_well_inside_tolerance(self):
-        chip = FakeIMUChip(angle=20., offset=(-980., 0., 150.), noise=150.,
+        chip = FakeBMI160(angle=20., offset=(-980., 0., 150.), noise=150.,
                            gain=(1., 1., 1.02))
         obj, axis, _ = build_calibration(chip, config_values={
             'sample_time': .7})
@@ -1612,7 +1563,7 @@ class TestSensorCalibration(unittest.TestCase):
 
 class TestSensorCalibrationCommand(unittest.TestCase):
     def _build(self, **params):
-        chip = FakeIMUChip(angle=0., offset=(-980., 0., 150.))
+        chip = FakeBMI160(angle=0., offset=(-980., 0., 150.))
         obj, axis, configfile = build_calibration(chip, home=False)
         obj.b_axis = axis
         return obj, axis, FakeGCmd(params)
@@ -1746,7 +1697,7 @@ def build_drive(ratio=1., backlash=0., rng=(-45., 100.), config_values=None,
                 noise=0.):
     values = dict(DRIVE_CALIBRATION)
     values.update(config_values or {})
-    chip = FakeIMUChip(angle=0., offset=DRIVE_OFFSET, noise=noise)
+    chip = FakeBMI160(angle=0., offset=DRIVE_OFFSET, noise=noise)
     obj, axis, configfile = build_calibration(chip, ratio, rng, values,
                                               home=False)
     axis.backlash = backlash
