@@ -894,13 +894,10 @@ the plans are the sequences the C test runs through the step compressor.
 
 ### What it does not do yet
 
-* **Only G-Code and probing moves are planned.**  Probing moves and
-  `RTCP_PROBE_MOVE` go straight to the toolhead rather than through
-  G-Code, so they ask `[polar_singularity]` for a planned move through
-  `probe.manual_move()`.  That matters: a round bed mesh probes the centre
-  on its middle row and carries straight on across it, which the step
-  compressor refuses when sent straight.  Anything else that moves the
-  toolhead directly is still only limited and refused, not planned.
+* **Only G-Code moves are planned.**  Anything that moves the toolhead
+  directly is only limited and refused by the move check.  Code that does
+  so near the centre is expected to plan its moves with
+  `CentrePlanner.plan()`, which needs nothing but positions.
 * **A tilted head is not stood upright.**  At the centre the RTCP
   correction asks for an arm on the far side of the middle as soon as B
   swings the tip outboard, and the reach check refuses it.  Centre moves

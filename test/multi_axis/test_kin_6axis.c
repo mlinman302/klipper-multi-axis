@@ -959,19 +959,6 @@ test_centre_path_step_generation(void)
           run_bed_sequence((const double (*)[3])planned, n, 50., 0.),
           0., 0.);
 
-    // A round bed mesh's middle row, probing the centre on the way
-    static const double row[3][3] = {
-        {-25., 0., 0.}, {0., 0., 0.}, {25., 0., 0.} };
-    check("mesh row through the centre, sent straight: refused",
-          run_bed_sequence(row, 2, 50., 0.) != 0, 1., 0.);
-    const double left[3] = {-25., 0., 0.};
-    memcpy(planned[0], left, sizeof(left));
-    planned[1][0] = -CP_PARK; planned[1][1] = 0.; planned[1][2] = 0.;
-    n = append_departure(planned, 1, M_PI, 0., 25.);
-    check("mesh row through the centre, planned: accepted",
-          run_bed_sequence((const double (*)[3])planned, n, 50., 0.),
-          0., 0.);
-
     // With RTCP on, tilt the head while standing on the centre
     static const double tilt[3][3] = {
         {0., 40., 0.}, {0., 0., 0.}, {0., 0., -10.} };

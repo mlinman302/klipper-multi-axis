@@ -484,16 +484,6 @@ class FakeToolhead:
         self.position = list(newpos)
 
 
-class FakePrinter:
-    def __init__(self, objects):
-        self.objects = objects
-        self.events = []
-    def lookup_object(self, name, default=None):
-        return self.objects.get(name, default)
-    def send_event(self, event, *args):
-        self.events.append(event)
-
-
 class TestTransform(unittest.TestCase):
     def build(self, position):
         obj = ps.PolarSingularity.__new__(ps.PolarSingularity)
@@ -531,51 +521,6 @@ class TestTransform(unittest.TestCase):
         sent = [p for p, speed in obj.toolhead.sent]
         self.assertEqual(sent[-1], pos(0., 40., 30.))
         self.assertLess(largest_step(bed_trace((40., 0.), sent)), STEP)
-
-
-class TestProbingMoves(unittest.TestCase):
-    # Probing moves go straight to the toolhead, and a round bed mesh
-    # probes the centre on its middle row, carrying straight on across it
-    def build(self, position):
-        obj = ps.PolarSingularity.__new__(ps.PolarSingularity)
-        obj.planner = make_planner()
-        obj.toolhead = FakeToolhead(position)
-        obj.printer = FakePrinter({'polar_singularity': obj,
-                                   'toolhead': obj.toolhead})
-        return obj
-
-    def test_a_mesh_row_through_the_centre_is_planned(self):
-        from extras import probe
-        obj = self.build(pos(-50., 0., 5.))
-        for x in (-25., 0., 25., 50.):
-            probe.manual_move(obj.printer, [x, 0.], 50.)
-            # The probe lifts between points
-            probe.manual_move(obj.printer, [None, None, 5.], 5.)
-        sent = [p for p, speed in obj.toolhead.sent]
-        self.assertLess(largest_step(bed_trace((-50., 0.), sent)), STEP)
-        self.assertEqual(obj.toolhead.position, pos(50., 0., 5.))
-        self.assertEqual(obj.printer.events,
-                         ["toolhead:manual_move"] * 8)
-        # Sent straight, the same row steps the bed at the centre
-        straight = [pos(x, 0., 5.) for x in (-25., 0., 25., 50.)]
-        self.assertGreater(largest_step(bed_trace((-50., 0.), straight)),
-                           3.)
-
-    def test_the_probe_stands_where_it_was_asked_to(self):
-        from extras import probe
-        obj = self.build(pos(25., 0., 5.))
-        probe.manual_move(obj.printer, [0., 0.], 50.)
-        x, y = obj.toolhead.position[:2]
-        self.assertLess(math.hypot(x, y), 1e-3)
-
-    def test_without_the_module_it_is_the_toolhead(self):
-        from extras import probe
-        toolhead = FakeToolhead(pos(0., 0.))
-        moves = []
-        toolhead.manual_move = lambda coord, speed: moves.append(
-            (coord, speed))
-        probe.manual_move(FakePrinter({'toolhead': toolhead}), [1., 2.], 3.)
-        self.assertEqual(moves, [([1., 2.], 3.)])
 
 
 if __name__ == '__main__':

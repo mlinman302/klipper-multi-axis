@@ -2717,12 +2717,9 @@ the bed, which is harmless on a travel move and leaves a blob on a
 printed one, hence the different defaults. A move that is merely slowed
 is split so that only its part close to the centre runs slowly.
 
-G-Code moves are planned, and so are probing moves and
-`RTCP_PROBE_MOVE`, which go straight to the toolhead - a round bed mesh
-crosses the centre on its middle row. Other moves made directly on the
-toolhead are only limited and refused. A tilted head is not stood
-upright for a move across the centre - with `[rtcp]` on, centre moves
-are for `B` near zero.
+Only G-Code moves are planned; moves made directly on the toolhead are
+only limited and refused. A tilted head is not stood upright for a move
+across the centre - with `[rtcp]` on, centre moves are for `B` near zero.
 
 See [Multi_Axis.md](Multi_Axis.md).
 

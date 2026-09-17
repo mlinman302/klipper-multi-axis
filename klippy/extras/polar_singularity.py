@@ -50,7 +50,7 @@
 # Two things, at two different altitudes.
 #
 # A move check, which every move reaching the toolhead passes through -
-# including the ones no g-code transform ever sees, such as probing moves.
+# including the ones no g-code transform ever sees.
 # It slows a move that passes near the centre to the bed's angular limits,
 # and refuses one that crosses the axis or that would have to crawl below
 # min_velocity to stay inside them.
@@ -71,11 +71,10 @@
 #
 # WHAT IT DOES NOT DO YET
 #
-# It does not stand a tilted head upright for a centre transit.  And of
-# the moves that go straight to the toolhead rather than through g-code,
-# only the ones that call manual_move() below are planned - probing does,
-# through probe.manual_move(), because a round bed mesh crosses the centre
-# on its middle row.  Anything else is only seen by the move check.
+# It does not stand a tilted head upright for a centre transit.  And it
+# only plans g-code moves: anything that moves the toolhead itself is seen
+# by the move check alone, and has to plan its own moves with
+# kinematics/centre_path.py if they touch the centre.
 import math
 from kinematics import centre_path
 from kinematics.bed_centre import (
@@ -162,19 +161,6 @@ class PolarSingularity:
                 machine_xy, self.last_position, newpos, speed):
             self.next_transform.move(pos, move_speed)
         self.last_position[:] = newpos
-    def manual_move(self, coord, speed):
-        # toolhead.manual_move(), planned.  For moves that go straight to
-        # the toolhead rather than through g-code - probing, above all -
-        # so they are in the toolhead's frame, below every transform.
-        start = self.toolhead.get_position()
-        end = list(start)
-        for i, value in enumerate(coord):
-            if value is not None:
-                end[i] = value
-        for pos, move_speed in self.planner.plan(start[:2], start, end,
-                                                 speed):
-            self.toolhead.move(pos, move_speed)
-        self.printer.send_event("toolhead:manual_move")
 
     ######################################################################
     # Move checking

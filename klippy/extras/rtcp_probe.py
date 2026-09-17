@@ -43,7 +43,7 @@
 # See docs/Multi_Axis.md.
 import math
 import stepper
-from . import manual_probe, probe, rtcp
+from . import manual_probe, rtcp
 
 # Index of the B coordinate within a toolhead position vector
 B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
@@ -354,8 +354,7 @@ class RTCPProbe:
         bed_y = gcmd.get_float('Y', 0.)
         speed = gcmd.get_float('F', self.orient_speed, above=0.)
         toolpos = self.bed_to_tool((bed_x, bed_y))
-        # Planned, since the bed centre is a legal probe target
-        probe.manual_move(self.printer, toolpos, speed)
+        self.toolhead.manual_move(toolpos, speed)
         gcmd.respond_info(
             "rtcp_probe: probe over bed %.3f,%.3f - head at %.3f,%.3f"
             % (bed_x, bed_y, toolpos[0], toolpos[1]))
