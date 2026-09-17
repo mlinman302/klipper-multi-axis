@@ -17,8 +17,9 @@
 # angular velocity diverges as 1/r on the approach and its angular
 # acceleration as 1/r^2, so a near miss is the same problem with a finite
 # but still unreachable number attached to it.  The geometry, and the
-# limits that follow from it, are derived at the top of
-# klippy/kinematics/polar.py.
+# limits that follow from it, are derived in
+# klippy/kinematics/bed_centre.py; this file only decides what to do
+# with them.
 #
 # WHAT COUNTS AS SINGULAR
 #
@@ -53,18 +54,10 @@
 # and both are decisions the machine's owner has to make rather than
 # something to do silently underneath them.
 import math
-from kinematics.polar import (path_geometry, swept_angle,
-                              peak_angular_velocity, peak_angular_accel,
-                              limits_for_angular_rates, NO_ACCEL_LIMIT)
-
-# Within this radius of the centre the bed angle is not meaningfully
-# defined, and a change of angle there is a discrete jump rather than a
-# rate that can be slowed down.  Kept identical to BED_MIN_RADIUS in
-# klippy/chelper/kin_corertheta.c, which is the same disc, used there to
-# make set_position() at the centre well defined.
-CENTRE_RADIUS = 0.010
-# A sweep smaller than this is not worth refusing a move over
-MIN_SWEPT_ANGLE = math.radians(1.)
+from kinematics.bed_centre import (
+    CENTRE_RADIUS, path_geometry, swept_angle, crosses_centre,
+    peak_angular_velocity, peak_angular_accel, limits_for_angular_rates)
+from kinematics.polar import NO_ACCEL_LIMIT
 
 
 class PolarSingularity:
@@ -121,7 +114,7 @@ class PolarSingularity:
         self.last_radius = r_min
         self.last_swept = swept
         self.last_velocity_limit = 0.
-        if r_min <= CENTRE_RADIUS and abs(swept) >= MIN_SWEPT_ANGLE:
+        if crosses_centre(r_min, swept):
             # The path crosses the axis itself.  There is no rate here to
             # slow down - the bed angle steps, and no feedrate makes a step
             # take longer.  A dead straight line across the centre is the

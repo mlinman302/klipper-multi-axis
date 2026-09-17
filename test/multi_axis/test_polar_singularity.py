@@ -1,6 +1,8 @@
 #!/usr/bin/env python
-# Host test of the bed centre singularity geometry and limits
-# (klippy/kinematics/polar.py and klippy/extras/polar_singularity.py).
+# Host test of the bed centre move check and feedrate limit
+# (klippy/extras/polar_singularity.py and limit_centre_speed() in
+# klippy/kinematics/polar.py).  The geometry underneath both is covered by
+# test_bed_centre.py.
 #
 # Copyright (C) 2026  Klipper multi-axis contributors
 #
@@ -24,11 +26,8 @@ sys.path.insert(0, os.path.normpath(KLIPPY_DIR))
 # stepper.py imports mcu, which needs pyserial; nothing under test uses it
 sys.modules.setdefault('mcu', types.ModuleType('mcu'))
 
-from kinematics import polar
+from kinematics import bed_centre, polar
 from extras import polar_singularity as ps
-
-# The coefficient the angular acceleration peaks at, 9 / (8 * sqrt(3))
-ALPHA_PEAK = 9. / (8. * math.sqrt(3.))
 
 
 ######################################################################
@@ -66,146 +65,6 @@ def build_checker(max_angular_v=5., max_angular_a=0., min_velocity=0.5):
     chk.min_velocity = min_velocity
     chk.last_radius = chk.last_swept = chk.last_velocity_limit = 0.
     return chk
-
-
-######################################################################
-# Geometry
-######################################################################
-
-class TestPathGeometry(unittest.TestCase):
-    def test_chord_reaches_its_closest_approach(self):
-        # A chord from (40, -30) to (40, 30) has a radius of 50 at both
-        # ends and dips to 40 in the middle
-        offset, r_min, u_start, u_end = polar.path_geometry((40., -30.),
-                                                            (40., 30.))
-        self.assertAlmostEqual(abs(offset), 40.)
-        self.assertAlmostEqual(r_min, 40.)
-        # The endpoints straddle the foot of the perpendicular
-        self.assertLessEqual(u_start * u_end, 0.)
-
-    def test_closest_approach_at_an_endpoint(self):
-        # An outbound move never comes closer than where it started
-        offset, r_min, u_start, u_end = polar.path_geometry((10., 0.),
-                                                            (30., 0.1))
-        self.assertAlmostEqual(r_min, 10., places=4)
-        self.assertGreater(u_start * u_end, 0.)
-
-    def test_radial_paths_have_no_offset(self):
-        # A radial move, a move departing the centre and a move arriving
-        # at it all leave the bed angle alone
-        for start, end in (((10., 0.), (30., 0.)),
-                           ((0., 0.), (10., 0.)),
-                           ((50., 50.), (0., 0.)),
-                           ((15., 15.), (20., 20.))):
-            offset = polar.path_geometry(start, end)[0]
-            self.assertAlmostEqual(offset, 0.,
-                                   msg="%s -> %s" % (start, end))
-
-    def test_zero_length_path(self):
-        offset, r_min, u_start, u_end = polar.path_geometry((3., 4.),
-                                                            (3., 4.))
-        self.assertAlmostEqual(offset, 0.)
-        self.assertAlmostEqual(r_min, 5.)
-
-
-class TestSweptAngle(unittest.TestCase):
-    def test_straight_across_the_centre_is_half_a_turn(self):
-        self.assertAlmostEqual(abs(polar.swept_angle((10., 0.), (-10., 0.))),
-                               math.pi)
-        self.assertAlmostEqual(abs(polar.swept_angle((30., 30.),
-                                                     (-30., -30.))),
-                               math.pi)
-
-    def test_quarter_turn_and_its_sign(self):
-        self.assertAlmostEqual(polar.swept_angle((10., 0.), (0., 10.)),
-                               math.pi / 2.)
-        self.assertAlmostEqual(polar.swept_angle((0., 10.), (10., 0.)),
-                               -math.pi / 2.)
-
-    def test_an_endpoint_on_the_centre_sweeps_nothing(self):
-        # The centre has no angle of its own, so departing along a ray and
-        # arriving along one are zero sweeps rather than undefined ones
-        self.assertAlmostEqual(polar.swept_angle((0., 0.), (10., 0.)), 0.)
-        self.assertAlmostEqual(polar.swept_angle((50., 50.), (0., 0.)), 0.)
-
-
-class TestAngularRates(unittest.TestCase):
-    def test_peak_velocity_is_v_over_r_min(self):
-        offset, r_min, u_start, u_end = polar.path_geometry((40., -30.),
-                                                            (40., 30.))
-        self.assertAlmostEqual(polar.peak_angular_velocity(100., offset,
-                                                           r_min),
-                               100. / 40.)
-
-    def test_peak_accel_matches_the_closed_form(self):
-        offset, r_min, u_start, u_end = polar.path_geometry((40., -30.),
-                                                            (40., 30.))
-        self.assertAlmostEqual(
-            polar.peak_angular_accel(100., offset, u_start, u_end),
-            ALPHA_PEAK * 100. ** 2 / 40. ** 2)
-
-    def test_a_radial_path_turns_the_bed_at_no_rate(self):
-        offset, r_min, u_start, u_end = polar.path_geometry((0., 0.),
-                                                            (10., 0.))
-        self.assertEqual(polar.peak_angular_velocity(100., offset, r_min), 0.)
-        self.assertEqual(polar.peak_angular_accel(100., offset,
-                                                  u_start, u_end), 0.)
-
-    def test_rates_diverge_as_the_path_tightens(self):
-        # theta_dot as 1/r and theta_ddot as 1/r^2 - the whole reason a
-        # velocity limit alone is not enough
-        rates = []
-        for r in (40., 20., 10., 5., 2.5):
-            offset, r_min, u_start, u_end = polar.path_geometry((r, -30.),
-                                                                (r, 30.))
-            rates.append((polar.peak_angular_velocity(100., offset, r_min),
-                          polar.peak_angular_accel(100., offset,
-                                                   u_start, u_end)))
-        for (w0, a0), (w1, a1) in zip(rates, rates[1:]):
-            self.assertAlmostEqual(w1 / w0, 2.)
-            self.assertAlmostEqual(a1 / a0, 4., delta=1e-6)
-
-
-class TestRateLimits(unittest.TestCase):
-    def test_velocity_limit_meets_the_angular_velocity_exactly(self):
-        offset, r_min, u_start, u_end = polar.path_geometry((40., -30.),
-                                                            (40., 30.))
-        v_limit, a_limit = polar.limits_for_angular_rates(
-            offset, r_min, u_start, u_end, 5., 0.)
-        self.assertAlmostEqual(
-            polar.peak_angular_velocity(v_limit, offset, r_min), 5.)
-        self.assertIsNone(a_limit)
-
-    def test_velocity_limit_meets_the_angular_accel_exactly(self):
-        offset, r_min, u_start, u_end = polar.path_geometry((40., -30.),
-                                                            (40., 30.))
-        v_limit, a_limit = polar.limits_for_angular_rates(
-            offset, r_min, u_start, u_end, 0., 200.)
-        self.assertAlmostEqual(
-            polar.peak_angular_accel(v_limit, offset, u_start, u_end), 200.)
-        # The move's own acceleration is bounded through a*offset/r^2
-        self.assertAlmostEqual(a_limit * abs(offset) / (r_min * r_min), 200.)
-
-    def test_a_radial_path_is_not_limited(self):
-        offset, r_min, u_start, u_end = polar.path_geometry((0., 0.),
-                                                            (10., 0.))
-        self.assertEqual(polar.limits_for_angular_rates(
-            offset, r_min, u_start, u_end, 5., 200.), (None, None))
-
-    def test_the_velocity_limit_holds_the_accel_below_a_fixed_figure(self):
-        # Wherever the velocity limit binds, the feedrate it leaves is
-        # max_angular_velocity * r_min, and the angular acceleration at
-        # that feedrate is 0.65 * max_angular_velocity^2 whatever the
-        # radius.  So a max_angular_accel above that figure never limits a
-        # feedrate - which is worth knowing before setting one.
-        for r in (0.5, 5., 20., 40.):
-            offset, r_min, u_start, u_end = polar.path_geometry((r, -30.),
-                                                                (r, 30.))
-            v_limit = polar.limits_for_angular_rates(
-                offset, r_min, u_start, u_end, 5., 0.)[0]
-            self.assertAlmostEqual(
-                polar.peak_angular_accel(v_limit, offset, u_start, u_end),
-                ALPHA_PEAK * 5. ** 2, delta=1e-6)
 
 
 ######################################################################
@@ -274,14 +133,14 @@ class TestMoveCheck(unittest.TestCase):
     def test_a_near_miss_is_slowed_to_the_bed_limit(self):
         for r in (0.15, 1., 5., 20.):
             move = self.check((r, -30.), (r, 30.))
-            offset, r_min, u_start, u_end = polar.path_geometry(
+            offset, r_min, u_start, u_end = bed_centre.path_geometry(
                 move.start_pos, move.end_pos)
             velocity = move.cruise_velocity()
             self.assertAlmostEqual(
-                polar.peak_angular_velocity(velocity, offset, r_min), 5.,
+                bed_centre.peak_angular_velocity(velocity, offset, r_min), 5.,
                 msg="r_min=%s" % (r_min,))
             self.assertLessEqual(
-                polar.peak_angular_accel(velocity, offset, u_start, u_end),
+                bed_centre.peak_angular_accel(velocity, offset, u_start, u_end),
                 50. + 1e-6)
 
     def test_a_wide_path_is_left_alone(self):
@@ -305,7 +164,7 @@ class TestMoveCheck(unittest.TestCase):
         status = self.chk.get_status(0.)
         self.assertAlmostEqual(status['last_radius'], 5.)
         self.assertAlmostEqual(abs(status['last_swept_angle']),
-                               math.degrees(abs(polar.swept_angle(
+                               math.degrees(abs(bed_centre.swept_angle(
                                    (5., -20.), (5., 20.)))))
         self.assertAlmostEqual(status['last_velocity_limit'], 25.)
 

@@ -27,6 +27,7 @@
 #include <stddef.h> // offsetof
 #include <stdlib.h> // malloc
 #include <string.h> // memset
+#include "bed_centre.h" // bed_centre_angle
 #include "compiler.h" // __visible
 #include "itersolve.h" // struct stepper_kinematics
 #include "pyhelper.h" // errorf
@@ -37,12 +38,6 @@ struct corertheta_stepper {
     double b_ratio;
 };
 
-// Below this radius (in mm) the polar angle is not meaningfully defined:
-// an arbitrarily small change in x/y swings atan2 by up to pi, and at
-// exactly x==y==0 it is degenerate.  Bed rotation also has no effect on
-// the tool position there.
-#define BED_MIN_RADIUS 0.010
-
 // Bed rotation - the polar angle of the commanded cartesian position.
 // The radius that goes with it is what the two gantry solvers below
 // compute as sqrt(x*x + y*y) - the R coordinate of the arm.
@@ -51,32 +46,16 @@ corertheta_stepper_bed_calc_position(struct stepper_kinematics *sk
                                      , struct move *m, double move_time)
 {
     struct coord c = move_get_coord(m, move_time);
-    double angle;
-    if (c.x*c.x + c.y*c.y >= BED_MIN_RADIUS * BED_MIN_RADIUS
-        || (!m->axes_r.x && !m->axes_r.y)) {
-        angle = atan2(c.y, c.x);
-    } else {
-        // Inside the dead zone the angle is indeterminate, so take it from
-        // the direction of travel: the angle the path has where it leaves
-        // the zone, or - while the tool is still heading inward - where it
-        // entered.  The bed is then already at the right angle by the time
-        // the radius becomes meaningful again, so nothing has to turn at
-        // the boundary.
-        //
-        // This has to stay a pure function of (move, move_time).
-        // itersolve_set_position() runs this same callback over a zeroed
-        // move, so returning sk->commanded_pos here would make setting the
-        // position at the centre a no-op: the R home forces the toolhead to
-        // (position_min, 0), and with a position_min of zero that left the
-        // bed holding the angle of the last print move and then whipped it
-        // round as soon as the homing move carried the radius out of the
-        // dead zone - thousands of bed steps in a few microseconds, which
-        // the step compressor reports as "Internal error in stepcompress".
-        angle = atan2(m->axes_r.y, m->axes_r.x);
-        if (c.x * m->axes_r.x + c.y * m->axes_r.y < 0.)
-            // Heading inward - the zone was entered from the far side
-            angle += angle > 0. ? -M_PI : M_PI;
-    }
+    // Inside a small disc at the centre the angle comes from the
+    // direction of travel rather than the position - see bed_centre.h.
+    // It has to stay a pure function of (move, move_time): the R home
+    // forces the toolhead to (position_min, 0), and with a position_min
+    // of zero a rule that held the last angle left the bed where the last
+    // print move put it and then whipped it round as soon as the homing
+    // move carried the radius out of the disc - thousands of bed steps in
+    // a few microseconds, which the step compressor reports as "Internal
+    // error in stepcompress".
+    double angle = bed_centre_angle(m, &c);
     if (angle - sk->commanded_pos > M_PI)
         angle -= 2. * M_PI;
     else if (angle - sk->commanded_pos < -M_PI)

@@ -247,7 +247,7 @@ class CoreRThetaKinematics:
         # Slow down near center.  A move whose closest approach to the
         # centre was zero used to return here without being limited at
         # all - the one move that most needs the limit was the one move
-        # that escaped it.  See the geometry notes at the top of polar.py.
+        # that escaped it.  See the geometry notes in bed_centre.py.
         # [polar_singularity], loaded above, adds the angular acceleration
         # limit and refuses the moves no feedrate can rescue.
         if self.v_rad_max and (move.axes_d[0] or move.axes_d[1]):

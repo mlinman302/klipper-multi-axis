@@ -44,6 +44,7 @@
 # the velocity or acceleration planning.
 import math
 import chelper, stepper
+from kinematics import bed_centre
 
 # Only a B axis head (tilting about an axis parallel to Y) is modelled.
 RTCP_AXIS_GCODE_ID = 'B'
@@ -54,9 +55,6 @@ B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
 FRAME_CARTESIAN = 0
 FRAME_RADIAL = 1
 FRAME_NAMES = {'cartesian': FRAME_CARTESIAN, 'radial': FRAME_RADIAL}
-# Below this radius the bed angle is meaningless, so a radial correction
-# is applied along +x instead of being scaled onto x and y
-RADIAL_EPSILON = 1e-9
 # Kinematics whose x/y are bed coordinates and whose arm travels in
 # radius, so the tip swings along the arm rather than along +X
 RADIAL_KINEMATICS = ('corertheta', 'polar')
@@ -218,7 +216,7 @@ class RTCP:
         dh, dz = sign * dh, sign * dz
         if self.frame == FRAME_RADIAL:
             radius = math.hypot(res[0], res[1])
-            if radius > RADIAL_EPSILON:
+            if radius > bed_centre.CENTRE_EPSILON:
                 # Scaling x and y together moves the arm radius and
                 # leaves the bed angle alone
                 scale = (radius + dh) / radius
@@ -269,15 +267,12 @@ class RTCP:
         # move, so interpolating the whole position vector is exact.
         sp, ep = move.start_pos, move.end_pos
         ts = []
-        if self.b_project is not None and (sp[1] < 0.) != (ep[1] < 0.):
-            ts.append(sp[1] / (sp[1] - ep[1]))
+        if self.b_project is not None:
+            ts.append(bed_centre.axis_crossing_fraction(sp, ep, 1))
         if self.frame == FRAME_RADIAL:
-            dx, dy = ep[0] - sp[0], ep[1] - sp[1]
-            d2 = dx * dx + dy * dy
-            if d2 > 0.:
-                ts.append(-(sp[0] * dx + sp[1] * dy) / d2)
-        return [[s + t * (e - s) for s, e in zip(sp, ep)]
-                for t in ts if 0. < t < 1.]
+            ts.append(bed_centre.closest_approach_fraction(sp, ep))
+        return [bed_centre.interpolate(sp, ep, t)
+                for t in ts if t is not None]
 
     def _check_move(self, move):
         # The kinematics checked the *tip* position; make sure the machine

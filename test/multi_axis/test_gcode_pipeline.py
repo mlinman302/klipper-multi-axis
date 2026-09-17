@@ -30,6 +30,7 @@ import stepper as stepper_mod
 import toolhead as toolhead_mod
 from extras import gcode_move as gcode_move_mod
 from kinematics import rotary_axis as rotary_axis_mod
+from kinematics import bed_centre
 from extras import rtcp as rtcp_mod
 from extras import b_projection as bproject_mod
 
@@ -874,8 +875,8 @@ def _project_b(b, x, y, max_angle, taper_range):
     ab = abs(b)
     if max_angle <= 0. or ab >= max_angle + taper_range:
         return b
-    r2 = x * x + y * y
-    cos_t = x / math.sqrt(r2) if r2 >= 0.010**2 else 1.
+    # A position, not a move, so the static form of the bed angle
+    cos_t = bed_centre.cos_bed_angle(x, y)
     w = 1.
     if ab > max_angle:
         t = (ab - max_angle) / taper_range

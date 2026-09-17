@@ -39,17 +39,12 @@
 #include <stddef.h> // offsetof
 #include <stdlib.h> // malloc
 #include <string.h> // memset
+#include "bed_centre.h" // bed_centre_cos
 #include "compiler.h" // __visible
 #include "itersolve.h" // struct stepper_kinematics
 #include "trapq.h" // struct move
 
 #define DUMMY_T 500.0
-
-// Below this radius (in mm) the bed angle is not meaningfully defined.
-// Kept identical to kin_corertheta.c, whose dead zone handling this
-// mirrors so that the bed angle used here is the one the bed motor is
-// actually being driven to.
-#define BED_MIN_RADIUS 0.010
 
 struct bproject_stepper {
     struct stepper_kinematics sk;
@@ -57,29 +52,6 @@ struct bproject_stepper {
     struct move m;
     double max_angle, taper_range;
 };
-
-// cos() of the bed angle at a sampled position.  Inside the dead zone the
-// angle comes from the direction of travel, exactly as the bed solver in
-// kin_corertheta.c resolves it, so the two never disagree.
-static double
-bproject_cos_bed_angle(struct move *m, struct coord *c)
-{
-    double r2 = c->x * c->x + c->y * c->y;
-    if (r2 >= BED_MIN_RADIUS * BED_MIN_RADIUS)
-        return c->x / sqrt(r2);
-    double rx = m->axes_r.x, ry = m->axes_r.y;
-    double rn2 = rx * rx + ry * ry;
-    if (rn2 <= 0.)
-        // Not moving in xy and sitting on the centre - the bed angle has
-        // no effect on anything, so leave B alone
-        return 1.;
-    double cos_t = rx / sqrt(rn2);
-    if (c->x * rx + c->y * ry < 0.)
-        // Heading inward - the zone was entered from the far side, which
-        // is the bed angle turned by pi
-        cos_t = -cos_t;
-    return cos_t;
-}
 
 // The projection itself.  Exposed so that the host code can apply the
 // same mapping to a single position without going through a stepper.
@@ -94,7 +66,7 @@ bproject_project_b(double b, double x, double y
     struct move m;
     memset(&m, 0, sizeof(m));
     struct coord c = { .x = x, .y = y };
-    double cos_t = bproject_cos_bed_angle(&m, &c);
+    double cos_t = bed_centre_cos(&m, &c);
     double w = 1.;
     if (ab > max_angle) {
         // Smoothstep the correction away over the taper band, so the
@@ -119,7 +91,7 @@ bproject_calc_position(struct stepper_kinematics *sk, struct move *m
     double ab = fabs(pos.b);
     double none_angle = bs->max_angle + bs->taper_range;
     if (bs->max_angle > 0. && ab < none_angle) {
-        double cos_t = bproject_cos_bed_angle(m, &pos);
+        double cos_t = bed_centre_cos(m, &pos);
         double w = 1.;
         if (ab > bs->max_angle) {
             double t = (ab - bs->max_angle) / bs->taper_range;

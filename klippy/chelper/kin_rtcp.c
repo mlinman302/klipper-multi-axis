@@ -70,6 +70,7 @@
 #include <stddef.h> // offsetof
 #include <stdlib.h> // malloc
 #include <string.h> // memset
+#include "bed_centre.h" // BED_CENTRE_EPSILON
 #include "compiler.h" // __visible
 #include "itersolve.h" // struct stepper_kinematics
 #include "kin_rtcp.h" // RTCP_FRAME_RADIAL
@@ -77,9 +78,6 @@
 
 #define DUMMY_T 500.0
 #define DEG_TO_RAD (M_PI / 180.)
-// Below this radius the bed angle is meaningless, so a radial correction
-// is applied along +x instead of being scaled onto x and y
-#define RADIAL_EPSILON 1e-9
 
 struct rtcp_stepper {
     struct stepper_kinematics sk;
@@ -107,7 +105,7 @@ rtcp_apply(int frame, double dh, double dz, double *x, double *y, double *z)
 {
     if (frame == RTCP_FRAME_RADIAL) {
         double radius = sqrt(*x * *x + *y * *y);
-        if (radius > RADIAL_EPSILON) {
+        if (radius > BED_CENTRE_EPSILON) {
             double scale = (radius + dh) / radius;
             *x *= scale;
             *y *= scale;
@@ -252,7 +250,7 @@ rtcp_machine_to_tool(double tool_h, double tool_v, int frame, double b
     if (frame == RTCP_FRAME_RADIAL) {
         double radius = sqrt(pos_xyz[0] * pos_xyz[0]
                              + pos_xyz[1] * pos_xyz[1]);
-        if (radius > RADIAL_EPSILON) {
+        if (radius > BED_CENTRE_EPSILON) {
             double scale = (radius - dh) / radius;
             pos_xyz[0] *= scale;
             pos_xyz[1] *= scale;

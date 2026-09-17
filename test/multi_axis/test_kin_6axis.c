@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include "bed_centre.h" // BED_CENTRE_RADIUS
 #include "itersolve.h"
 #include "kin_rtcp.h" // RTCP_FRAME_CARTESIAN
 #include "list.h"
@@ -211,8 +212,7 @@ test_core_r_theta(void)
     trapq_free(tq_xc);
 }
 
-// Mirrors BED_MIN_RADIUS in kin_corertheta.c
-#define BED_HOLD_R 0.010
+#define BED_HOLD_R BED_CENTRE_RADIUS
 
 static void
 test_corertheta(void)
@@ -742,6 +742,96 @@ test_b_projection(void)
           5. - L * sin(10. * M_PI / 180.), 1e-9);
 }
 
+// The dead zone rule of bed_centre.h, which both the bed solver and the B
+// projection now take their angle from.  The table is repeated in
+// test/multi_axis/test_bed_centre.py against the Python mirror, so the
+// two languages are pinned to the same answers.
+struct bed_centre_case {
+    const char *what;
+    double x, y, rx, ry, angle;
+};
+
+static const struct bed_centre_case bed_centre_cases[] = {
+    { "outside, static, +x",           50.,    0.,     0.,  0.,  0. },
+    { "outside, static, +y",           0.,     50.,    0.,  0.,  M_PI / 2. },
+    { "inside, static, off centre",    -0.005, 0.,     0.,  0.,  M_PI },
+    { "on the centre, static",         0.,     0.,     0.,  0.,  0. },
+    { "inside, heading in along +x",   -0.005, 0.,     1.,  0.,  M_PI },
+    { "inside, heading out along +x",  0.005,  0.,     1.,  0.,  0. },
+    { "on the centre, along +x",       0.,     0.,     1.,  0.,  0. },
+    { "on the centre, along -x",       0.,     0.,     -1., 0.,  M_PI },
+    { "inside, heading in along -x",   0.005,  0.,     -1., 0.,  0. },
+    { "inside, heading out along +y",  0.003,  0.004,  0.,  1.,  M_PI / 2. },
+    { "outside, moving, +x",           0.02,   0.,     0.,  1.,  0. },
+    { "inside, heading in along +y",   0.,     -0.005, 0.,  1.,  -M_PI / 2. },
+};
+
+static void
+test_bed_centre(void)
+{
+    printf("\n-- bed_centre.h: one bed angle for every solver --\n");
+    size_t i;
+    for (i = 0; i < sizeof(bed_centre_cases) / sizeof(bed_centre_cases[0]);
+         i++) {
+        const struct bed_centre_case *bc = &bed_centre_cases[i];
+        struct move m = { .axes_r = { .x = bc->rx, .y = bc->ry } };
+        struct coord c = { .x = bc->x, .y = bc->y };
+        char what[80];
+        snprintf(what, sizeof(what), "angle: %s", bc->what);
+        check(what, bed_centre_angle(&m, &c), bc->angle, 1e-12);
+        // The cosine form skips the atan2 on the common path, and must
+        // still be the cosine of the same angle
+        snprintf(what, sizeof(what), "cos:   %s", bc->what);
+        check(what, bed_centre_cos(&m, &c), cos(bc->angle), 1e-12);
+    }
+    check("half turn of 0", bed_centre_half_turn(0.), M_PI, 0.);
+    check("half turn of pi", bed_centre_half_turn(M_PI), 0., 0.);
+    check("half turn of -pi/2", bed_centre_half_turn(-M_PI / 2.),
+          M_PI / 2., 1e-15);
+
+    // End to end: the bed solver and the projection wrapped around a
+    // gantry motor, for a B-only move with the tool held just off the
+    // centre on the -x side.  The bed is driven to pi there, so a lean
+    // toward the bed's +x is a lean toward the machine's inboard side:
+    // the projection has to invert B.  It used to leave B untouched here,
+    // disagreeing with the bed about which way it was facing.
+    const double MA = 1e30, TR = 1.;
+    double t0 = 0.1, move_t = 1.0;
+    double held[KIN_AXES] = {-0.005, 0., 0., 0., 0., 0.};
+    double d_b[KIN_AXES] = {0., 0., 0., 0., 10., 0.};
+    struct trapq *tq = queue_move(t0, move_t, held, d_b);
+    struct stepper_kinematics *bed = corertheta_stepper_alloc('c', 1.);
+    bed->commanded_pos = M_PI;
+    check("static off centre: bed angle",
+          sample(tq, bed, t0 + move_t), M_PI, 1e-12);
+    struct stepper_kinematics *plus = bproject_alloc();
+    bproject_set_sk(plus, corertheta_stepper_alloc('+', 1.));
+    bproject_set_params(plus, MA, TR);
+    check("static off centre: projected B follows the bed",
+          sample(tq, plus, t0 + move_t), -10. + 0.005, 1e-12);
+
+    // And moving: B held at 10 while the tool sweeps -1 -> +1 along x.
+    // Inside the disc the projection takes the same travel-derived angle
+    // as the bed - pi on the way in, 0 on the way out.
+    double thru[KIN_AXES] = {-1., 0., 0., 0., 10., 0.};
+    double d_thru[KIN_AXES] = {2., 0., 0., 0., 0., 0.};
+    struct trapq *tq_o = queue_move(t0, move_t, thru, d_thru);
+    double t_in = t0 + move_t * (1. - BED_HOLD_R / 2.) / 2.;   // x=-hold/2
+    double t_out = t0 + move_t * (1. + BED_HOLD_R / 2.) / 2.;  // x=+hold/2
+    bed->commanded_pos = M_PI;
+    check("sweep, heading in: bed angle",
+          sample(tq_o, bed, t_in), M_PI, 1e-9);
+    check("sweep, heading in: projected B",
+          sample(tq_o, plus, t_in), -10. + BED_HOLD_R / 2., 1e-9);
+    bed->commanded_pos = 0.;
+    check("sweep, heading out: bed angle",
+          sample(tq_o, bed, t_out), 0., 1e-9);
+    check("sweep, heading out: projected B",
+          sample(tq_o, plus, t_out), 10. + BED_HOLD_R / 2., 1e-9);
+    trapq_free(tq);
+    trapq_free(tq_o);
+}
+
 int
 main(void)
 {
@@ -754,6 +844,7 @@ main(void)
     test_set_position_and_active_axis();
     test_rtcp();
     test_b_projection();
+    test_bed_centre();
     benchmark();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures != 0;

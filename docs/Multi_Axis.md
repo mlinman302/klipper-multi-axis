@@ -147,18 +147,22 @@ klippy/chelper/kin_generic.c       linear combination of all six axes
 klippy/chelper/kin_rotary_axis.c   the uncoupled rotational stepper
 klippy/chelper/kin_rtcp.c          the RTCP transform (wraps a solver)
 klippy/chelper/kin_bproject.c      the bed-frame B projection (wraps a solver)
+klippy/chelper/bed_centre.h        the bed centre dead zone, shared by the
+                                     bed solver and the B projection
 klippy/chelper/__init__.py         build + cffi declarations
 klippy/stepper.py                  kin_coords() - the position gather
 klippy/toolhead.py                 position vector, Move, trapq_append
 klippy/kinematics/rotary_axis.py   RotaryAxis / CoupledRotaryAxis
 klippy/kinematics/generic_cartesian.py  a/b/c carriages
 klippy/kinematics/kinematic_stepper.py  six-coefficient parsing
+klippy/kinematics/bed_centre.py    bed centre geometry (owns bed_centre.h)
 klippy/extras/gcode_move.py        A/B/C g-code words
 klippy/extras/homing.py            homing across six axes
 klippy/extras/motion_report.py     six-axis trapq dumps
 klippy/extras/rtcp.py              installs RTCP, reach checks
 klippy/extras/b_projection.py      installs the B projection, speed limits
 klippy/extras/rtcp_probe.py        probe geometry on the tilting head
+klippy/extras/polar_singularity.py limits and refusals at the bed centre
 ```
 
 ## Position vector layout
@@ -267,7 +271,8 @@ alongside the linear axes.
 | `test/multi_axis/run_c_tests.sh` | any host with a C compiler | Shared time base, core r-theta coefficients, RTCP geometry, the bed-frame B projection, 3-axis regression, benchmark |
 | `test/multi_axis/test_gcode_pipeline.py` | any host with Python + cffi | Real `gcode.py`, `gcode_move.py`, `Move`, `LookAheadQueue`, `RotaryAxis` |
 | `test/multi_axis/test_rtcp_probe.py` | any host with Python + cffi | Tilting-head probe geometry, the radial probe transform, its config checks |
-| `test/multi_axis/test_polar_singularity.py` | any host with Python | Bed centre geometry, the angular rate limits, what is refused and what is legal on the axis |
+| `test/multi_axis/test_bed_centre.py` | any host with Python | Bed centre geometry, the dead zone rule and its C mirror, signed radius |
+| `test/multi_axis/test_polar_singularity.py` | any host with Python | The bed centre move check: what is slowed, what is refused, what is legal on the axis |
 | `test/klippy/multi_axis.test` | Linux (`scripts/test_klippy.py`) | Uncoupled A/C axes: config load, homing, step generation |
 | `test/klippy/multi_axis_rtheta.test` | Linux (`scripts/test_klippy.py`) | Coupled core r-theta stage |
 | `test/klippy/multi_axis_rtcp.test` | Linux (`scripts/test_klippy.py`) | RTCP on a B axis tilting head |
@@ -277,7 +282,7 @@ alongside the linear axes.
 | `test/klippy/polar_singularity_refuse.test` | Linux (`scripts/test_klippy.py`) | Bed centre: a move straight across the axis is refused |
 
 ```bash
-bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py     && python test/multi_axis/test_rtcp_probe.py     && python test/multi_axis/test_polar_singularity.py
+bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py     && python test/multi_axis/test_rtcp_probe.py     && python test/multi_axis/test_bed_centre.py     && python test/multi_axis/test_polar_singularity.py
 ```
 
 ## RTCP (Rotational Tool Center Point)
@@ -798,8 +803,8 @@ passes a feedrate check can still overrun the step compressor on the
 `[stepper_c]` queue, and why *both* limits land on the feedrate rather
 than on the move's acceleration.
 
-`klippy/kinematics/polar.py` carries the geometry, `[polar_singularity]`
-turns it into limits.  A move that passes near the centre is slowed to
+`klippy/kinematics/bed_centre.py` carries the geometry and
+`[polar_singularity]` turns it into limits.  A move that passes near the centre is slowed to
 `max_angular_velocity * r_min`; one that would have to run slower than
 `min_velocity` is refused, and so is one that crosses the axis outright.
 
@@ -845,11 +850,32 @@ them.
 Nor is the bed angle *scheduled* while the tip is on the axis.  Inside a
 disc where the angle stops being determined by position it becomes a free
 degree of freedom, and something has to choose it: today
-`kin_corertheta.c` resolves such a sample from the direction of travel,
+`bed_centre_angle()` resolves such a sample from the direction of travel,
 which is right for the homing sweep it was written for and is a half turn
 commanded in one sample for anything else.  That is why a move that comes
 to rest on the axis and then leaves along a different ray is still not
-something to rely on.
+something to rely on.  The rule cannot be fixed at the level of a sample:
+the RTCP and projection wrappers hand the bed solver a synthetic move whose
+endpoints mean nothing, so a sample cannot tell a move that is arriving
+from one that is leaving.
+
+### One geometry, one dead zone
+
+The geometry has a single owner, `klippy/kinematics/bed_centre.py`, which
+imports nothing but `math` so any layer can use it.  The step generators
+take the same numbers and the same dead zone rule from
+`klippy/chelper/bed_centre.h`, and `test/multi_axis/test_bed_centre.py`
+fails if the header and the module disagree, or if any of the names the
+old copies went by reappears.  The bed solver and the B projection both
+take their angle from the header, so they agree sample by sample on which
+way the bed is facing.  They used not to for a tool standing still just
+off the centre, where the projection assumed a bed angle of zero while the
+bed was being driven to the position's own angle.
+
+The module also carries the arithmetic for a signed arm radius: every x/y
+position has two polar names, `(r, theta)` and `(-r, theta + pi)`, and on
+the second a straight line through the centre is a radial move with the
+bed angle held.  Nothing drives that yet.
 
 ## Deliberate limitations (current stage)
 

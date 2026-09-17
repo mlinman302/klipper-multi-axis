@@ -49,8 +49,8 @@
 # is what makes every consumer see one consistent B - the angle the head
 # is really turned to - and lets the projection be re-evaluated at every
 # sample time, since the bed angle changes continuously *within* a move.
-import math
 import chelper, stepper
+from kinematics import bed_centre
 
 # Index of the B coordinate within a toolhead position vector
 B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
@@ -62,9 +62,6 @@ B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
 NO_BAND_ANGLE = 1e30
 NO_BAND_TAPER = 1.
 
-# Below this radius (in mm) the bed angle is not meaningfully defined.
-# Kept identical to kin_bproject.c and kin_corertheta.c.
-BED_MIN_RADIUS = 0.010
 # Below this |cos(theta)| the projection has no inverse: every commanded B
 # maps onto a machine B of nearly zero.
 COS_EPSILON = 1e-6
@@ -194,15 +191,10 @@ class BAxisProjection:
     # Coordinate transforms
     ######################################################################
     def cos_bed_angle(self, x, y):
-        # cos(theta) at a position, matching bproject_cos_bed_angle() in
-        # kin_bproject.c for a position that is not moving.  Inside the
-        # dead zone at the centre the C resolves the angle from the
-        # direction of travel; a static position has none, and there the
-        # bed angle has no effect on anything, so leave B alone.
-        r2 = x * x + y * y
-        if r2 < BED_MIN_RADIUS * BED_MIN_RADIUS:
-            return 1.
-        return x / math.sqrt(r2)
+        # cos(theta) at a position that is not moving - the angle the bed
+        # solver drives the bed to there, so that the projection agrees
+        # with the bed about which way it is facing.  See bed_centre.py.
+        return bed_centre.cos_bed_angle(x, y)
 
     def project(self, b, x, y):
         # Machine B for a commanded B at bed position x/y.  The C helper
@@ -255,12 +247,10 @@ class BAxisProjection:
         # which for a path that is not radial is an interior point.  The
         # two ends can therefore say nothing at all is happening.
         sp, ep = move.start_pos, move.end_pos
-        if (sp[1] < 0.) == (ep[1] < 0.):
+        t = bed_centre.axis_crossing_fraction(sp, ep, 1)
+        if t is None:
             return None
-        t = sp[1] / (sp[1] - ep[1])
-        if not 0. < t < 1.:
-            return None
-        return [s + t * (e - s) for s, e in zip(sp, ep)]
+        return bed_centre.interpolate(sp, ep, t)
 
     def _check_move(self, move):
         # The commanded B and the machine B do not move at the same rate:

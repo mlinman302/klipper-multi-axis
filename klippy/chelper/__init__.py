@@ -28,7 +28,8 @@ SOURCE_FILES = [
 DEST_LIB = "c_helper.so"
 OTHER_FILES = [
     'list.h', 'serialqueue.h', 'stepcompress.h', 'steppersync.h',
-    'itersolve.h', 'pyhelper.h', 'trapq.h', 'pollreactor.h', 'msgblock.h'
+    'itersolve.h', 'pyhelper.h', 'trapq.h', 'pollreactor.h', 'msgblock.h',
+    'bed_centre.h'
 ]
 
 defs_stepcompress = """
