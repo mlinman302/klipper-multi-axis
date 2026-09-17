@@ -61,11 +61,13 @@ bed_centre_half_turn(double angle)
 // position_min of zero.
 //
 // Note what it cannot do: a sample cannot tell a move that is arriving at
-// the centre from one that is leaving it.  A move that ends exactly on the
-// centre is "not heading inward" at its last sample and flips the bed by
-// pi there, and one that starts from the centre along a new ray steps the
-// bed at its first.  Scheduling the angle on the axis is a job for the
-// host, which sees the moves on either side.
+// the centre from one that is leaving it.  A move that leaves the centre
+// along any ray but the one the bed faces steps the bed at its first
+// sample, and a sample on the bare centre while the bed is live - which
+// RTCP makes it on a B move - falls back to atan2 of wherever the
+// carriage is.  Scheduling the angle on the axis is a job for the host,
+// which sees the moves on either side; see
+// klippy/kinematics/centre_path.py.
 static inline double
 bed_centre_angle(struct move *m, struct coord *c)
 {

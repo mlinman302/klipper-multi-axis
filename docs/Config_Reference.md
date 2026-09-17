@@ -619,9 +619,8 @@ available parameters.
 
 CORE R-THETA KINEMATICS ARE A WORK IN PROGRESS.  As with polar
 kinematics, the 0, 0 position is a singularity of the bed angle. Moves
-near it are slowed and moves across it are refused - see
-[[polar_singularity]](#polar_singularity) - but nothing yet routes a
-path around it.
+near it are slowed, and moves onto, off and across it are planned or
+refused - see [[polar_singularity]](#polar_singularity).
 
 ```
 [printer]
@@ -2699,14 +2698,31 @@ diverges as `1/r` and its angular acceleration as `1/r²` - so this
 module limits the feedrate of a move that passes near the centre and
 refuses one that crosses it.
 
-Moves that sit on the axis without turning the bed are unaffected: a
-pure `Z` move along the axis, and a move that departs from or arrives at
-the centre along a ray, are all legal at full feedrate.
+On the axis itself the bed angle is not determined by the position at
+all, so G-Code moves that start or end there are planned: a move onto
+the centre stops a tenth of a micron short, on the ray it arrived along,
+so the bed keeps facing that way; and a move off the centre along a
+different ray first turns the bed, by carrying the tool round a small
+circle of `reorient_radius` at the bed's angular velocity limit. `Z`,
+`E` and rotary axes are held during that turn. A pure `Z` move along
+the axis, and a move that leaves along the ray the bed already faces,
+are unaffected.
 
-A refused move names its closest approach and the rate it would have
-needed. Nothing routes a move around the centre yet - that costs either
-a path deviation or an arm radius that can go negative, and both are
-decisions for the machine's owner.
+A move that crosses the axis - or passes so close that it would have to
+run below `min_velocity` - is handled according to `travel_policy` or
+`print_policy`: `error` refuses it, naming its closest approach and the
+rate it would have needed; `bypass` routes it through the centre and
+turns the bed there. Bypass stops on the axis for up to half a turn of
+the bed, which is harmless on a travel move and leaves a blob on a
+printed one, hence the different defaults. A move that is merely slowed
+is split so that only its part close to the centre runs slowly.
+
+G-Code moves are planned, and so are probing moves and
+`RTCP_PROBE_MOVE`, which go straight to the toolhead - a round bed mesh
+crosses the centre on its middle row. Other moves made directly on the
+toolhead are only limited and refused. A tilted head is not stood
+upright for a move across the centre - with `[rtcp]` on, centre moves
+are for `B` near zero.
 
 See [Multi_Axis.md](Multi_Axis.md).
 
@@ -2728,7 +2744,20 @@ See [Multi_Axis.md](Multi_Axis.md).
 #min_velocity: 0.5
 #   The feedrate (in mm/s) below which slowing down has stopped being an
 #   answer. A move that would have to run slower than this to hold the
-#   limits above is refused instead. The default is 0.5.
+#   limits above is handled as if it crossed the centre. The default is
+#   0.5.
+#travel_policy: bypass
+#   What to do with a move that crosses the centre and does not extrude:
+#   "bypass" to route it through the centre and turn the bed there, or
+#   "error" to refuse it. The default is bypass.
+#print_policy: error
+#   The same for a move that extrudes. The default is error.
+#reorient_radius:
+#   The radius (in mm) of the circle the tool follows while the bed turns
+#   on the axis. It must be at least 0.04, and large enough that the
+#   bed's angular velocity limit does not hold the circle below
+#   min_velocity. The default is the smallest radius that satisfies
+#   both - 0.125 for a 5 rad/s bed and a 0.5 mm/s floor.
 ```
 
 ### [rtcp_probe]

@@ -156,13 +156,14 @@ klippy/kinematics/rotary_axis.py   RotaryAxis / CoupledRotaryAxis
 klippy/kinematics/generic_cartesian.py  a/b/c carriages
 klippy/kinematics/kinematic_stepper.py  six-coefficient parsing
 klippy/kinematics/bed_centre.py    bed centre geometry (owns bed_centre.h)
+klippy/kinematics/centre_path.py   planning moves onto, off and across it
 klippy/extras/gcode_move.py        A/B/C g-code words
 klippy/extras/homing.py            homing across six axes
 klippy/extras/motion_report.py     six-axis trapq dumps
 klippy/extras/rtcp.py              installs RTCP, reach checks
 klippy/extras/b_projection.py      installs the B projection, speed limits
 klippy/extras/rtcp_probe.py        probe geometry on the tilting head
-klippy/extras/polar_singularity.py limits and refusals at the bed centre
+klippy/extras/polar_singularity.py limits, refusals and the centre transform
 ```
 
 ## Position vector layout
@@ -273,6 +274,7 @@ alongside the linear axes.
 | `test/multi_axis/test_rtcp_probe.py` | any host with Python + cffi | Tilting-head probe geometry, the radial probe transform, its config checks |
 | `test/multi_axis/test_bed_centre.py` | any host with Python | Bed centre geometry, the dead zone rule and its C mirror, signed radius |
 | `test/multi_axis/test_polar_singularity.py` | any host with Python | The bed centre move check: what is slowed, what is refused, what is legal on the axis |
+| `test/multi_axis/test_centre_path.py` | any host with Python | Planning at the bed centre: parking, turning the bed on an arc, bypassing a crossing, splitting a near miss, and a replay proving the bed never steps |
 | `test/klippy/multi_axis.test` | Linux (`scripts/test_klippy.py`) | Uncoupled A/C axes: config load, homing, step generation |
 | `test/klippy/multi_axis_rtheta.test` | Linux (`scripts/test_klippy.py`) | Coupled core r-theta stage |
 | `test/klippy/multi_axis_rtcp.test` | Linux (`scripts/test_klippy.py`) | RTCP on a B axis tilting head |
@@ -282,7 +284,7 @@ alongside the linear axes.
 | `test/klippy/polar_singularity_refuse.test` | Linux (`scripts/test_klippy.py`) | Bed centre: a move straight across the axis is refused |
 
 ```bash
-bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py     && python test/multi_axis/test_rtcp_probe.py     && python test/multi_axis/test_bed_centre.py     && python test/multi_axis/test_polar_singularity.py
+bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py     && python test/multi_axis/test_rtcp_probe.py     && python test/multi_axis/test_bed_centre.py     && python test/multi_axis/test_polar_singularity.py     && python test/multi_axis/test_centre_path.py
 ```
 
 ## RTCP (Rotational Tool Center Point)
@@ -839,25 +841,72 @@ radius, and where `radius + dh(b)` can ask for an arm on the far side of
 the middle.  `[rtcp]` range checks that in its own move check — see
 "Reach checking" above.
 
+### Scheduling the bed angle on the axis
+
+Inside a small disc at the centre the bed angle stops being determined by
+position and becomes a free degree of freedom, which something has to
+choose.  The step generator chooses it one sample at a time, in
+`bed_centre_angle()`, from the direction of travel.  That is right for
+the homing sweep it was written for, and it cannot be right in general:
+the RTCP and projection wrappers hand the bed solver a synthetic move
+whose endpoints mean nothing, so a sample cannot tell a move that is
+arriving from one that is leaving.  Run through the real step generator
+and step compressor (`test_centre_path_step_generation()` in
+`test/multi_axis/test_kin_6axis.c`), that rule fails in two ways:
+
+* **Leaving along a new ray.**  A move off the centre along any ray but
+  the one the bed faces — carrying straight on through it included —
+  steps the bed at its first sample, and the compressor reports
+  `Invalid sequence`.
+* **Standing on the bare centre with the bed live.**  RTCP makes the bed
+  live on a B move, and on the bare centre its correction shifts the
+  carriage along +x, so the bed angle jumps to 0 or pi.
+
+Arriving is not a failure: the rule hands the last instant of an arriving
+move the angle of travel, but the step generator stops short of it.
+
+So the host schedules the angle, where it can see the moves on either
+side.  `klippy/kinematics/centre_path.py` plans each G-Code move, and
+`[polar_singularity]` installs it as a move transform:
+
+* **Arriving** on the centre stops `PARK_RADIUS` (0.1 µm) short, on the
+  ray the tool arrived along.  The bed keeps facing that ray, at rest and
+  under an RTCP B move, whose correction now scales the carriage along the
+  park ray.  The reported position is still the centre.
+* **Departing** along a different ray steps out to `reorient_radius`
+  along the ray the bed already faces, follows that circle round to the
+  new ray in 10° chords at the bed's angular velocity limit, and carries
+  on radially.  Z, E and rotary axes are held for the turn, which is the
+  only place the tool leaves the commanded path.
+* **Crossing** — through the dead zone, or so close that holding the
+  limits would take the move below `min_velocity` — is refused
+  (`error`) or routed through the centre as an arrival and a departure
+  (`bypass`).  Bypass stops on the axis while the bed turns, so travel
+  defaults to `bypass` and printing to `error`.
+* **A near miss that is only slowed** is split where the radius doubles,
+  so each piece is held to the limit at its own inner end and only the
+  part of the move that really is close runs slowly.
+
+`test/multi_axis/test_centre_path.py` replays every plan through the
+Python mirror of the dead zone rule and checks that the commanded bed angle
+never jumps, that every planned move gets past the move check, and that
+the plans are the sequences the C test runs through the step compressor.
+
 ### What it does not do yet
 
-Nothing routes a path around the centre.  A move that crosses the axis is
-rejected rather than rerouted, because rerouting costs either a path
-deviation or an arm radius that can go negative, and both are decisions
-for the machine's owner rather than something to do silently underneath
-them.
-
-Nor is the bed angle *scheduled* while the tip is on the axis.  Inside a
-disc where the angle stops being determined by position it becomes a free
-degree of freedom, and something has to choose it: today
-`bed_centre_angle()` resolves such a sample from the direction of travel,
-which is right for the homing sweep it was written for and is a half turn
-commanded in one sample for anything else.  That is why a move that comes
-to rest on the axis and then leaves along a different ray is still not
-something to rely on.  The rule cannot be fixed at the level of a sample:
-the RTCP and projection wrappers hand the bed solver a synthetic move whose
-endpoints mean nothing, so a sample cannot tell a move that is arriving
-from one that is leaving.
+* **Only G-Code and probing moves are planned.**  Probing moves and
+  `RTCP_PROBE_MOVE` go straight to the toolhead rather than through
+  G-Code, so they ask `[polar_singularity]` for a planned move through
+  `probe.manual_move()`.  That matters: a round bed mesh probes the centre
+  on its middle row and carries straight on across it, which the step
+  compressor refuses when sent straight.  Anything else that moves the
+  toolhead directly is still only limited and refused, not planned.
+* **A tilted head is not stood upright.**  At the centre the RTCP
+  correction asks for an arm on the far side of the middle as soon as B
+  swings the tip outboard, and the reach check refuses it.  Centre moves
+  are for B near zero until the transform stands the head up for them.
+* **Nothing drives a signed arm radius**, so a crossing is a stop and a
+  turn rather than a straight line through the middle.
 
 ### One geometry, one dead zone
 
@@ -909,11 +958,9 @@ bed angle held.  Nothing drives that yet.
   too.
 * **Multi-rotation RTCP** (A and C as well as B), if a future head needs
   it — see "Scope" above.
-* **Schedule the bed angle through the centre.**  Inside the disc where
-  the bed angle stops being determined by position it is a free degree of
-  freedom that nothing currently owns — see "The bed centre singularity"
-  above.  Giving it an owner is what makes a path across the axis
-  possible at all: either routed around the centre at a bounded radius,
-  or driven straight through it on a signed arm radius with the bed angle
-  held, which needs `position_min` below zero on `[stepper_r]` and a
-  branch carried on the move through to the `corertheta` solvers.
+* **Finish the bed centre.**  Stand a tilted head upright for a centre
+  transit, plan the probing moves that bypass G-Code, and drive a straight
+  line through the centre on a signed arm radius with the bed angle held -
+  which needs `position_min` below zero on `[stepper_r]` and a branch
+  carried on the move through to the `corertheta` solvers.  See "The bed
+  centre singularity" above.

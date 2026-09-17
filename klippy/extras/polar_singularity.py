@@ -45,15 +45,39 @@
 # Both have a perpendicular offset of zero, which is what path_geometry()
 # reports and what makes them cost nothing here.
 #
-# WHAT THIS DOES, AND WHAT IT DOES NOT DO YET
+# WHAT THIS DOES
 #
-# This is the first stage: it makes the machine refuse what it cannot do,
-# and says why.  It does not reshape a path to avoid the centre.  A move
-# that crosses the axis is rejected rather than routed around it, because
-# routing it around costs either a path deviation or a signed arm radius,
-# and both are decisions the machine's owner has to make rather than
-# something to do silently underneath them.
+# Two things, at two different altitudes.
+#
+# A move check, which every move reaching the toolhead passes through -
+# including the ones no g-code transform ever sees, such as probing moves.
+# It slows a move that passes near the centre to the bed's angular limits,
+# and refuses one that crosses the axis or that would have to crawl below
+# min_velocity to stay inside them.
+#
+# A g-code move transform, which plans the path around the centre before
+# the moves are made: it parks the tool on the ray it arrived along, turns
+# the bed on a small arc before leaving along a new one, routes a crossing
+# travel move through the centre instead of refusing it, and splits a near
+# miss so only its close part runs slowly.  The planning itself lives in
+# klippy/kinematics/centre_path.py, which explains each of those.  The
+# transform only schedules what the move check would allow; anything it
+# passes through unchanged still has to get past the check.
+#
+# The transform is registered at connect time, after every transform that
+# insists on being first ([bed_mesh], [bed_tilt]) and before the ones that
+# stack on top ([skew_correction]), so the x/y it plans in are the x/y the
+# toolhead receives.
+#
+# WHAT IT DOES NOT DO YET
+#
+# It does not stand a tilted head upright for a centre transit.  And of
+# the moves that go straight to the toolhead rather than through g-code,
+# only the ones that call manual_move() below are planned - probing does,
+# through probe.manual_move(), because a round bed mesh crosses the centre
+# on its middle row.  Anything else is only seen by the move check.
 import math
+from kinematics import centre_path
 from kinematics.bed_centre import (
     CENTRE_RADIUS, path_geometry, swept_angle, crosses_centre,
     peak_angular_velocity, peak_angular_accel, limits_for_angular_rates)
@@ -88,6 +112,24 @@ class PolarSingularity:
                                              minval=0.)
         # Below this feedrate, slowing down has stopped being an answer
         self.min_velocity = config.getfloat('min_velocity', 0.5, above=0.)
+        # What to do with a move that crosses the centre: refuse it, or
+        # stop on the centre and turn the bed there.  Stopping is harmless
+        # on a travel move and leaves a blob on a print move.
+        travel_policy = config.getchoice('travel_policy',
+                                         list(centre_path.POLICIES),
+                                         'bypass')
+        print_policy = config.getchoice('print_policy',
+                                        list(centre_path.POLICIES), 'error')
+        # The circle the tool follows while the bed turns at the centre
+        reorient_radius = config.getfloat('reorient_radius', None, above=0.)
+        try:
+            self.planner = centre_path.CentrePlanner(
+                self.max_angular_v, self.max_angular_a, self.min_velocity,
+                reorient_radius, travel_policy, print_policy)
+        except ValueError as e:
+            raise config.error("[%s] %s" % (config.get_name(), e))
+        self.toolhead = self.next_transform = None
+        self.last_position = [0., 0., 0., 0.]
         # Diagnostics for the last move that came near the centre.  Most
         # of the failures this replaces present as an "Internal error in
         # stepcompress" with no indication of where the machine was.
@@ -96,8 +138,43 @@ class PolarSingularity:
         self.last_velocity_limit = 0.
         self.printer.register_event_handler("klippy:connect", self._connect)
     def _connect(self):
-        toolhead = self.printer.lookup_object('toolhead')
-        toolhead.register_move_check(self._check_move)
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.toolhead.register_move_check(self._check_move)
+        gcode_move = self.printer.lookup_object('gcode_move')
+        self.next_transform = gcode_move.set_move_transform(self, force=True)
+
+    ######################################################################
+    # Move transform
+    ######################################################################
+    def get_position(self):
+        # A tool parked on the axis stands a tenth of a micron off it, on
+        # the ray the bed faces; the caller asked for the centre itself
+        pos = self.next_transform.get_position()
+        if centre_path.at_centre(pos):
+            pos[0] = pos[1] = 0.
+        self.last_position[:] = pos
+        return list(pos)
+    def move(self, newpos, speed):
+        # The toolhead's own x/y is what the bed angle follows, and on the
+        # centre it is a park point rather than the position asked for
+        machine_xy = self.toolhead.get_position()[:2]
+        for pos, move_speed in self.planner.plan(
+                machine_xy, self.last_position, newpos, speed):
+            self.next_transform.move(pos, move_speed)
+        self.last_position[:] = newpos
+    def manual_move(self, coord, speed):
+        # toolhead.manual_move(), planned.  For moves that go straight to
+        # the toolhead rather than through g-code - probing, above all -
+        # so they are in the toolhead's frame, below every transform.
+        start = self.toolhead.get_position()
+        end = list(start)
+        for i, value in enumerate(coord):
+            if value is not None:
+                end[i] = value
+        for pos, move_speed in self.planner.plan(start[:2], start, end,
+                                                 speed):
+            self.toolhead.move(pos, move_speed)
+        self.printer.send_event("toolhead:manual_move")
 
     ######################################################################
     # Move checking
@@ -134,8 +211,10 @@ class PolarSingularity:
         if v_limit is None and a_limit is None:
             return
         if v_limit is not None:
-            if v_limit < self.min_velocity:
-                velocity = math.sqrt(move.max_cruise_v2)
+            velocity = math.sqrt(move.max_cruise_v2)
+            # A move already asked to run below the floor, and slowly
+            # enough for the bed, is not one this needs to refuse
+            if v_limit < self.min_velocity and v_limit < velocity:
                 raise move.move_error(
                     "Move passes %.4f mm from the centre of the bed and"
                     " would turn it at %.1f rad/s (%.0f rad/s^2).  Holding"
@@ -158,6 +237,9 @@ class PolarSingularity:
             'last_radius': self.last_radius,
             'last_swept_angle': math.degrees(self.last_swept),
             'last_velocity_limit': self.last_velocity_limit,
+            'reorient_radius': self.planner.reorient_radius,
+            'travel_policy': self.planner.travel_policy,
+            'print_policy': self.planner.print_policy,
         }
 
 

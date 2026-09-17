@@ -100,13 +100,25 @@ ANGULAR_ACCEL_PEAK = 9. / (8. * math.sqrt(3.))
 # This is the rule the step generators actually run, which is why it is
 # mirrored here rather than improved.  It is right for the homing sweep
 # it was written for, which departs from the centre along +x.  It is not
-# right in general: a move that ends exactly on the centre is "not heading
-# inward" at its last sample and so flips the bed by pi there, and a move
-# that starts from the centre along a new ray steps the bed at its first.
+# right in general, in two ways the real step generator confirms (see
+# test_centre_path_step_generation() in test/multi_axis/test_kin_6axis.c):
+#
+#   * A move that leaves the centre along any ray but the one the bed
+#     already faces - including one that carries straight on through it -
+#     steps the bed at its first sample.
+#   * A sample on the bare centre while the bed is live falls back to
+#     atan2 of whatever is there: zero at (0, 0), or with RTCP on, the
+#     direction the tool offset has pushed the carriage - so tilting the
+#     head while standing on the bare centre steps the bed as well.
+#
+# The rule also hands the very last instant of a move that arrives on the
+# centre the angle of travel rather than the angle arrived at, but the
+# step generator stops short of that instant, so arriving is harmless.
+#
 # Scheduling the bed angle while the tool is on the axis is the job of the
-# layer above this one; nothing at the level of a single sample can do it,
-# because a sample cannot tell a move that is arriving from one that is
-# leaving.
+# layer above this one (centre_path.py); nothing at the level of a single
+# sample can do it, because a sample cannot tell a move that is arriving
+# from one that is leaving.
 
 def half_turn(angle):
     # angle + pi, folded back into (-pi, pi] - the same half turn the C

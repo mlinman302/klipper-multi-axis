@@ -1,8 +1,11 @@
-# A move straight across the bed's rotation axis is refused.  The bed
-# angle is derived from the commanded x/y, so a path from (-40, 0) to
+# A print move straight across the bed's rotation axis is refused.  The
+# bed angle is derived from the commanded x/y, so a path from (-40, 0) to
 # (40, 0) turns the bed half a turn at the instant the sign of x flips -
 # there is no rate there to slow down, and no feedrate makes a step take
-# longer.
+# longer.  A travel move is routed through the centre instead (see
+# polar_singularity.test), but that stops on the axis while the bed turns,
+# which on a print move would leave a blob - so print_policy defaults to
+# refusing.
 #
 # Note how little the arithmetic sees: the path's perpendicular offset
 # from the centre is exactly zero, so every angular rate computed for it
@@ -23,5 +26,5 @@ G1 Z10 F600
 G1 X0 Y40 F3000
 G1 X-40 Y0 F3000
 
-# And now straight back across it
-G1 X40 Y0 F3000
+# And now straight back across it, extruding
+G1 X40 Y0 E5 F3000

@@ -1,15 +1,12 @@
-# Tests for the bed centre singularity limits - the moves near the bed's
-# rotation axis that are legal, and legal only slowly.  The moves that
-# are refused outright are in polar_singularity_refuse.test, which needs
-# a file of its own because SHOULD_FAIL applies to a whole test.
+# Tests for the bed centre - the moves near the bed's rotation axis that
+# are legal, those that are legal only slowly, and the ones that sit on the
+# axis itself and need the bed angle scheduled around them.  The moves
+# that are refused outright are in polar_singularity_refuse.test, which
+# needs a file of its own because SHOULD_FAIL applies to a whole test.
 #
-# Nothing here comes to rest on the axis.  A move that ends on it, or
-# starts from it along a new ray, leaves the bed angle a free choice that
-# nothing yet schedules - the C dead zone of kin_corertheta.c resolves
-# such a sample from the direction of travel, which is right for the
-# homing sweep it was written for and is a half turn commanded in one
-# sample for anything else.  Scheduling that angle is the next stage of
-# this work, and until it exists there is nothing here to assert.
+# test/multi_axis/test_centre_path.py checks the plans these moves are
+# turned into, and test_kin_6axis.c runs the same plans through the real
+# step compressor.  This runs them end to end through klippy.
 DICTIONARY atmega2560.dict
 CONFIG polar_singularity.cfg
 
@@ -72,6 +69,43 @@ G1 X20 Y0 Z0.3 F1500
 G1 X2 Y-8 E1 F1500
 G1 X2 Y8 E2 F1500
 G1 X20 Y8 E3 F1500
+
+# On the axis.  Arrive from +x, work along the axis - the N in [0, 0, N]
+# - and leave along +y.  The arrival parks a tenth of a micron short, on
+# the +x ray, and the departure turns the bed on a small arc before it
+# leaves, so the bed is never asked to step.
+G1 X40 Y0 Z10 F3000
+G1 X0 Y0 F3000
+G1 Z50 F600
+G1 Z10 F600
+GET_POSITION
+G1 B20 F600
+G1 B0 F600
+G1 X0 Y40 F3000
+
+# Back to the centre and out again the way it came - no turn needed
+G1 X0 Y0 F3000
+G1 X0 Y30 F3000
+
+# Leaving in the opposite direction to the arrival is a half turn
+G1 X0 Y0 F3000
+G1 X0 Y-30 F3000
+
+# Straight across the centre on a travel move is routed through it,
+# stopping on the axis while the bed turns
+G1 X-40 Y0 F3000
+G1 X40 Y0 F3000
+G1 X0.003 Y40 F3000
+G1 X-0.003 Y-40 F3000
+
+# A travel move so close to the centre that it would have to crawl is
+# routed the same way
+G1 X-20 Y0.05 F3000
+G1 X20 Y0.05 F3000
+
+# Printing away from the centre after all of that
+G1 X20 Y0 Z0.3 F1500
+G1 X20 Y8 E4 F1500
 
 GET_POSITION
 M114

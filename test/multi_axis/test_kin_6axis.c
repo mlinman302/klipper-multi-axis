@@ -17,6 +17,7 @@
 #include <stddef.h> // offsetof
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h> // memcpy
 #include <time.h>
 #include "bed_centre.h" // BED_CENTRE_RADIUS
 #include "itersolve.h"
@@ -832,6 +833,156 @@ test_bed_centre(void)
     trapq_free(tq_o);
 }
 
+// Drive the bed motor through a chain of moves with the real step
+// generator and step compressor, and report whether the compressor
+// accepted the result.  points[] holds n+1 positions as (x, y, b).  A
+// move with no x/y travel takes its rotation as its distance, as
+// toolhead.Move does.  With 'tool_v' non-zero the bed solver runs under
+// radial RTCP with that vertical tool offset.
+static int
+run_bed_sequence(const double (*points)[3], int n, double speed,
+                 double tool_v)
+{
+    const double mcu_freq = 16000000.;
+    const double bed_step_dist = 2. * M_PI / (200. * 16. * 4.);
+    struct list_head msg_queue;
+    list_init(&msg_queue);
+    struct stepcompress *sc = stepcompress_alloc(&msg_queue);
+    stepcompress_fill(sc, 1, (uint32_t)(0.000025 * mcu_freq), 1, 2);
+    stepcompress_set_time(sc, 0., mcu_freq);
+    struct stepper_kinematics *bed = corertheta_stepper_alloc('c', 1.);
+    if (tool_v) {
+        struct stepper_kinematics *wrapped = rtcp_alloc();
+        rtcp_set_sk(wrapped, bed);
+        rtcp_set_tool(wrapped, 0., tool_v, RTCP_FRAME_RADIAL);
+        bed = wrapped;
+    }
+    struct trapq *tq = trapq_alloc();
+    itersolve_set_trapq(bed, tq, bed_step_dist);
+    itersolve_set_position(bed, points[0][0], points[0][1], 0., 0.,
+                           points[0][2], 0.);
+    double t = 0.1;
+    int i, ret = 0;
+    for (i = 0; i < n && !ret; i++) {
+        double dx = points[i + 1][0] - points[i][0];
+        double dy = points[i + 1][1] - points[i][1];
+        double db = points[i + 1][2] - points[i][2];
+        double len = sqrt(dx * dx + dy * dy);
+        double v = speed;
+        if (!len) {
+            len = fabs(db);
+            v = 20.;
+        }
+        double move_t = len / v;
+        trapq_append(tq, t, 0., move_t, 0.,
+                     points[i][0], points[i][1], 0., 0., points[i][2], 0.,
+                     dx / len, dy / len, 0., 0., db / len, 0., v, v, 0.);
+        t += move_t;
+        ret = itersolve_generate_steps(bed, sc, t);
+    }
+    if (!ret)
+        ret = stepcompress_flush(sc, (uint64_t)((t + 1.) * mcu_freq));
+    stepcompress_free(sc);
+    trapq_free(tq);
+    return ret;
+}
+
+// Mirrors PARK_RADIUS, and the default reorient_radius for a 5 rad/s bed
+// and a 0.5 mm/s floor, in klippy/kinematics/centre_path.py
+#define CP_PARK 1e-4
+#define CP_RADIUS .125
+
+// Append the planner's departure from a park point facing 'from' to a
+// target on the ray 'to': out along 'from', round in 10 degree chords,
+// then on to the target.  Returns the new count of moves.
+static int
+append_departure(double (*points)[3], int n, double from, double to,
+                 double target_r)
+{
+    double turn = atan2(sin(to - from), cos(to - from));
+    int chords = (int)ceil(fabs(turn) / (M_PI / 18.) - 1e-9), i;
+    n++;
+    points[n][0] = CP_RADIUS * cos(from);
+    points[n][1] = CP_RADIUS * sin(from);
+    points[n][2] = 0.;
+    for (i = 1; i <= chords; i++) {
+        double angle = from + turn * i / chords;
+        n++;
+        points[n][0] = CP_RADIUS * cos(angle);
+        points[n][1] = CP_RADIUS * sin(angle);
+        points[n][2] = 0.;
+    }
+    n++;
+    points[n][0] = target_r * cos(to);
+    points[n][1] = target_r * sin(to);
+    points[n][2] = 0.;
+    return n;
+}
+
+// The g-code sent straight to the toolhead, against the same g-code as
+// klippy/kinematics/centre_path.py plans it.  The real step generator
+// never emits the dead zone's travel-derived angle at the very end of a
+// move that arrives on the centre, so arriving is not the hazard.
+// Leaving is - along any ray but the one the bed faces, including
+// carrying straight on - and so is standing on the bare centre while the
+// bed is live, which RTCP makes it on a B move: the angle there falls
+// back to atan2 of wherever the RTCP offset put the carriage.
+static void
+test_centre_path_step_generation(void)
+{
+    printf("\n-- centre_path: the step compressor at the centre --\n");
+    double planned[40][3];
+    int n;
+
+    // Arrive along -y onto the centre, then leave along +x
+    static const double leave[3][3] = {
+        {0., 40., 0.}, {0., 0., 0.}, {40., 0., 0.} };
+    check("leave on a new ray, sent straight: refused",
+          run_bed_sequence(leave, 2, 50., 0.) != 0, 1., 0.);
+    const double up[3] = {0., 40., 0.};
+    memcpy(planned[0], up, sizeof(up));
+    planned[1][0] = 0.; planned[1][1] = CP_PARK; planned[1][2] = 0.;
+    n = append_departure(planned, 1, M_PI / 2., 0., 40.);
+    check("leave on a new ray, planned: accepted",
+          run_bed_sequence((const double (*)[3])planned, n, 50., 0.),
+          0., 0.);
+
+    // Straight across the centre
+    static const double across[2][3] = { {40., 0., 0.}, {-40., 0., 0.} };
+    check("straight across, sent straight: refused",
+          run_bed_sequence(across, 1, 50., 0.) != 0, 1., 0.);
+    const double right[3] = {40., 0., 0.};
+    memcpy(planned[0], right, sizeof(right));
+    planned[1][0] = CP_PARK; planned[1][1] = 0.; planned[1][2] = 0.;
+    n = append_departure(planned, 1, 0., M_PI, 40.);
+    check("straight across, bypassed: accepted",
+          run_bed_sequence((const double (*)[3])planned, n, 50., 0.),
+          0., 0.);
+
+    // A round bed mesh's middle row, probing the centre on the way
+    static const double row[3][3] = {
+        {-25., 0., 0.}, {0., 0., 0.}, {25., 0., 0.} };
+    check("mesh row through the centre, sent straight: refused",
+          run_bed_sequence(row, 2, 50., 0.) != 0, 1., 0.);
+    const double left[3] = {-25., 0., 0.};
+    memcpy(planned[0], left, sizeof(left));
+    planned[1][0] = -CP_PARK; planned[1][1] = 0.; planned[1][2] = 0.;
+    n = append_departure(planned, 1, M_PI, 0., 25.);
+    check("mesh row through the centre, planned: accepted",
+          run_bed_sequence((const double (*)[3])planned, n, 50., 0.),
+          0., 0.);
+
+    // With RTCP on, tilt the head while standing on the centre
+    static const double tilt[3][3] = {
+        {0., 40., 0.}, {0., 0., 0.}, {0., 0., -10.} };
+    check("tilt on the bare centre under RTCP: refused",
+          run_bed_sequence(tilt, 2, 50., 40.) != 0, 1., 0.);
+    const double parked_tilt[3][3] = {
+        {0., 40., 0.}, {0., CP_PARK, 0.}, {0., CP_PARK, -10.} };
+    check("tilt on the park point under RTCP: accepted",
+          run_bed_sequence(parked_tilt, 2, 50., 40.), 0., 0.);
+}
+
 int
 main(void)
 {
@@ -845,6 +996,7 @@ main(void)
     test_rtcp();
     test_b_projection();
     test_bed_centre();
+    test_centre_path_step_generation();
     benchmark();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures != 0;

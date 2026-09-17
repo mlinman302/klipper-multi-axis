@@ -66,7 +66,7 @@ class ProbeCommandHelper:
                                    self.cmd_Z_OFFSET_APPLY_PROBE,
                                    desc=self.cmd_Z_OFFSET_APPLY_PROBE_help)
     def _move(self, coord, speed):
-        self.printer.lookup_object('toolhead').manual_move(coord, speed)
+        manual_move(self.printer, coord, speed)
     def get_status(self, eventtime):
         return {'name': self.name,
                 'last_query': self.last_state,
@@ -226,6 +226,17 @@ class LookupZSteppers:
 # by the stock code below.
 def lookup_probe_transform(printer):
     return printer.lookup_object('probe_transform', None)
+
+# On a rotating-bed machine a move onto, off or across the bed centre has
+# to be planned, or the bed is asked to jump there - see
+# klippy/extras/polar_singularity.py.  G-code moves are planned by its move
+# transform; probing moves go straight to the toolhead, so they ask for
+# the planning here.  Anywhere else this is toolhead.manual_move().
+def manual_move(printer, coord, speed):
+    mover = printer.lookup_object('polar_singularity', None)
+    if mover is None:
+        mover = printer.lookup_object('toolhead')
+    mover.manual_move(coord, speed)
 
 # Support homing via probe using the probe:z_virtual_endstop pseudo-pin
 class HomingViaProbeHelper:
@@ -495,7 +506,7 @@ class ProbePointsHelper:
     def get_lift_speed(self):
         return self.lift_speed
     def _move(self, coord, speed):
-        self.printer.lookup_object('toolhead').manual_move(coord, speed)
+        manual_move(self.printer, coord, speed)
     def _raise_tool(self, is_first=False):
         speed = self.lift_speed
         if is_first:

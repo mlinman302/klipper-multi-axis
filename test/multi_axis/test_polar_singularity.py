@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.normpath(KLIPPY_DIR))
 # stepper.py imports mcu, which needs pyserial; nothing under test uses it
 sys.modules.setdefault('mcu', types.ModuleType('mcu'))
 
-from kinematics import bed_centre, polar
+from kinematics import bed_centre, centre_path, polar
 from extras import polar_singularity as ps
 
 
@@ -63,6 +63,8 @@ def build_checker(max_angular_v=5., max_angular_a=0., min_velocity=0.5):
     chk.max_angular_v = max_angular_v
     chk.max_angular_a = max_angular_a
     chk.min_velocity = min_velocity
+    chk.planner = centre_path.CentrePlanner(max_angular_v, max_angular_a,
+                                            min_velocity)
     chk.last_radius = chk.last_swept = chk.last_velocity_limit = 0.
     return chk
 
@@ -123,6 +125,14 @@ class TestMoveCheck(unittest.TestCase):
         self.assertIsNotNone(msg)
         self.assertIn("from the centre", msg)
 
+    def test_a_move_already_that_slow_is_not_refused(self):
+        # 0.05mm out needs 0.25mm/s - below the floor, but a move asked to
+        # run at 0.2mm/s is already slow enough for the bed
+        self.assertIsNone(self.refused((0.05, -20.), (0.05, 20.),
+                                       velocity=.2))
+        self.assertIsNotNone(self.refused((0.05, -20.), (0.05, 20.),
+                                          velocity=.3))
+
     def test_the_floor_is_where_the_refusal_starts(self):
         # 0.1mm needs exactly the 0.5mm/s floor and is allowed; a hair
         # closer is not
@@ -167,6 +177,9 @@ class TestMoveCheck(unittest.TestCase):
                                math.degrees(abs(bed_centre.swept_angle(
                                    (5., -20.), (5., 20.)))))
         self.assertAlmostEqual(status['last_velocity_limit'], 25.)
+        self.assertEqual(status['travel_policy'], 'bypass')
+        self.assertEqual(status['print_policy'], 'error')
+        self.assertEqual(status['reorient_radius'], .125)
 
 
 ######################################################################
