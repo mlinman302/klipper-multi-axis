@@ -8,13 +8,14 @@ CONFIG multi_axis_bproject.cfg
 RTCP_PROBE_INFO
 
 # Homing, probing and orienting run in the machine frame, so both
-# transforms are off for them: the park angle (-90) and the probing
-# angle (45) are machine angles, and the projection would scale each of
-# them by whatever bed angle happened to be under the arm.
+# transforms are off for them: a measured B and the probing angle (45)
+# are machine angles, and the projection would scale each of them by
+# whatever bed angle happened to be under the arm.  B has no endstop and
+# this harness has no IMU to home it with, so its position is set by hand.
 SET_RTCP ENABLE=0
 SET_B_PROJECTION ENABLE=0
 G28 X
-G28 B
+SET_ROTARY_AXIS AXIS=B SET_POSITION=0
 RTCP_PROBE_ORIENT MODE=PROBE
 RTCP_PROBE_MOVE X=25 Y=0 F=50
 G28 Z
