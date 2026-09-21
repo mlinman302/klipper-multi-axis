@@ -85,7 +85,7 @@ class BaseRotaryAxis:
     def _register(self):
         self.commanded_pos = 0.
         # Homes an axis that has no endstop, and picks the direction of
-        # one that has an endstop but no homing_positive_dir - see
+        # one whose rail leaves its homing direction to be measured - see
         # set_homing_source()
         self.homing_source = None
         gcode = self.printer.lookup_object('gcode')
@@ -202,9 +202,10 @@ class BaseRotaryAxis:
         #                 and drives it to zero.  This is the default for
         #                 the corertheta B axis, whose position_min and
         #                 position_max are then only soft limits.
-        #   an endstop    with homing_positive_dir unset, the source picks
-        #   and no        the direction: choose_homing_direction() returns
-        #   direction     (positive_dir, min_sweep) before the sweep, and
+        #   an endstop    the rail has no homing direction of its own (the
+        #   and no        corertheta B rail), so the source picks it:
+        #   direction     choose_homing_direction() returns (positive_dir,
+        #                 min_sweep) before the sweep, and
         #                 verify_home(position_endstop) checks it after.
         self.homing_source = source
         if not self.has_endstop:
@@ -214,15 +215,37 @@ class BaseRotaryAxis:
         # Called by a homing source that has just measured the axis
         self.set_position(angle)
         self.is_homed = True
-    def move_axis(self, angle, speed=None):
-        # A move of this axis alone, for a homing source to drive it with
+    def get_homing_accel(self):
+        # The acceleration homing moves should ramp at, if the homing
+        # source declares one ([accel_b_homing] homing_accel)
+        source = self.homing_source
+        get_accel = getattr(source, 'get_homing_accel', None)
+        return get_accel() if get_accel is not None else None
+    def move_axis(self, angle, speed=None, accel=None):
+        # A move of this axis alone, for a homing source to drive it with.
+        #
+        # accel, in deg/s^2, gives that move a trapezoid.  A move that
+        # turns this axis and nothing else has no linear travel, so
+        # toolhead.Move does not treat it as a kinematic move and leaves
+        # it with no acceleration limit at all - it steps straight to
+        # speed and stops just as abruptly, which sets a belt-driven head
+        # ringing.  The limit is applied by tightening this axis' own
+        # max_accel for the move, so it lands in check_move() beside
+        # every other limit rather than in a second code path.
         toolhead = self.printer.lookup_object('toolhead')
         if speed is None:
             speed = self.rail.get_homing_info().speed
         pos = toolhead.get_position()
         pos[self.get_position_index()] = angle
-        toolhead.move(pos, speed)
-        toolhead.wait_moves()
+        prev_accel = self.max_accel
+        if accel is not None:
+            self.max_accel = accel if prev_accel is None else min(accel,
+                                                                 prev_accel)
+        try:
+            toolhead.move(pos, speed)
+            toolhead.wait_moves()
+        finally:
+            self.max_accel = prev_accel
         self.commanded_pos = toolhead.get_position()[
             self.get_position_index()]
     def _homing_direction(self, hi):
@@ -231,10 +254,9 @@ class BaseRotaryAxis:
         source = self.homing_source
         if source is None:
             raise self.printer.command_error(
-                "Rotary axis %s has no homing_positive_dir and nothing to"
-                " measure which way its endstop is - configure"
-                " [accel_b_homing], or set homing_positive_dir in [%s]"
-                % (self.gcode_id, self.rail.get_name()))
+                "Rotary axis %s has an endstop but no homing direction, and"
+                " nothing to measure which way the endstop is - configure"
+                " [accel_b_homing]" % (self.gcode_id,))
         positive_dir, min_sweep = source.choose_homing_direction(
             hi.position_endstop, self.pos_min, self.pos_max)
         return positive_dir, min_sweep, source
@@ -294,13 +316,12 @@ class BaseRotaryAxis:
             # the endstop - and would otherwise be reported as homed
             source.verify_home(hi.position_endstop)
         self.is_homed = True
-
-        ### move to vertical position after homing rotary axis
-        curpos = toolhead.get_position()
-        curpos[pos_index] = 0.
-        toolhead.move(curpos, self.rail.homing_speed)
-
-        self.commanded_pos = toolhead.get_position()[pos_index]
+        # Move to the vertical position after homing the rotary axis.
+        # The homing sweep itself is a drip move, which carries no
+        # acceleration limit for a rotation-only move; this one is an
+        # ordinary move, so it can be given the trapezoid.
+        self.move_axis(0., self.rail.homing_speed,
+                       accel=self.get_homing_accel())
 
     ######################################################################
     # Commands

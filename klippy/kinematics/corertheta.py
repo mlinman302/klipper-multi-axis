@@ -90,8 +90,9 @@ class CoreRThetaKinematics:
         # gravity and drives it to B=0, so position_min/position_max are
         # only soft limits - see rotary_axis.BaseRotaryAxis.home() and
         # [accel_b_homing].  An endstop_pin is still accepted, and its
-        # homing direction is not guessed from where it sits in the range:
-        # with homing_positive_dir unset, the IMU picks it at G28 B.
+        # homing direction is not guessed from where it sits in the range,
+        # and homing_positive_dir is not accepted: the IMU picks the
+        # direction at every G28 B.
         rail_b = stepper.LookupMultiRail(config.getsection('stepper_tilt'),
                                          infer_homing_dir=False,
                                          need_endstop=False)

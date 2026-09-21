@@ -672,10 +672,10 @@ gear_ratio:
 # position can only be set by hand with SET_ROTARY_AXIS AXIS=B
 # SET_POSITION=<angle>.
 # An endstop_pin and position_endstop may still be given, in which case
-# G28 B sweeps into the endstop. Unlike every other rail its
-# homing_positive_dir is then not inferred from where position_endstop
-# sits in the range: either set it, or leave it unset and let
-# [accel_b_homing] measure which side of the endstop the head is on.
+# G28 B sweeps into the endstop. Unlike every other rail it has no
+# homing_positive_dir, given or inferred from where position_endstop sits
+# in the range, and the option is refused here: [accel_b_homing] measures
+# which side of the endstop the head is on at every G28 B.
 [stepper_tilt]
 
 # The stepper_z section is used to describe the leadscrew stepper
@@ -2871,13 +2871,36 @@ commissioning order, and [BMI160_IMU.md](BMI160_IMU.md) for the sensor.
 On corertheta this section is what homes B. `[stepper_tilt]` has no
 endstop by default, so `G28 B` energises both gantry motors, measures the
 head, books the measurement as B, and turns it to B=0, measuring again
-after each move until it is within `zero_tolerance`. The first move is no
-longer than `direction_check_move` and is checked: a head that turns the
-wrong way, not at all, or much further than commanded stops the home
-there. `position_min` and `position_max` are then soft limits. If
-`[stepper_tilt]` has an `endstop_pin`, `G28 B` sweeps into it instead,
-with the measurement picking the direction (when `homing_positive_dir`
-is unset) and verifying the result.
+after each move until it is within `zero_tolerance`. `position_min` and
+`position_max` are then soft limits. If `[stepper_tilt]` has an
+`endstop_pin`, `G28 B` sweeps into it instead, with the measurement
+picking the direction and verifying the result.
+
+Which way B=0 lies is taken from the config, not worked out by trying:
+`invert_b_direction` in `[printer]` says which way the gantry motors turn
+B and `positive_vector` says which way the sensor reads it. `G28 B`
+commands the move to B=0 outright and then checks what the head did - a
+head that turned the other way, not at all, or much further than
+commanded is refused, the first of those with "the homing direction is
+inverted". A move too short to have a direction (under one degree) is not
+judged. Because nothing caps that first move, an inverted machine turns
+the head as far the wrong way as it was asked to turn the right way, so
+verify both vectors before relying on the home, with the head at a B it
+can afford to turn away from.
+
+The `direction_check_move` option that capped that first move while the
+direction was still being discovered was removed. klippy reports an error
+naming what replaced it.
+
+Homing moves ramp at `homing_accel`, and the `B_SENSOR_CALIBRATE` and
+`B_STEP_CALIBRATE` sweeps at `calibration_accel`. A move that only turns
+B has no linear travel, so Klipper does not treat it as a kinematic move
+and it carries no acceleration limit of its own; without one the head is
+stepped straight to the commanded speed and rings on the belts
+afterwards, which the settle dwell before each measurement then has to
+wait out. Both are ceilings - an `axis_max_accel` on the axis still wins
+where it is tighter - and both are separate because the sweeps are the
+long, patient moves: they stop to be measured at every station.
 
 Which way is B=0 is declared with two signed sensor axes. Both name the
 sensor axis that points straight *up* at the angle in question - an
@@ -2959,13 +2982,20 @@ positive_vector:
 #max_homing_moves: 5
 #   The most moves G28 B may make toward B=0, the first move included,
 #   before it gives up with an error. The default is 5.
-#direction_check_move: 5.0
-#   The longest first move (in degrees) G28 B makes toward B=0, before
-#   the head has been seen to follow the motors. The home is refused if
-#   the head turned the wrong way, less than half as far as commanded, or
-#   more than twice as far. Keep it no larger than the travel the
-#   filament tube can take beyond a soft limit. It must be at least 1.0.
-#   The default is 5.0.
+#homing_accel: 100.0
+#   The largest acceleration (in deg/s^2) B homing moves may ramp at,
+#   which is also the one the move to vertical after an endstop home
+#   uses. A rotation-only move carries no acceleration limit of its own,
+#   so 0 - which restores that - steps the head straight to
+#   homing_speed. An axis_max_accel on the axis itself still applies when
+#   it is tighter. The default is 100.0.
+#calibration_accel: 100.0
+#   The same ceiling for the moves B_SENSOR_CALIBRATE and
+#   B_STEP_CALIBRATE make - every station of a sweep, and the parks that
+#   end one, including on an error path. These are the moves that stop to
+#   be measured dozens of times, so this is the one to lower if stations
+#   do not settle. The re-home a sensor calibration ends with uses
+#   homing_accel. The default is 100.0.
 #homing_tolerance: 5.0
 #   Only for a [stepper_tilt] with an endstop_pin, in degrees: the band
 #   around position_endstop inside which the head's side of the endstop

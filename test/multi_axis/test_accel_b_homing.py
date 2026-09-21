@@ -13,6 +13,7 @@
 #
 # Run with:  python test/multi_axis/test_accel_b_homing.py
 import math, os, random, sys, types, unittest
+from unittest import mock
 
 KLIPPY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           '..', '..', 'klippy')
@@ -893,6 +894,7 @@ class FakeMeasuredAxis:
         self.position = None
         self.is_homed = False
         self.moves = []
+        self.accels = []
         # What rotary_axis.home() hands an endstop-less rail to
         self.has_endstop = False
         self.homing_source = None
@@ -910,13 +912,14 @@ class FakeMeasuredAxis:
     def set_measured_position(self, angle):
         self.position = angle
         self.is_homed = True
-    def move_axis(self, angle, speed=None):
+    def move_axis(self, angle, speed=None, accel=None):
         if not self.is_homed:
             raise ConfigError("Must home rotary axis B first")
         lo, hi = self.rng
         if angle < lo or angle > hi:
             raise ConfigError("Rotary axis B move out of range")
         self.moves.append(angle)
+        self.accels.append(accel)
         # The head follows the motors through the dead band: d is where
         # the drive holds the head, in commanded degrees
         half = .5 * self.backlash
@@ -953,12 +956,24 @@ class TestMeasuredHome(unittest.TestCase):
     def test_a_correct_drive_homes_to_zero(self):
         obj, axis, _ = build_home(30.)
         obj.home_axis(axis)
-        # A capped check move first, then straight to zero
-        self.assertEqual(axis.moves[:2], [25., 0.])
+        # Straight to zero: the direction is declared, not discovered
+        self.assertEqual(axis.moves, [0.])
         self.assertAlmostEqual(axis.chip.angle, 0., places=2)
         self.assertEqual(axis.position, 0.)
         self.assertTrue(axis.is_homed)
         self.assertIn("head at B = 30.00", self._responses(obj))
+    def test_the_homing_moves_are_given_an_acceleration(self):
+        obj, axis, _ = build_home(30., config_values={'homing_accel': 40.})
+        obj.home_axis(axis)
+        self.assertEqual(axis.accels, [40.])
+    def test_a_zero_homing_accel_leaves_the_axis_limits_alone(self):
+        obj, axis, _ = build_home(30., config_values={'homing_accel': 0.})
+        obj.home_axis(axis)
+        self.assertEqual(axis.accels, [None])
+    def test_the_default_homing_accel_is_applied(self):
+        obj, axis, _ = build_home(30.)
+        obj.home_axis(axis)
+        self.assertEqual(axis.accels, [100.])
     def test_the_home_books_the_fused_angle(self):
         # A head the fake keeps turning at 4 deg/s through each capture:
         # the accelerometer average of a capture lags at +2 deg, the
@@ -970,10 +985,10 @@ class TestMeasuredHome(unittest.TestCase):
         self.assertIn("head at B = 33.00", self._responses(obj))
         self.assertAlmostEqual(obj.last_reading.fused_angle, 0., delta=.25)
         self.assertAlmostEqual(obj.last_reading.accel_angle, -1., delta=.25)
-    def test_the_check_move_heads_toward_zero_from_either_side(self):
+    def test_a_head_below_zero_homes_up_to_it(self):
         obj, axis, _ = build_home(-20.)
         obj.home_axis(axis)
-        self.assertEqual(axis.moves[0], -15.)
+        self.assertEqual(axis.moves, [0.])
         self.assertAlmostEqual(axis.chip.angle, 0., places=2)
     def test_the_motors_are_energised_before_measuring(self):
         obj, axis, enable = build_home(10.)
@@ -984,22 +999,24 @@ class TestMeasuredHome(unittest.TestCase):
         obj, axis, _ = build_home(60., ratio=.9)
         obj.home_axis(axis)
         self.assertLess(abs(axis.chip.angle), .25)
-        self.assertGreater(len(axis.moves), 3)
+        self.assertGreater(len(axis.moves), 2)
+        self.assertEqual(set(axis.moves), set([0.]))
     def test_a_head_already_vertical_needs_no_correction(self):
         obj, axis, _ = build_home(.1)
         obj.home_axis(axis)
         # Only the final move onto a commanded zero
         self.assertEqual(axis.moves, [0.])
         self.assertAlmostEqual(axis.chip.angle, 0., places=6)
-    def test_a_reversed_head_stops_after_the_check_move(self):
+    def test_a_reversed_head_is_refused_after_one_move(self):
         obj, axis, _ = build_home(80., ratio=-1.)
         with self.assertRaises(ConfigError) as cm:
             obj.home_axis(axis)
+        self.assertIn("homing direction is inverted", str(cm.exception))
         self.assertIn("positive_vector", str(cm.exception))
         self.assertIn("invert_b_direction", str(cm.exception))
-        # Driven the wrong way by the check move only - never toward 160
-        self.assertEqual(axis.moves, [75.])
-        self.assertAlmostEqual(axis.chip.angle, 85., places=2)
+        # One move, then refused - never a second one
+        self.assertEqual(axis.moves, [0.])
+        self.assertAlmostEqual(axis.chip.angle, 160., places=2)
     def test_a_head_that_does_not_move_is_refused(self):
         obj, axis, _ = build_home(30., ratio=0.)
         with self.assertRaises(ConfigError) as cm:
@@ -1016,19 +1033,20 @@ class TestMeasuredHome(unittest.TestCase):
         with self.assertRaises(ConfigError) as cm:
             obj.home_axis(axis)
         self.assertIn("not converging", str(cm.exception))
-    def test_the_check_move_is_configurable(self):
-        obj, axis, _ = build_home(30., config_values={
-            'direction_check_move': 10.})
-        obj.home_axis(axis)
-        self.assertEqual(axis.moves[0], 20.)
+    def test_the_removed_check_move_option_is_reported(self):
+        with self.assertRaises(ConfigError) as cm:
+            build({'direction_check_move': 10.})
+        self.assertIn("direction_check_move", str(cm.exception))
+        self.assertIn("has been removed", str(cm.exception))
+        self.assertIn("invert_b_direction", str(cm.exception))
     def test_a_tiny_first_move_gives_no_verdict(self):
-        # 0.8 degrees is too short to say which way the head went, so it
-        # is neither refused nor trusted: the next move is capped again,
-        # and that one is long enough to catch the reversal
+        # 0.8 degrees is too short to say which way the head went, so
+        # that move is not judged; the next one is long enough to catch
+        # the reversal
         obj, axis, _ = build_home(.8, ratio=-1.)
         with self.assertRaises(ConfigError) as cm:
             obj.home_axis(axis)
-        self.assertIn("positive_vector", str(cm.exception))
+        self.assertIn("homing direction is inverted", str(cm.exception))
         self.assertEqual(axis.moves[0], 0.)
         self.assertAlmostEqual(axis.moves[1], 0., places=6)
         self.assertEqual(len(axis.moves), 2)
@@ -1036,8 +1054,8 @@ class TestMeasuredHome(unittest.TestCase):
         obj, axis, _ = build_home(110.)
         obj.home_axis(axis)
         self.assertIn("outside the soft limits", self._responses(obj))
-        # The first move cannot end beyond the limit, so it ends on it
-        self.assertEqual(axis.moves[0], 100.)
+        # Zero is inside the limits, so the move is still a move to zero
+        self.assertEqual(axis.moves, [0.])
         self.assertAlmostEqual(axis.chip.angle, 0., places=2)
 
 
@@ -1132,10 +1150,14 @@ class FakeHomingToolhead(FakeToolhead):
         self.position = list(pos)
 
 class FakeSource:
-    def __init__(self, positive_dir, min_sweep, verify_error=None):
+    def __init__(self, positive_dir, min_sweep, verify_error=None,
+                 homing_accel=None):
         self.result = (positive_dir, min_sweep)
         self.verify_error = verify_error
+        self.homing_accel = homing_accel
         self.verified = []
+    def get_homing_accel(self):
+        return self.homing_accel
     def choose_homing_direction(self, position_endstop, pos_min, pos_max):
         return self.result
     def verify_home(self, position_endstop):
@@ -1153,17 +1175,31 @@ class TestRotaryAxisHome(unittest.TestCase):
     def _axis(self, position_endstop, positive_dir, source=None,
               rng=(-90., 90.)):
         printer = FakePrinter()
-        toolhead = FakeHomingToolhead()
-        printer.add_object('toolhead', toolhead)
         ra = rotary_axis.BaseRotaryAxis()
         ra.printer, ra.gcode_id = printer, 'B'
         ra.rail = FakeRail(position_endstop, positive_dir)
         ra.pos_min, ra.pos_max = rng
         ra.can_home, ra.is_homed = True, False
         ra.has_endstop = True
+        ra.max_accel = None
         ra.homing_source = source
+        toolhead = FakeAccelToolhead(ra)
+        printer.add_object('toolhead', toolhead)
         toolhead.extra_axes = [FakeExtruder(), None, ra]
+        self.toolhead = toolhead
         return ra
+    def test_the_move_to_vertical_takes_the_sources_accel(self):
+        source = FakeSource(True, 0., homing_accel=40.)
+        ra = self._axis(45., None, source)
+        ra.home()
+        # The endstop sweep is a drip move; the move to vertical that
+        # follows it is the one given the trapezoid
+        self.assertEqual(self.toolhead.seen, [40.])
+        self.assertIsNone(ra.max_accel)
+    def test_the_move_to_vertical_works_without_a_source(self):
+        ra = self._axis(45., True)
+        ra.home()
+        self.assertEqual(self.toolhead.seen, [None])
     def _forcepos(self, ra):
         return FakeHomingState.calls[-1][0][ra.get_position_index()]
     def test_a_configured_direction_needs_no_source(self):
@@ -1176,7 +1212,7 @@ class TestRotaryAxisHome(unittest.TestCase):
         with self.assertRaises(ConfigError) as cm:
             ra.home()
         self.assertIn("[accel_b_homing]", str(cm.exception))
-        self.assertIn("[stepper_tilt]", str(cm.exception))
+        self.assertNotIn("homing_positive_dir", str(cm.exception))
         self.assertFalse(ra.is_homed)
     def test_the_source_picks_the_direction_and_verifies(self):
         source = FakeSource(True, 10.)
@@ -1242,6 +1278,28 @@ class TestEndstoplessRail(unittest.TestCase):
             self.assertIn(option, str(cm.exception))
             self.assertIn("endstop_pin", str(cm.exception))
 
+class TestEndstopRailWithMeasuredDirection(unittest.TestCase):
+    # The corertheta B rail may have an endstop, but never a
+    # homing_positive_dir: the IMU measures the direction at every home
+    def _rail(self, values):
+        values = dict(values, endstop_pin='PJ1', position_endstop=-45.,
+                      position_min=-45., position_max=100.)
+        config = FakeRailConfig(FakeRailPrinter(), values)
+        with mock.patch.object(stepper.GenericPrinterRail, 'lookup_endstop',
+                               return_value=object()):
+            return stepper.GenericPrinterRail(config, infer_homing_dir=False,
+                                              need_endstop=False)
+    def test_the_direction_is_left_to_be_measured(self):
+        rail = self._rail({})
+        self.assertIsNone(rail.get_homing_info().positive_dir)
+        self.assertEqual(rail.get_homing_info().position_endstop, -45.)
+    def test_homing_positive_dir_is_refused(self):
+        for value in (True, False):
+            with self.assertRaises(ConfigError) as cm:
+                self._rail({'homing_positive_dir': value})
+            self.assertIn("homing_positive_dir", str(cm.exception))
+            self.assertIn("[accel_b_homing]", str(cm.exception))
+
 class FakeMeasuringSource:
     def __init__(self, angle=0., error=None):
         self.angle, self.error = angle, error
@@ -1250,6 +1308,8 @@ class FakeMeasuringSource:
         if self.error:
             raise ConfigError(self.error)
         axis.move_axis(0.)
+    def get_homing_accel(self):
+        return 100.
 
 class TestRotaryAxisMeasuredHome(unittest.TestCase):
     def setUp(self):
@@ -1268,6 +1328,7 @@ class TestRotaryAxisMeasuredHome(unittest.TestCase):
         ra.pos_min, ra.pos_max = -45., 100.
         ra.has_endstop = False
         ra.can_home, ra.is_homed = True, False
+        ra.max_accel = None
         ra.commanded_pos = 0.
         ra.homing_source = None
         toolhead.extra_axes = [FakeExtruder(), None, ra]
@@ -1300,6 +1361,62 @@ class TestRotaryAxisMeasuredHome(unittest.TestCase):
         with self.assertRaises(ConfigError):
             ra.home()
         self.assertFalse(ra.is_homed)
+
+
+######################################################################
+# The acceleration a homing move is given
+######################################################################
+
+# Records the axis' accel limit as it stood when each move was queued -
+# which is what toolhead.move() reads through check_move()
+class FakeAccelToolhead(FakeHomingToolhead):
+    def __init__(self, axis):
+        FakeHomingToolhead.__init__(self)
+        self.axis = axis
+        self.seen = []
+    def move(self, pos, speed):
+        self.seen.append(self.axis.max_accel)
+        FakeHomingToolhead.move(self, pos, speed)
+
+class TestMoveAxisAccel(unittest.TestCase):
+    def _axis(self, max_accel=None):
+        printer = FakePrinter()
+        ra = rotary_axis.BaseRotaryAxis()
+        ra.printer, ra.gcode_id = printer, 'B'
+        ra.rail = FakeRail(None, None)
+        ra.pos_min, ra.pos_max = -45., 100.
+        ra.max_accel = max_accel
+        ra.commanded_pos = 0.
+        toolhead = FakeAccelToolhead(ra)
+        printer.add_object('toolhead', toolhead)
+        toolhead.extra_axes = [FakeExtruder(), None, ra]
+        return ra, toolhead
+    def test_a_rotation_only_move_is_given_the_accel(self):
+        ra, toolhead = self._axis()
+        ra.move_axis(30., accel=40.)
+        self.assertEqual(toolhead.seen, [40.])
+    def test_the_axis_limit_is_restored_afterwards(self):
+        ra, toolhead = self._axis(max_accel=200.)
+        ra.move_axis(30., accel=40.)
+        self.assertEqual(toolhead.seen, [40.])
+        self.assertEqual(ra.max_accel, 200.)
+    def test_the_axis_own_limit_still_wins_when_it_is_tighter(self):
+        ra, toolhead = self._axis(max_accel=20.)
+        ra.move_axis(30., accel=40.)
+        self.assertEqual(toolhead.seen, [20.])
+    def test_no_accel_leaves_the_axis_limit_alone(self):
+        ra, toolhead = self._axis(max_accel=200.)
+        ra.move_axis(30.)
+        self.assertEqual(toolhead.seen, [200.])
+        self.assertEqual(ra.max_accel, 200.)
+    def test_the_limit_is_restored_after_a_failed_move(self):
+        ra, toolhead = self._axis(max_accel=200.)
+        def boom(pos, speed):
+            raise ConfigError("Rotary axis B move out of range")
+        toolhead.move = boom
+        with self.assertRaises(ConfigError):
+            ra.move_axis(30., accel=40.)
+        self.assertEqual(ra.max_accel, 200.)
 
 
 ######################################################################
@@ -1439,6 +1556,20 @@ class TestSensorCalibration(unittest.TestCase):
         return obj.calibrate_sensor(axis, start, end, steps, 0., .1, gain)
     def _responses(self, obj):
         return "\n".join(obj.printer.lookup_object('gcode').responses)
+    def test_the_sweep_and_the_home_after_it_ramp_differently(self):
+        # The sweep is the calibration's, the home it ends with is
+        # G28 B's, and the two ceilings are independent
+        chip = FakeBMI160(angle=30.)
+        obj, axis, _ = build_calibration(chip, ratio=.85, config_values={
+            'homing_accel': 90., 'calibration_accel': 25.})
+        steps = 13
+        axis.accels = []
+        self._calibrate(obj, axis, steps=steps)
+        # The stations and the park that follows them, then the moves of
+        # the re-home the calibration ends with
+        self.assertEqual(axis.accels[:steps + 1], [25.] * (steps + 1))
+        self.assertTrue(axis.accels[steps + 1:])
+        self.assertEqual(set(axis.accels[steps + 1:]), set([90.]))
     def test_it_fixes_the_zero_a_home_got_wrong(self):
         # The corertheta symptom: 100 mg of u offset homes the head to
         # about +5.7 deg, and after calibrating it homes to vertical
@@ -1794,8 +1925,8 @@ class TestDriveCalibration(unittest.TestCase):
         obj, axis, configfile, chip = build_drive()
         moves = []
         real_move = axis.move_axis
-        def move_then_break(angle, speed=None):
-            real_move(angle, speed)
+        def move_then_break(angle, speed=None, accel=None):
+            real_move(angle, speed, accel)
             moves.append(angle)
             if len(moves) == 3:
                 chip.overflows = 4
@@ -1807,6 +1938,28 @@ class TestDriveCalibration(unittest.TestCase):
         self.assertIn("fifo overflows", str(cm.exception))
         self.assertEqual(axis.moves[-1], 0.)
         self.assertEqual(configfile.saved, {})
+    def test_the_sweep_moves_ramp_at_the_calibration_accel(self):
+        obj, axis, _, _ = build_drive(config_values={
+            'homing_accel': 100., 'calibration_accel': 25.})
+        axis.accels = []
+        self._calibrate(obj, axis)
+        # Every move of the sweep, and the park that ends it
+        self.assertTrue(axis.accels)
+        self.assertEqual(set(axis.accels), set([25.]))
+    def test_the_park_after_a_failed_sweep_is_ramped_too(self):
+        obj, axis, _, chip = build_drive(config_values={
+            'calibration_accel': 25.})
+        chip.overflows = 4
+        axis.accels = []
+        with self.assertRaises(ConfigError):
+            self._calibrate(obj, axis)
+        self.assertEqual(axis.moves[-1], 0.)
+        self.assertEqual(set(axis.accels), set([25.]))
+    def test_a_zero_calibration_accel_leaves_the_axis_limits_alone(self):
+        obj, axis, _, _ = build_drive(config_values={'calibration_accel': 0.})
+        axis.accels = []
+        self._calibrate(obj, axis)
+        self.assertEqual(set(axis.accels), set([None]))
     def test_a_spot_check_changes_nothing(self):
         obj, axis, configfile, _ = build_drive(ratio=.95)
         scale = self._calibrate(obj, axis, 0., 90., 2, save=False)
