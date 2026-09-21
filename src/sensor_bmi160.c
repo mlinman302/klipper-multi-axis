@@ -1,6 +1,7 @@
-// Support for gathering acceleration data from BMI160 chip
+// Support for gathering data from a BMI160 accelerometer/gyroscope
 //
 // Copyright (C) 2025  Francisco Stephens <francisco.stephens.g@gmail.com>
+// Copyright (C) 2026  Klipper multi-axis contributors
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 #include <string.h> // memcpy
@@ -20,8 +21,14 @@
 #define BMI_FIFO_STATUS 0x22
 #define BMI_FIFO_DATA 0x24
 
-#define BYTES_PER_SAMPLE 6
+// A headerless fifo frame is six bytes with only the accelerometer
+// enabled, and twelve with the gyroscope enabled as well (gyro first -
+// the fifo stores sensor data in data-register order).  Klipper's
+// FixedFreqReader timestamps by counting, so every bulk message must
+// carry exactly MAX_BULK_MSG_SIZE (51) / frame_size whole frames:
+// 51/6 = 8 frames and 51/12 = 4 frames, both of which are 48 bytes.
 #define BYTES_PER_BLOCK 48
+#define BMI_FIFO_SIZE 1024
 
 struct bmi160 {
     struct timer timer;
@@ -32,6 +39,7 @@ struct bmi160 {
     };
     uint8_t bus_type;
     uint8_t flags;
+    uint8_t bytes_per_frame;
     uint16_t fifo_bytes_pending;
     struct sensor_bulk sb;
 };
@@ -65,6 +73,9 @@ command_config_bmi160(uint32_t *args)
     struct bmi160 *ax = oid_alloc(args[0], command_config_bmi160
                                    , sizeof(*ax));
     ax->timer.func = bmi160_event;
+    if (args[3] == 0 || BYTES_PER_BLOCK % args[3])
+        shutdown("bytes_per_frame must divide the bulk block size");
+    ax->bytes_per_frame = args[3];
 
     switch (args[2]) {
         case SPI_SERIAL:
@@ -88,7 +99,7 @@ command_config_bmi160(uint32_t *args)
     }
 }
 DECL_COMMAND(command_config_bmi160, "config_bmi160 oid=%c"
-                " bus_oid=%c bus_oid_type=%c");
+                " bus_oid=%c bus_oid_type=%c bytes_per_frame=%c");
 
 // Helper code to reschedule the bmi160_event() timer
 static void
@@ -104,8 +115,15 @@ bmi160_reschedule_timer(struct bmi160 *ax)
 static void
 update_fifo_status(struct bmi160 *ax, uint16_t fifo_bytes)
 {
-    // BMI160 FIFO can hold up to 1024 bytes
-    if (fifo_bytes > 1024)
+    // The fifo is full once another whole frame no longer fits.  A full
+    // fifo overwrites its oldest frames, and in headerless mode it does
+    // so silently - the skip frame that reports lost frames only exists
+    // in header mode, and the byte counter saturates rather than
+    // exceeding the fifo size.  Losing frames would corrupt the host's
+    // timestamps, which are assigned by counting, so a full fifo is
+    // reported as a possible overflow.  A slow bus (such as a Linux
+    // host's i2c at its default 100kHz) makes this likely.
+    if (fifo_bytes > BMI_FIFO_SIZE - ax->bytes_per_frame)
         ax->sb.possible_overflows++;
     ax->fifo_bytes_pending = fifo_bytes;
 }
