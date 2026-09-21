@@ -25,12 +25,19 @@ struct move {
     double print_time, move_t;
     double start_v, half_accel;
     struct coord start_pos, axes_r;
+    // Which of the two solutions of a kinematics with a redundant
+    // representation the move is solved on, and whether it changes over
+    // to the other one where it passes through the centre - see
+    // bed_centre.h.  Both are zero on every other machine.
+    int branch, branch_flip;
 
     struct list_node node;
 };
 
 struct trapq {
     struct list_head moves, history;
+    // Stamped onto each move trapq_append() adds - see trapq_set_branch()
+    int branch, branch_flip;
 };
 
 struct pull_move {
@@ -43,10 +50,12 @@ struct pull_move {
 struct move *move_alloc(void);
 double move_get_distance(struct move *m, double move_time);
 struct coord move_get_coord(struct move *m, double move_time);
+int move_get_branch(struct move *m, struct coord *c);
 struct trapq *trapq_alloc(void);
 void trapq_free(struct trapq *tq);
 void trapq_check_sentinels(struct trapq *tq);
 void trapq_add_move(struct trapq *tq, struct move *m);
+void trapq_set_branch(struct trapq *tq, int branch, int branch_flip);
 void trapq_append(struct trapq *tq, double print_time
                   , double accel_t, double cruise_t, double decel_t
                   , double start_pos_x, double start_pos_y, double start_pos_z

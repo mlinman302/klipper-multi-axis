@@ -642,6 +642,17 @@ max_z_velocity:
 max_z_accel:
 #max_angular_velocity: 0
 #   These behave as they do for polar kinematics (see above).
+#arm_crosses_centre: False
+#   Set this to True if the arm carriage can travel straight through the
+#   centre of the bed and on to position_max on the far side. Every X/Y
+#   position then has a second solution - the arm at a negative radius
+#   with the bed turned the other half turn - and a move that carries on
+#   through the centre takes it, with the bed held still, instead of
+#   turning the bed half a turn. The far side must reach as far as the
+#   near one, since the tool stays on that side until it next passes the
+#   centre: position_min of [stepper_r] must be -position_max or less. It
+#   is what the "cross" policy of [polar_singularity] needs. The default
+#   is False.
 
 # The stepper_c section is used to describe the stepper controlling the
 # rotating bed. As on a polar printer its angle is derived from the
@@ -653,9 +664,10 @@ gear_ratio:
 
 # The stepper_r section describes the first gantry motor. It carries the
 # endstop and position_min/position_max of the R axis - the arm radius in
-# mm from the centre of the bed. A negative position_min is allowed - it
-# denotes the far side of the bed, reached by turning the bed rather than
-# by driving the arm through the middle - but position_endstop must not be
+# mm from the centre of the bed. A negative position_min is allowed; the
+# arm only travels there with arm_crosses_centre set, and otherwise the
+# far side of the bed is reached by turning the bed rather than by
+# driving the arm through the middle. position_endstop must not be
 # negative. Homing R always sweeps from a radius of zero, since a homing
 # sweep across the centre would be a half turn of the bed at the instant
 # the sign of the radius flips.
@@ -2712,14 +2724,31 @@ A move that crosses the axis - or passes so close that it would have to
 run below `min_velocity` - is handled according to `travel_policy` or
 `print_policy`: `error` refuses it, naming its closest approach and the
 rate it would have needed; `bypass` routes it through the centre and
-turns the bed there. Bypass stops on the axis for up to half a turn of
-the bed, which is harmless on a travel move and leaves a blob on a
-printed one, hence the different defaults. A move that is merely slowed
-is split so that only its part close to the centre runs slowly.
+turns the bed there; `cross` carries it straight on through the centre
+with the bed held still and the arm travelling through zero radius, which
+needs `arm_crosses_centre` in `[printer]`. Bypass stops on the axis for
+up to half a turn of the bed, which is harmless on a travel move and
+leaves a blob on a printed one, hence the different defaults; `cross`
+keeps a move dead through the centre on its path and at its speed, and
+is the only policy fit for printing. With `cross` a move leaving the
+centre may also leave along the far half of the line the bed faces, so
+the bed never turns more than a quarter turn. A move that is merely
+slowed is split so that only its part close to the centre runs slowly.
 
-Only G-Code moves are planned; moves made directly on the toolhead are
-only limited and refused. A tilted head is not stood upright for a move
-across the centre - with `[rtcp]` on, centre moves are for `B` near zero.
+With the head tilted, a `bypass` that turns the bed first stands the head
+up (`B` to zero) where the move starts and tilts it back where it ends
+(`upright_transit`), since turning the bed under a tilted head swings
+the head with `[b_projection]` and the arm with `[rtcp]`. A printing move
+cannot do that without changing the bead, so it is refused instead.
+`cross` holds the bed still and needs neither.
+
+Every move, planned or not, is checked so that the toolhead position
+always names the angle the bed faces: a move may only come to rest near
+the centre on the ray it arrived along, and only leave it along the line
+the bed faces. Setting the position anywhere else would redefine the bed
+angle and turn everything printed afterwards. Only G-Code moves are
+planned; moves made directly on the toolhead are only limited and
+refused.
 
 See [Multi_Axis.md](Multi_Axis.md).
 
@@ -2745,10 +2774,18 @@ See [Multi_Axis.md](Multi_Axis.md).
 #   0.5.
 #travel_policy: bypass
 #   What to do with a move that crosses the centre and does not extrude:
-#   "bypass" to route it through the centre and turn the bed there, or
-#   "error" to refuse it. The default is bypass.
+#   "bypass" to route it through the centre and turn the bed there,
+#   "cross" to carry it straight on through the centre with the bed held
+#   still (needs arm_crosses_centre in [printer]), or "error" to refuse
+#   it. The default is bypass.
 #print_policy: error
 #   The same for a move that extrudes. The default is error.
+#upright_transit: True
+#   Whether a bypass that turns the bed stands a tilted head up while it
+#   does, on a travel move, and refuses a printing move that would need
+#   to. With this False such moves run tilted, and are refused by the
+#   [rtcp] reach check wherever the arm cannot follow. The default is
+#   True.
 #reorient_radius:
 #   The radius (in mm) of the circle the tool follows while the bed turns
 #   on the axis. It must be at least 0.04, and large enough that the

@@ -1,0 +1,63 @@
+# Tests for crossing the bed centre on an arm that can travel through it
+# (arm_crosses_centre).  A move that carries straight on through the
+# middle takes the other solution of every x/y position - the arm at a
+# negative radius, the bed turned the other half turn - so it keeps its
+# path and its speed and the bed never turns.  The moves that cross the
+# centre in polar_singularity.test by stopping on it and turning the bed
+# are the ones this runs straight through, printing included.
+#
+# test/multi_axis/test_centre_path.py checks the plans, and
+# test_kin_6axis.c runs the same crossings through the real step
+# compressor on the bed and both gantry motors.  This runs them end to
+# end through klippy, which is the one place the toolhead hands the
+# branch to the motion queue.
+DICTIONARY atmega2560.dict
+CONFIG polar_singularity_cross.cfg
+
+# Home.  Homing R puts the arm on the usual branch, at a positive radius.
+G28 X
+G28 B
+G28 Z
+G90
+G1 X80 Y0 Z10 F6000
+
+# Straight across the centre: stopped a tenth of a micron short of it,
+# then carried on through onto the far side, where the arm radius is
+# negative and the bed has not moved
+G1 X-80 Y0 F6000
+
+# Round the far side on the negative branch, and back across
+G1 X0 Y-80 F6000
+G1 X80 Y0 F6000
+G1 X-80 Y0 F6000
+G1 X-40 Y-40 F6000
+G1 X40 Y40 F6000
+
+# A near miss, too close to slow down for, is routed through the centre
+# and turns the bed by the few hundredths of a degree it misses by
+G1 X-40 Y0.005 F6000
+G1 X40 Y0.005 F6000
+
+# Printing straight across, both ways
+G1 X40 Y0 Z0.3 F3000
+G1 X-40 Y0 E5 F1500
+G1 X40 Y0 E10 F1500
+
+# Onto the centre, up and down the axis, and off it at right angles -
+# the bed turns a quarter turn at most, whichever side it leaves on
+G1 X0 Y0 Z10 F3000
+G1 Z30 F600
+G1 Z10 F600
+G1 X0 Y40 F3000
+G1 X0 Y0 F3000
+G1 X-40 Y0 F3000
+G1 X0 Y0 F3000
+G1 X0 Y-40 F3000
+
+# Homing R again from the far side puts the arm back on the usual branch
+G1 X-60 Y0 F3000
+G28 X
+G1 X50 Y0 F3000
+
+GET_POSITION
+M84

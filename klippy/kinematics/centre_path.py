@@ -13,9 +13,7 @@
 # taking it from the direction of travel.  A single sample cannot tell a
 # move that is arriving at the centre from one that is leaving it, so that
 # rule steps the bed whenever a move leaves the centre along any ray but
-# the one the bed faces - carrying straight on through it included - and,
-# because on the bare centre it falls back to atan2 of wherever the
-# carriage is, whenever RTCP shifts the carriage there with a B move.
+# the one the bed faces - carrying straight on through it included.
 #
 # The host can see the moves on either side, so the host schedules the
 # angle.  This file turns one commanded move into the list of moves that
@@ -28,45 +26,55 @@
 # Arriving.  A move whose target is on the centre is stopped PARK_RADIUS
 # short of it, on the ray it arrived along.  At rest the bed angle is then
 # the angle of that park point - the one the bed arrived facing - rather
-# than whatever atan2 makes of the bare centre, and it stays so under a
-# B move with RTCP on, whose correction scales the carriage along the
-# park ray.  It also means the bed angle can be read back off the
-# toolhead position, which is what departing needs.  The park point is a
+# than whatever atan2 makes of the bare centre.  That is what lets the
+# bed angle be read back off the toolhead position, which departing
+# needs, and which setting the toolhead position relies on (see "The
+# position names the bed angle" in bed_centre.py).  The park point is a
 # tenth of a micron from the centre: far below anything the arm can
 # resolve, and far above rounding.
 #
-# Departing.  A move from the centre to a point on a different ray needs
-# the bed to turn first, and the bed can only turn at a finite rate while
-# the tool is outside the disc.  So the tool steps radially out to
-# reorient_radius along the ray the bed is already facing, follows that
-# circle round to the new ray at no more than the bed's angular velocity
-# limit, and then carries on radially to the target.  The arc is the only
-# place the tool leaves the commanded path, by reorient_radius at most,
-# and z, e and any rotary axis are held while it runs.
+# Departing.  A move from the centre to a point off the line the bed faces
+# needs the bed to turn first, and the bed can only turn at a finite rate
+# while the tool is outside the disc.  So the tool steps radially out to
+# reorient_radius along that line, follows the circle round to the new
+# ray at no more than the bed's angular velocity limit, and then carries
+# on radially to the target.  The arc is the only place the tool leaves
+# the commanded path, by reorient_radius at most, and z, e and any rotary
+# axis are held while it runs.  Where the arm can travel through the
+# centre (arm_crosses_centre) and the move's policy is 'cross', the tool
+# may leave along either half of the line the bed faces - carrying on
+# through the centre onto the other branch if that half is the nearer -
+# so the bed never turns more than a quarter turn.
 #
 # Crossing.  A move that passes through the disc - or so close to it that
-# no feedrate within min_velocity would hold the bed's limits - is either
-# left alone for the move check to refuse ('error'), or split at its
-# closest approach into an arrival and a departure ('bypass').  Bypass
+# no feedrate within min_velocity would hold the bed's limits - is left
+# alone for the move check to refuse ('error'), or split at its closest
+# approach into an arrival and a departure.  With 'bypass' the departure
 # stops on the centre while the bed turns up to half a turn, which is
-# harmless on a travel move and leaves a blob on a print move, so the two
-# have separate policies and printing defaults to 'error'.
+# harmless on a travel move and leaves a blob on a print move.  With
+# 'cross' it carries straight on through the centre with the bed held
+# still and the arm travelling through zero radius: a move dead through
+# the middle keeps its exact path and its speed.  Printing defaults to
+# 'error', since only 'cross' is fit for it.
+#
+# Upright transit.  With the head tilted, crossing the centre by turning
+# the bed is not free: [b_projection] swings the head's B with the bed,
+# and [rtcp] swings the arm with the head - through the middle, on an arm
+# that cannot go there.  So a 'bypass' that turns the bed stands the head
+# up (B to zero) before it sets off and tilts it back once it has
+# arrived, on a travel move.  A print move cannot stand the head up
+# without changing the bead, and is refused instead.  'cross' holds the
+# bed still, or turns it a little at most, on an arm that follows the
+# tilt through the middle, so it needs neither.
 #
 # Everything else passes through.  A near miss that the bed's limits slow
 # down is split around its closest approach, into segments whose inner
 # radii double outward, so that only the part of the move that really is
 # close to the centre runs slowly.
-#
-# WHAT IT DOES NOT DO YET
-#
-# It does not stand the head up.  A tilted head at the centre puts the arm
-# on the far side of the middle as soon as RTCP swings the tip, and the
-# RTCP reach check refuses that - so centre work is for B at zero, or at
-# least at a B whose swing fits inside the arc.
 import math
 from . import bed_centre
 
-POLICIES = ('error', 'bypass')
+POLICIES = ('error', 'bypass', 'cross')
 
 # A target this close to the centre is on it.  The same disc the step
 # generator treats specially, so that nothing is ever left standing inside
@@ -75,8 +83,8 @@ SNAP_RADIUS = bed_centre.CENTRE_RADIUS
 # How far short of the centre an arriving move stops, in mm
 PARK_RADIUS = 1e-4
 # A bed angle change this small (in radians) is left to the step
-# generator - well under a microstep on any bed this is likely to drive
-ANGLE_TOLERANCE = 1e-4
+# generator - the same tolerance the move check holds a departure to
+ANGLE_TOLERANCE = bed_centre.ANGLE_TOLERANCE
 # The most one chord of a reorientation arc turns the bed through.  Each
 # chord dips inside the circle by ARC_CHORD_DIP at its middle.
 MAX_ARC_CHORD = math.radians(10.)
@@ -111,21 +119,32 @@ def with_xy(pos, x, y):
     res[0], res[1] = x, y
     return res
 
-def wrap_angle(angle):
-    # Into (-pi, pi]
-    return math.atan2(math.sin(angle), math.cos(angle))
+wrap_angle = bed_centre.wrap_angle
 
 def is_extruding(start, end):
     return len(start) > 3 and len(end) > 3 and end[3] > start[3]
 
 
+class CentrePlanError(Exception):
+    pass
+
+
 class CentrePlanner:
     def __init__(self, max_angular_v=0., max_angular_a=0., min_velocity=.5,
                  reorient_radius=None, travel_policy='bypass',
-                 print_policy='error'):
+                 print_policy='error', can_cross=False, tilt_index=None,
+                 upright_transit=True):
+        # 'can_cross' says the arm can travel through the centre to a
+        # negative radius, and 'tilt_index' where the head's tilt (B) is
+        # in a position vector - None for a machine without one.
         for policy in (travel_policy, print_policy):
             if policy not in POLICIES:
                 raise ValueError("Unknown centre policy '%s'" % (policy,))
+            if policy == 'cross' and not can_cross:
+                raise ValueError(
+                    "The 'cross' policy carries the arm through the centre"
+                    " of the bed to a negative radius, and this machine"
+                    " does not allow that - see arm_crosses_centre")
         if reorient_radius is None:
             reorient_radius = default_reorient_radius(max_angular_v,
                                                       min_velocity)
@@ -148,18 +167,23 @@ class CentrePlanner:
         self.reorient_v = max_angular_v or DEFAULT_REORIENT_VELOCITY
         self.travel_policy = travel_policy
         self.print_policy = print_policy
+        self.can_cross = can_cross
+        self.tilt_index = tilt_index
+        self.upright_transit = upright_transit
 
     def policy(self, start, end):
         if is_extruding(start, end):
             return self.print_policy
         return self.travel_policy
 
-    def plan(self, machine_xy, start, end, speed):
+    def plan(self, machine_xy, start, end, speed, branch=1):
         # The moves that carry out start -> end.  'start' and 'end' are
         # full position vectors in the frame of the caller; 'machine_xy'
         # is where the toolhead really is, which on the centre is a park
-        # point rather than the (0, 0) the caller asked for.  Returns a
-        # list of (position, speed).
+        # point rather than the (0, 0) the caller asked for, and 'branch'
+        # the branch it is on (see bed_centre.py).  Returns a list of
+        # (position, speed).  Raises CentrePlanError for a move that has
+        # no plan and that the move check would pass.
         from_centre = at_centre(machine_xy)
         if at_centre(end):
             if from_centre:
@@ -169,8 +193,9 @@ class CentrePlanner:
                          speed)]
             return self._arrive(machine_xy, end, speed)
         if from_centre:
-            return self._depart(machine_xy, start, end, speed)
-        return self._through(start, end, speed)
+            return self._depart(machine_xy, start, end, speed, branch,
+                                self.policy(start, end) == 'cross')
+        return self._through(start, end, speed, branch)
 
     ######################################################################
     # Arriving and departing
@@ -181,24 +206,48 @@ class CentrePlanner:
         scale = PARK_RADIUS / math.sqrt(x*x + y*y)
         return [(with_xy(end, x * scale, y * scale), speed)]
 
-    def _depart(self, machine_xy, start, end, speed):
-        angle_from = bed_centre.bed_angle(machine_xy[0], machine_xy[1])
-        angle_to = math.atan2(end[1], end[0])
-        turn = wrap_angle(angle_to - angle_from)
+    def _departure(self, machine_xy, end, branch, may_cross):
+        # How far the bed has to turn before the tool can leave the centre
+        # for 'end' in a straight line, and the branch it leaves on: the
+        # usual one, or - where the arm may cross the centre - the other,
+        # if that turns the bed less.
+        facing = bed_centre.bed_angle(machine_xy[0], machine_xy[1], None,
+                                      branch)
+        ray = math.atan2(end[1], end[0])
+        best = None
+        for new_branch in ((1, -1) if may_cross else (1,)):
+            target = ray if new_branch > 0 else bed_centre.half_turn(ray)
+            turn = wrap_angle(target - facing)
+            if best is None or abs(turn) < abs(best[0]) - ANGLE_TOLERANCE:
+                best = (turn, new_branch)
+        return best
+
+    def _depart(self, machine_xy, start, end, speed, branch=1,
+                may_cross=False):
+        turn, new_branch = self._departure(machine_xy, end, branch,
+                                           may_cross)
         if abs(turn) <= ANGLE_TOLERANCE:
-            # Already facing the right way - the move is radial
+            # Already facing along the line to the target - the move is
+            # radial.  If the target is on the far side of the centre the
+            # kinematics carries it through onto the other branch.
             return [(end, speed)]
-        radius = self.reorient_radius
+        angle_from = bed_centre.bed_angle(machine_xy[0], machine_xy[1], None,
+                                          branch)
+        # The arc runs at this arm radius: on the far side of the centre,
+        # negative, when the tool leaves on the other branch
+        radius = new_branch * self.reorient_radius
         def on_arc(angle):
             return with_xy(start, radius * math.cos(angle),
                            radius * math.sin(angle))
-        # Out along the ray the bed already faces.  It starts inside the
-        # dead zone heading outward, so the bed holds its angle.
+        # Out along the line the bed already faces.  It starts inside the
+        # dead zone heading straight along that line, so the bed holds its
+        # angle - on the far side, by carrying on through the centre.
         moves = [(on_arc(angle_from), speed)]
         # Round to the new ray, outside the dead zone the whole way
         # A quarter turn is nine chords, not ten because of rounding
         count = int(math.ceil(abs(turn) / MAX_ARC_CHORD - 1e-9))
-        arc_speed = min(speed, self.reorient_v * radius * ARC_CHORD_DIP)
+        arc_speed = min(speed,
+                        self.reorient_v * self.reorient_radius * ARC_CHORD_DIP)
         for i in range(1, count + 1):
             moves.append((on_arc(angle_from + turn * i / count), arc_speed))
         # And radially on to the target, carrying everything else with it
@@ -208,7 +257,7 @@ class CentrePlanner:
     ######################################################################
     # Everything else
     ######################################################################
-    def _through(self, start, end, speed):
+    def _through(self, start, end, speed, branch=1):
         if start[0] == end[0] and start[1] == end[1]:
             return [(end, speed)]
         offset, r_min, u_start, u_end = bed_centre.path_geometry(start, end)
@@ -221,24 +270,62 @@ class CentrePlanner:
         too_tight = (v_limit is not None and v_limit < self.min_velocity
                      and v_limit < speed)
         if bed_centre.crosses_centre(r_min, swept) or too_tight:
-            if self.policy(start, end) == 'error':
+            policy = self.policy(start, end)
+            if policy == 'error':
                 # Leave the refusal to the move check, which says why
                 return [(end, speed)]
-            return self._bypass(start, end, speed, u_start, u_end)
+            return self._via_centre(start, end, speed, branch,
+                                    policy == 'cross', u_start, u_end)
         if v_limit is not None and v_limit < speed and self.max_angular_v:
             return self._split_slow(start, end, speed, offset,
                                     u_start, u_end)
         return [(end, speed)]
 
-    def _bypass(self, start, end, speed, u_start, u_end):
+    def _via_centre(self, start, end, speed, branch, may_cross,
+                    u_start, u_end):
         # Visit the centre at the closest approach, interpolating
-        # everything else there, and turn the bed while stopped on it
+        # everything else there, and leave it for the target - turning
+        # the bed while stopped on it, or carrying straight on through
         length = u_end - u_start
         t = min(max(-u_start / length, 0.), 1.)
         middle = with_xy(bed_centre.interpolate(start, end, t), 0., 0.)
-        moves = self._arrive(start, middle, speed)
-        park = moves[-1][0]
-        return moves + self._depart(park, middle, end, speed)
+        park = self._arrive(start, middle, speed)[0][0]
+        turn = self._departure(park, end, branch, may_cross)[0]
+        if may_cross or not self._stands_up(start, end, turn):
+            return ([(park, speed)]
+                    + self._depart(park, middle, end, speed, branch,
+                                   may_cross))
+        tilt = self.tilt_index
+        if is_extruding(start, end):
+            raise CentrePlanError(
+                "Move crosses the centre of the bed with the head tilted"
+                " (B=%.3f to %.3f).  Crossing by turning the bed would stand"
+                " the head up in the middle of printing.  Print across the"
+                " centre with B at zero, route the move clear of it, or use"
+                " print_policy: cross on an arm that can travel through it"
+                % (start[tilt], end[tilt]))
+        def upright(pos):
+            res = list(pos)
+            res[tilt] = 0.
+            return res
+        # Stand up where the move starts, cross upright, tilt back where
+        # it ends.  Each is a B move alone, so the arm holds its radius.
+        return ([(upright(start), speed), (upright(park), speed)]
+                + self._depart(upright(park), upright(middle), upright(end),
+                               speed, branch, may_cross)
+                + [(end, speed)])
+
+    def _stands_up(self, start, end, turn):
+        # Whether crossing the centre by turning the bed has to stand the
+        # head up: it turns the bed, and the head is tilted at either end.
+        # An arm that may cross the centre follows the tilt through the
+        # middle instead, and turns the bed a little at most.
+        tilt = self.tilt_index
+        if (not self.upright_transit or tilt is None
+                or abs(turn) <= ANGLE_TOLERANCE
+                or tilt >= len(start) or tilt >= len(end)):
+            return False
+        return bool(start[tilt] or end[tilt])
 
     def _split_slow(self, start, end, speed, offset, u_start, u_end):
         # Past r_fast the bed's velocity limit no longer binds at 'speed'.

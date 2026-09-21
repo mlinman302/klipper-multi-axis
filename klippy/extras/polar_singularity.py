@@ -53,13 +53,17 @@
 # including the ones no g-code transform ever sees.
 # It slows a move that passes near the centre to the bed's angular limits,
 # and refuses one that crosses the axis or that would have to crawl below
-# min_velocity to stay inside them.
+# min_velocity to stay inside them.  It also refuses a move that would
+# leave the centre, or come to rest there, with the bed facing somewhere
+# the toolhead position does not name - see "The position names the bed
+# angle" in bed_centre.py.
 #
 # A g-code move transform, which plans the path around the centre before
 # the moves are made: it parks the tool on the ray it arrived along, turns
 # the bed on a small arc before leaving along a new one, routes a crossing
-# travel move through the centre instead of refusing it, and splits a near
-# miss so only its close part runs slowly.  The planning itself lives in
+# move through the centre instead of refusing it - with the head stood up
+# if the bed has to turn - and splits a near miss so only its close part
+# runs slowly.  The planning itself lives in
 # klippy/kinematics/centre_path.py, which explains each of those.  The
 # transform only schedules what the move check would allow; anything it
 # passes through unchanged still has to get past the check.
@@ -67,20 +71,39 @@
 # The transform is registered at connect time, after every transform that
 # insists on being first ([bed_mesh], [bed_tilt]) and before the ones that
 # stack on top ([skew_correction]), so the x/y it plans in are the x/y the
-# toolhead receives.
+# toolhead receives.  [bed_mesh] and [bed_tilt] only change z, and
+# [bed_mesh] cuts a move into pieces along the same straight line, so
+# neither disturbs a plan.
 #
-# WHAT IT DOES NOT DO YET
+# CROSSING ON AN ARM THAT CAN
 #
-# It does not stand a tilted head upright for a centre transit.  And it
-# only plans g-code moves: anything that moves the toolhead itself is seen
-# by the move check alone, and has to plan its own moves with
-# kinematics/centre_path.py if they touch the centre.
+# On a corertheta machine whose arm travels through the centre
+# (arm_crosses_centre), a move that carries straight on through the
+# middle changes over to the other branch there - the arm passes through
+# zero radius and the bed is held still - and the kinematics marks it so
+# (branch_flip).  The bed does not turn on such a move, so the crossing
+# refusal and the angular limits do not apply to it; the check only makes
+# sure it runs straight along the line the bed faces.
+#
+# WHAT IT DOES NOT DO
+#
+# It only plans g-code moves: anything that moves the toolhead itself is
+# seen by the move check alone, and has to plan its own moves with
+# kinematics/centre_path.py if they touch the centre.  [input_shaper]
+# smooths the path across neighbouring moves, which at the centre is on
+# the scale of the park point and the reorientation arc; the plans here
+# assume the path the moves describe.
 import math
+import stepper
 from kinematics import centre_path
 from kinematics.bed_centre import (
-    CENTRE_RADIUS, path_geometry, swept_angle, crosses_centre,
-    peak_angular_velocity, peak_angular_accel, limits_for_angular_rates)
+    CENTRE_RADIUS, ANGLE_TOLERANCE, path_geometry, swept_angle,
+    crosses_centre, centre_turns, peak_angular_velocity, peak_angular_accel,
+    limits_for_angular_rates)
 from kinematics.polar import NO_ACCEL_LIMIT
+
+# Index of the head's tilt (B) within a toolhead position vector
+B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
 
 
 class PolarSingularity:
@@ -111,22 +134,25 @@ class PolarSingularity:
                                              minval=0.)
         # Below this feedrate, slowing down has stopped being an answer
         self.min_velocity = config.getfloat('min_velocity', 0.5, above=0.)
-        # What to do with a move that crosses the centre: refuse it, or
-        # stop on the centre and turn the bed there.  Stopping is harmless
-        # on a travel move and leaves a blob on a print move.
-        travel_policy = config.getchoice('travel_policy',
-                                         list(centre_path.POLICIES),
-                                         'bypass')
-        print_policy = config.getchoice('print_policy',
-                                        list(centre_path.POLICIES), 'error')
+        # What to do with a move that crosses the centre: refuse it, stop
+        # on the centre and turn the bed there, or - on an arm that can -
+        # carry straight on through it.  Stopping is harmless on a travel
+        # move and leaves a blob on a print move.
+        self.travel_policy = config.getchoice(
+            'travel_policy', list(centre_path.POLICIES), 'bypass')
+        self.print_policy = config.getchoice(
+            'print_policy', list(centre_path.POLICIES), 'error')
         # The circle the tool follows while the bed turns at the centre
-        reorient_radius = config.getfloat('reorient_radius', None, above=0.)
-        try:
-            self.planner = centre_path.CentrePlanner(
-                self.max_angular_v, self.max_angular_a, self.min_velocity,
-                reorient_radius, travel_policy, print_policy)
-        except ValueError as e:
-            raise config.error("[%s] %s" % (config.get_name(), e))
+        self.reorient_radius = config.getfloat('reorient_radius', None,
+                                               above=0.)
+        # Stand a tilted head up for a crossing that turns the bed
+        self.upright_transit = config.getboolean('upright_transit', True)
+        self.name = config.get_name()
+        # Whether 'cross' is possible depends on the kinematics, which is
+        # not there to ask until connect time - so check everything else
+        # now, and build the planner for real then
+        self.planner = self._make_planner(can_cross=True, tilt_index=None,
+                                          error=config.error)
         self.toolhead = self.next_transform = None
         self.last_position = [0., 0., 0., 0.]
         # Diagnostics for the last move that came near the centre.  Most
@@ -136,8 +162,24 @@ class PolarSingularity:
         self.last_swept = 0.
         self.last_velocity_limit = 0.
         self.printer.register_event_handler("klippy:connect", self._connect)
+    def _make_planner(self, can_cross, tilt_index, error):
+        try:
+            return centre_path.CentrePlanner(
+                self.max_angular_v, self.max_angular_a, self.min_velocity,
+                self.reorient_radius, self.travel_policy, self.print_policy,
+                can_cross, tilt_index, self.upright_transit)
+        except ValueError as e:
+            raise error("[%s] %s" % (self.name, e))
+
     def _connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
+        kin = self.toolhead.get_kinematics()
+        can_cross = getattr(kin, 'can_cross_centre', lambda: False)()
+        have_b = any(ea is not None and ea.get_axis_gcode_id() == 'B'
+                     for ea in self.toolhead.get_extra_axes())
+        self.planner = self._make_planner(
+            can_cross, B_POS_INDEX if have_b else None,
+            self.printer.config_error)
         self.toolhead.register_move_check(self._check_move)
         gcode_move = self.printer.lookup_object('gcode_move')
         self.next_transform = gcode_move.set_move_transform(self, force=True)
@@ -157,8 +199,12 @@ class PolarSingularity:
         # The toolhead's own x/y is what the bed angle follows, and on the
         # centre it is a park point rather than the position asked for
         machine_xy = self.toolhead.get_position()[:2]
-        for pos, move_speed in self.planner.plan(
-                machine_xy, self.last_position, newpos, speed):
+        try:
+            moves = self.planner.plan(machine_xy, self.last_position, newpos,
+                                      speed, self.toolhead.get_branch())
+        except centre_path.CentrePlanError as e:
+            raise self.printer.command_error(str(e))
+        for pos, move_speed in moves:
             self.next_transform.move(pos, move_speed)
         self.last_position[:] = newpos
 
@@ -171,12 +217,39 @@ class PolarSingularity:
             # This is the pure z move along the axis, and the rotation
             # only move at the centre.
             return
+        # Leaving rest and coming to rest must not step the bed, and must
+        # leave it facing the way the position says it does
+        turn_start, turn_end = centre_turns(move.start_pos, move.end_pos,
+                                            move.branch, move.branch_flip)
+        if abs(turn_start) > ANGLE_TOLERANCE:
+            raise move.move_error(
+                "Move leaves the centre of the bed %.2f degrees off the line"
+                " the bed faces, which would turn the bed that far at once."
+                "  Leave the centre along the line of the ray the tool"
+                " arrived on - the [polar_singularity] g-code transform"
+                " plans that" % (math.degrees(abs(turn_start)),))
+        if abs(turn_end) > ANGLE_TOLERANCE:
+            raise move.move_error(
+                "Move comes to rest at the centre of the bed %.2f degrees"
+                " off the ray it arrived along, where the position no"
+                " longer says which way the bed faces.  Stop short of the"
+                " centre on the ray of arrival - the [polar_singularity]"
+                " g-code transform plans that"
+                % (math.degrees(abs(turn_end)),))
         offset, r_min, u_start, u_end = path_geometry(move.start_pos,
                                                       move.end_pos)
-        swept = swept_angle(move.start_pos, move.end_pos)
         self.last_radius = r_min
-        self.last_swept = swept
         self.last_velocity_limit = 0.
+        if move.branch_flip:
+            # Straight through the centre onto the other branch, with the
+            # bed held still: the turns above keep it on the line the bed
+            # faces, so over the whole move the bed turns by no more than
+            # they allow.  Neither the crossing refusal nor the rates -
+            # which assume the bed follows atan2 - apply.
+            self.last_swept = 0.
+            return
+        swept = swept_angle(move.start_pos, move.end_pos)
+        self.last_swept = swept
         if crosses_centre(r_min, swept):
             # The path crosses the axis itself.  There is no rate here to
             # slow down - the bed angle steps, and no feedrate makes a step
@@ -217,7 +290,7 @@ class PolarSingularity:
                          NO_ACCEL_LIMIT if a_limit is None else a_limit)
 
     def get_status(self, eventtime):
-        return {
+        status = {
             'max_angular_velocity': self.max_angular_v,
             'max_angular_accel': self.max_angular_a,
             'last_radius': self.last_radius,
@@ -226,7 +299,16 @@ class PolarSingularity:
             'reorient_radius': self.planner.reorient_radius,
             'travel_policy': self.planner.travel_policy,
             'print_policy': self.planner.print_policy,
+            'upright_transit': self.planner.upright_transit,
+            'can_cross': self.planner.can_cross,
         }
+        if self.toolhead is not None:
+            # Whether the tool is standing on the centre, and on which
+            # branch - negative once it has crossed onto the far side
+            status['at_centre'] = centre_path.at_centre(
+                self.toolhead.get_position())
+            status['branch'] = self.toolhead.get_branch()
+        return status
 
 
 def load_config(config):

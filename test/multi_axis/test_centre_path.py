@@ -413,6 +413,8 @@ class FakeMove:
         self.end_pos = tuple(end_pos)
         self.axes_d = [e - s for s, e in zip(self.start_pos, self.end_pos)]
         self.max_cruise_v2 = velocity ** 2
+        self.branch = 1
+        self.branch_flip = False
     def limit_speed(self, speed, accel):
         self.max_cruise_v2 = min(self.max_cruise_v2, speed ** 2)
     def move_error(self, msg="Move out of range"):
@@ -479,6 +481,8 @@ class FakeToolhead:
         self.sent = []
     def get_position(self):
         return list(self.position)
+    def get_branch(self):
+        return 1
     def move(self, newpos, speed):
         self.sent.append((list(newpos), speed))
         self.position = list(newpos)
@@ -521,6 +525,259 @@ class TestTransform(unittest.TestCase):
         sent = [p for p, speed in obj.toolhead.sent]
         self.assertEqual(sent[-1], pos(0., 40., 30.))
         self.assertLess(largest_step(bed_trace((40., 0.), sent)), STEP)
+
+
+######################################################################
+# Crossing on an arm that can, and standing the head up
+######################################################################
+
+class Machine:
+    # The toolhead and the corertheta kinematics reduced to what a plan
+    # relies on: where the tool is, the branch it is on, and the flip the
+    # kinematics marks a move with when it carries on through the centre
+    def __init__(self, planner, start, can_cross=True, branch=1):
+        self.planner = planner
+        self.pos = list(start)
+        self.last = list(start)
+        self.branch = branch
+        self.can_cross = can_cross
+        self.moves = []
+    def send(self, p, speed):
+        moving = p[0] != self.pos[0] or p[1] != self.pos[1]
+        flip = (self.can_cross and moving and bed_centre.flips_through_centre(
+            self.pos, p, self.branch))
+        self.moves.append((list(self.pos), list(p), self.branch, flip, speed))
+        self.branch = bed_centre.end_branch(self.branch, flip)
+        self.pos = list(p)
+    def move(self, newpos, speed=100.):
+        for p, s in self.planner.plan(self.pos[:2], self.last, newpos, speed,
+                                      self.branch):
+            self.send(p, s)
+        self.last = list(newpos)
+
+def branch_trace(moves):
+    # The bed angles the step generator would command through a sequence
+    # of (start, end, branch, flip, speed) moves, at rest between them
+    angles = []
+    for start, end, branch, flip, speed in moves:
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        travel = (dx, dy) if (dx or dy) else None
+        angles.append(bed_centre.bed_angle(start[0], start[1], None, branch))
+        n = _samples(start, end)
+        for i in range(n + 1):
+            t = float(i) / n
+            x, y = start[0] + t * dx, start[1] + t * dy
+            angles.append(bed_centre.bed_angle(
+                x, y, travel,
+                bed_centre.sample_branch(x, y, travel, branch, flip)))
+        angles.append(bed_centre.bed_angle(
+            end[0], end[1], None, bed_centre.end_branch(branch, flip)))
+    return angles
+
+def cross_planner(**kw):
+    args = dict(travel_policy='cross', print_policy='cross', can_cross=True)
+    args.update(kw)
+    return make_planner(**args)
+
+def distance_to_line(p, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    return abs((p[0] - a[0]) * dy - (p[1] - a[1]) * dx) / math.hypot(dx, dy)
+
+
+class TestCross(unittest.TestCase):
+    def run_moves(self, planner, targets, can_cross=True):
+        machine = Machine(planner, targets[0], can_cross)
+        for target in targets[1:]:
+            machine.move(target)
+        return machine
+
+    def test_only_on_an_arm_that_can(self):
+        with self.assertRaises(ValueError):
+            make_planner(travel_policy='cross')
+        with self.assertRaises(ValueError):
+            make_planner(print_policy='cross')
+        cross_planner()
+
+    def test_straight_through_keeps_its_path_and_the_bed_still(self):
+        for a in ANGLES:
+            start, end = around(a, 40.), around(a + math.pi, 40.)
+            machine = self.run_moves(cross_planner(), [start, end])
+            # Stop short of the centre and carry straight on - no arc
+            self.assertEqual(len(machine.moves), 2, msg=a)
+            for s, e, branch, flip, speed in machine.moves:
+                self.assertLess(distance_to_line(e, start, end), 1e-9)
+                self.assertEqual(speed, 100.)
+            self.assertEqual([m[3] for m in machine.moves], [False, True])
+            self.assertEqual(machine.branch, -1)
+            trace = branch_trace(machine.moves)
+            facing = trace[0]
+            for angle in trace:
+                self.assertLess(abs(centre_path.wrap_angle(angle - facing)),
+                                1e-6, msg=a)
+
+    def test_there_and_back(self):
+        machine = self.run_moves(cross_planner(),
+                                 [pos(40., 0.), pos(-40., 0.), pos(40., 0.)])
+        self.assertEqual(machine.branch, 1)
+        self.assertLess(largest_step(branch_trace(machine.moves)), 1e-6)
+
+    def test_printing_straight_through(self):
+        machine = self.run_moves(cross_planner(),
+                                 [pos(40., 0., 10., 0.),
+                                  pos(-40., 0., 10., 4.)])
+        self.assertEqual(len(machine.moves), 2)
+        # Extruding the whole way, in proportion
+        e_park = machine.moves[0][1][3]
+        self.assertAlmostEqual(e_park, 2., places=4)
+        self.assertEqual(machine.moves[1][1][3], 4.)
+
+    def test_a_near_miss_turns_the_bed_a_little(self):
+        start, end = pos(-40., .005), pos(40., .005)
+        machine = self.run_moves(cross_planner(), [start, end])
+        self.assertLess(largest_step(branch_trace(machine.moves)), STEP)
+        self.assertEqual(machine.branch, -1)
+        # A single chord of arc, at the reorientation radius
+        radius = machine.planner.reorient_radius
+        for s, e, branch, flip, speed in machine.moves:
+            self.assertLessEqual(distance_to_line(e, start, end),
+                                 radius + 1e-9)
+        self.assertEqual(len(machine.moves), 4)
+
+    def test_leaving_the_centre_the_nearer_way(self):
+        # Facing 0, for a target at 100 degrees: a 100 degree turn on the
+        # usual branch, or 80 the other way with the arm on the far side
+        planner = cross_planner()
+        machine = Machine(planner, pos(centre_path.PARK_RADIUS, 0.))
+        machine.last = pos(0., 0.)
+        machine.move(around(math.radians(100.), 40.))
+        self.assertEqual(machine.branch, -1)
+        self.assertLess(largest_step(branch_trace(machine.moves)), STEP)
+        # Eight chords, not ten
+        self.assertEqual(len(machine.moves), 1 + 8 + 1)
+        # And out on the far side of the centre from where it stood
+        self.assertLess(machine.moves[0][1][0], 0.)
+
+    def test_a_crossing_arm_can_still_be_told_to_bypass(self):
+        planner = make_planner(can_cross=True)
+        machine = self.run_moves(planner, [pos(40., 0.), pos(-40., 0.)])
+        self.assertEqual(machine.branch, 1)
+        self.assertFalse(any(m[3] for m in machine.moves))
+        self.assertLess(largest_step(branch_trace(machine.moves)), STEP)
+
+    def test_every_crossing_move_gets_past_the_check(self):
+        chk = ps.PolarSingularity.__new__(ps.PolarSingularity)
+        chk.max_angular_v, chk.max_angular_a = MAX_V, MAX_A
+        chk.min_velocity = MIN_V
+        chk.last_radius = chk.last_swept = chk.last_velocity_limit = 0.
+        sequences = [[around(a, 40.), around(a + math.pi, 40.),
+                      pos(0., 0.), around(b, 40.)]
+                     for a in ANGLES for b in ANGLES[::2]]
+        sequences.append([pos(-40., .005), pos(40., .005), pos(0., 30.)])
+        for targets in sequences:
+            machine = self.run_moves(cross_planner(), targets)
+            self.assertLess(largest_step(branch_trace(machine.moves)),
+                            STEP, msg=targets)
+            for s, e, branch, flip, speed in machine.moves:
+                move = FakeMove(s, e, speed)
+                move.branch, move.branch_flip = branch, flip
+                if move.axes_d[0] or move.axes_d[1]:
+                    chk._check_move(move)
+
+
+def pos5(x, y, z=10., e=0., b=0.):
+    return [x, y, z, e, b]
+
+
+class TestUprightTransit(unittest.TestCase):
+    def plan(self, planner, start, end):
+        return planner.plan(start[:2], start, end, 50.)
+
+    def test_a_tilted_travel_crossing_stands_up(self):
+        planner = make_planner(tilt_index=4)
+        start, end = pos5(-40., 0., b=10.), pos5(40., 0., b=-5.)
+        moves = self.plan(planner, start, end)
+        # Up where it starts, across upright, back down where it ends
+        self.assertEqual(moves[0][0], pos5(-40., 0., b=0.))
+        for p, speed in moves[1:-1]:
+            self.assertEqual(p[4], 0.)
+        self.assertEqual(moves[-2][0], pos5(40., 0., b=0.))
+        self.assertEqual(moves[-1][0], end)
+        trace = bed_trace(start[:2], [p for p, speed in moves])
+        self.assertLess(largest_step(trace), STEP)
+
+    def test_upright_needs_no_standing_up(self):
+        planner = make_planner(tilt_index=4)
+        moves = self.plan(planner, pos5(-40., 0.), pos5(40., 0.))
+        self.assertEqual(moves,
+                         self.plan(make_planner(), pos5(-40., 0.),
+                                   pos5(40., 0.)))
+
+    def test_a_tilted_print_crossing_is_refused(self):
+        planner = make_planner(tilt_index=4, print_policy='bypass')
+        with self.assertRaises(centre_path.CentrePlanError):
+            self.plan(planner, pos5(-40., 0., e=0., b=10.),
+                      pos5(40., 0., e=2., b=10.))
+        # ...upright, it is only a bypass
+        self.plan(planner, pos5(-40., 0., e=0.), pos5(40., 0., e=2.))
+
+    def test_it_can_be_turned_off(self):
+        planner = make_planner(tilt_index=4, upright_transit=False)
+        moves = self.plan(planner, pos5(-40., 0., b=10.),
+                          pos5(40., 0., b=10.))
+        self.assertTrue(all(p[4] == 10. for p, speed in moves))
+
+    def test_crossing_on_an_arm_that_can_holds_the_tilt(self):
+        planner = cross_planner(tilt_index=4)
+        moves = self.plan(planner, pos5(-40., 0., e=0., b=10.),
+                          pos5(40., 0., e=2., b=10.))
+        self.assertEqual(len(moves), 2)
+        self.assertTrue(all(p[4] == 10. for p, speed in moves))
+
+
+class FakeCrossingToolhead(FakeToolhead):
+    # corertheta's part: marking a move that carries on through the centre
+    def __init__(self, position):
+        FakeToolhead.__init__(self, position)
+        self.branch = 1
+    def get_branch(self):
+        return self.branch
+    def move(self, newpos, speed):
+        if bed_centre.flips_through_centre(self.position, newpos,
+                                           self.branch):
+            self.branch = -self.branch
+        FakeToolhead.move(self, newpos, speed)
+
+
+class FakePrinter:
+    class command_error(Exception):
+        pass
+
+
+class TestCrossingTransform(unittest.TestCase):
+    def build(self, planner, position):
+        obj = ps.PolarSingularity.__new__(ps.PolarSingularity)
+        obj.printer = FakePrinter()
+        obj.planner = planner
+        obj.toolhead = obj.next_transform = FakeCrossingToolhead(position)
+        obj.last_position = [0., 0., 0., 0.]
+        obj.get_position()
+        return obj
+
+    def test_the_toolhead_branch_reaches_the_planner(self):
+        obj = self.build(cross_planner(), pos(40., 0.))
+        obj.move(pos(-40., 0.), 50.)
+        self.assertEqual(obj.toolhead.branch, -1)
+        # Back through the centre from the far side, still in a line
+        obj.move(pos(40., 0.), 50.)
+        self.assertEqual(obj.toolhead.branch, 1)
+        self.assertEqual(len(obj.toolhead.sent), 4)
+
+    def test_a_plan_that_cannot_be_made_is_a_g_code_error(self):
+        obj = self.build(make_planner(tilt_index=4, print_policy='bypass'),
+                         pos5(-40., 0., b=10.))
+        with self.assertRaises(FakePrinter.command_error):
+            obj.move(pos5(40., 0., e=2., b=10.), 50.)
+        self.assertEqual(obj.toolhead.sent, [])
 
 
 if __name__ == '__main__':

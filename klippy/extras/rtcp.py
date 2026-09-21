@@ -165,8 +165,17 @@ class RTCP:
         ffi_main, ffi_lib = chelper.get_ffi()
         tool_h, tool_v = self.get_tool_offsets()
         kin = self.toolhead.get_kinematics()
+        unwrapped = set()
+        if self.frame == FRAME_RADIAL and hasattr(kin,
+                                                  'get_bed_angle_steppers'):
+            # The radial correction moves the arm and never turns the bed,
+            # so the bed motor is left seeing the tool tip - which is what
+            # the bed angle is defined by.  Wrapped, it would see a
+            # carriage position that can sit on, or across, the centre
+            # while the tip is well away from it.
+            unwrapped = {s.get_name() for s in kin.get_bed_angle_steppers()}
         for s in kin.get_steppers():
-            if s.get_trapq() is None:
+            if s.get_trapq() is None or s.get_name() in unwrapped:
                 continue
             rtcp_sk = self._get_rtcp_stepper_kinematics(s)
             if rtcp_sk is None:
@@ -182,6 +191,10 @@ class RTCP:
             return 0., 0.
         return self.tool_h, self.tool_v
 
+    def _can_cross_centre(self):
+        kin = self.toolhead.get_kinematics()
+        return getattr(kin, 'can_cross_centre', lambda: False)()
+
     ######################################################################
     # Coordinate transforms
     ######################################################################
@@ -190,59 +203,96 @@ class RTCP:
     # called through cffi so that positions can be converted without a
     # compiled c_helper.so (and so the host tests can exercise them); the
     # C file carries the derivation.
-    def _deltas(self, b_angle):
+    def _deltas(self, b_angle, offsets=None):
         b_rad = math.radians(b_angle)
         sin_b, cos_b_1 = math.sin(b_rad), math.cos(b_rad) - 1.
-        tool_h, tool_v = self.get_tool_offsets()
+        if offsets is None:
+            offsets = self.get_tool_offsets()
+        tool_h, tool_v = offsets
         return (tool_h * cos_b_1 - tool_v * sin_b,
                 tool_h * sin_b + tool_v * cos_b_1)
 
-    def get_machine_b(self, pos):
+    def get_machine_b(self, pos, branch=1):
         # The angle the head is really turned to for a commanded toolhead
         # position.  Normally the commanded B itself, but [b_projection]
         # re-interprets B in the bed frame, and it is the projected angle
         # that swings the tip.
         if self.b_project is None:
             return pos[B_POS_INDEX]
-        return self.b_project.project_pos(pos)
+        return self.b_project.project_pos(pos, branch)
 
-    def _transform(self, pos, sign, b_angle=None):
+    def _apply(self, pos, dh, dz, branch, direction=None):
+        # rtcp_apply() in kin_rtcp.c: move a position by (dh, dz).  In the
+        # radial frame dh is taken along the arm, which points the way the
+        # bed faces - 'direction' where the caller knows it, otherwise the
+        # way it faces standing still at 'pos' on 'branch'.  Returns the
+        # new position and the branch it is on: the arm radius there is
+        # the position's own plus dh, and a large enough dh carries it
+        # through the centre.
         res = list(pos)
-        if b_angle is None:
-            b_angle = res[B_POS_INDEX]
-        dh, dz = self._deltas(b_angle)
-        if not dh and not dz:
-            return res
-        dh, dz = sign * dh, sign * dz
-        if self.frame == FRAME_RADIAL:
-            radius = math.hypot(res[0], res[1])
-            if radius > bed_centre.CENTRE_EPSILON:
-                # Scaling x and y together moves the arm radius and
-                # leaves the bed angle alone
-                scale = (radius + dh) / radius
-                res[0] *= scale
-                res[1] *= scale
-            else:
-                # On the centre line every bed angle names the same
-                # point; take up the offset along +x
-                res[0] += dh
-        else:
-            res[0] += dh
         res[2] += dz
-        return res
+        if self.frame != FRAME_RADIAL:
+            res[0] += dh
+            return res, branch
+        if direction is None:
+            direction = bed_centre.facing(res[0], res[1], None, branch)
+        fx, fy = direction
+        r_machine = res[0] * fx + res[1] * fy + dh
+        res[0] += dh * fx
+        res[1] += dh * fy
+        if r_machine < 0.:
+            return res, -1
+        if r_machine > 0.:
+            return res, 1
+        # On the centre itself: the branch whose position there, standing
+        # still, faces the same way along x
+        return res, (-1 if fx < 0. else 1)
 
-    def tool_to_machine(self, pos):
-        # Machine (carriage) position for a toolhead position vector.  The
-        # tip swings by the angle the head is really turned to, which
+    def tool_to_machine_branch(self, pos, branch=1, direction=None):
+        # Machine (carriage) position for a toolhead position vector on
+        # the given branch, and the branch the carriage is on.  The tip
+        # swings by the angle the head is really turned to, which
         # [b_projection] can make differ from the commanded B.
-        return self._transform(pos, 1., self.get_machine_b(pos))
+        dh, dz = self._deltas(self.get_machine_b(pos, branch))
+        return self._apply(pos, dh, dz, branch, direction)
 
-    def machine_to_tool(self, pos):
+    def tool_to_machine(self, pos, branch=1):
+        return self.tool_to_machine_branch(pos, branch)[0]
+
+    def machine_to_tool_branch(self, pos, branch=1, direction=None):
         # Inverse of the above - used when reading positions back out of
         # the steppers so they are reported in the frame g-code uses.  The
         # B in a machine position is already the angle the head is turned
-        # to, so it is used as it stands.
-        return self._transform(pos, -1.)
+        # to, so it is used as it stands.  A carriage standing exactly on
+        # the centre does not say which way the bed faces, so a caller
+        # that knows should pass it as 'direction'.
+        dh, dz = self._deltas(pos[B_POS_INDEX])
+        return self._apply(pos, -dh, -dz, branch, direction)
+
+    def machine_to_tool(self, pos, branch=1, direction=None):
+        return self.machine_to_tool_branch(pos, branch, direction)[0]
+
+    def change_offsets(self, pos, branch, old_offsets, new_offsets):
+        # The tool position that names the same carriage position under
+        # new tool offsets, and its branch.  The bed does not move, so the
+        # conversion runs along the way it already faces rather than
+        # through a carriage position that may sit on the centre and no
+        # longer say which way that is.
+        machine_b = self.get_machine_b(pos, branch)
+        dh_old, dz_old = self._deltas(machine_b, old_offsets)
+        dh_new, dz_new = self._deltas(machine_b, new_offsets)
+        direction = bed_centre.facing(pos[0], pos[1], None, branch)
+        res, new_branch = self._apply(pos, dh_old - dh_new, dz_old - dz_new,
+                                      branch, direction)
+        if (self.frame == FRAME_RADIAL and not (res[0] or res[1])
+                and bed_centre.facing(0., 0., None, new_branch) != direction):
+            # Exactly on the centre, where no position standing still
+            # names the way this bed faces
+            raise self.printer.command_error(
+                "Changing the RTCP offsets here would put the tool exactly"
+                " on the centre of the bed, where its position cannot say"
+                " which way the bed faces.  Move off the centre first")
+        return res, new_branch
 
     ######################################################################
     # Range checking
@@ -287,22 +337,39 @@ class RTCP:
         axis_max = status.get('axis_maximum')
         if axis_min is None or axis_max is None:
             return
-        for endpoint in ([move.start_pos, move.end_pos]
-                         + self._interior_points(move)):
+        sp, ep = move.start_pos, move.end_pos
+        travel = (ep[0] - sp[0], ep[1] - sp[1])
+        if not travel[0] and not travel[1]:
+            travel = None
+        for endpoint in [sp, ep] + self._interior_points(move):
+            # Solved the way the step generator solves it: on the branch
+            # the move is on there, along the way the bed is driven to face
+            branch = bed_centre.sample_branch(
+                endpoint[0], endpoint[1], travel, move.branch,
+                move.branch_flip)
+            direction = bed_centre.facing(endpoint[0], endpoint[1], travel,
+                                          branch)
+            pos, machine_branch = self.tool_to_machine_branch(
+                endpoint, branch, direction)
             if self.frame == FRAME_RADIAL:
-                # The arm radius cannot go negative.  The transform would
-                # happily produce a point on the far side of the centre at
-                # the same bed angle, which is within the machine's x/y
-                # bounds but is not somewhere the arm can be, so catch it
-                # before the check below waves it through.
-                radius = math.hypot(endpoint[0], endpoint[1])
-                dh = self._deltas(self.get_machine_b(endpoint))[0]
-                if radius + dh < -0.000000001:
+                # The arm radius the carriage needs.  The x/y bounds below
+                # are a square around the centre, which is not the shape
+                # the arm can reach, so check the radius itself - and
+                # below zero, the far side of the centre, which only an
+                # arm that can travel through the middle can reach.
+                radius = machine_branch * math.hypot(pos[0], pos[1])
+                r_max = axis_max[0]
+                r_min = -r_max if self._can_cross_centre() else 0.
+                if radius < r_min - 0.000000001:
                     raise move.move_error(
                         "RTCP move at B=%.3f needs an arm radius of %.3f,"
                         " which is through the centre of the bed"
-                        % (endpoint[B_POS_INDEX], radius + dh))
-            pos = self.tool_to_machine(endpoint)
+                        % (endpoint[B_POS_INDEX], radius))
+                if radius > r_max + 0.000000001:
+                    raise move.move_error(
+                        "RTCP move at B=%.3f needs an arm radius of %.3f,"
+                        " beyond the %.3f the arm can reach"
+                        % (endpoint[B_POS_INDEX], radius, r_max))
             for i, name in ((0, 'X'), (1, 'Y'), (2, 'Z')):
                 if pos[i] < axis_min[i] - 0.000000001 \
                         or pos[i] > axis_max[i] + 0.000000001:
@@ -347,15 +414,19 @@ class RTCP:
             # *means* does, so convert it across before changing anything
             # and hand the result back as the new toolhead position.  With
             # B at zero the two frames coincide and this is a no-op.
-            machine_pos = self.tool_to_machine(self.toolhead.get_position())
-            if enable is not None:
-                self.enabled = bool(enable)
-            if tool_v is not None:
-                self.tool_v = tool_v
-            if tool_h is not None:
-                self.tool_h = tool_h
+            pos = self.toolhead.get_position()
+            branch = self.toolhead.get_branch()
+            new_enabled = self.enabled if enable is None else bool(enable)
+            new_v = self.tool_v if tool_v is None else tool_v
+            new_h = self.tool_h if tool_h is None else tool_h
+            new_offsets = (new_h, new_v) if new_enabled else (0., 0.)
+            # Raises, before anything has changed, if the new position
+            # cannot be expressed
+            new_pos, new_branch = self.change_offsets(
+                pos, branch, self.get_tool_offsets(), new_offsets)
+            self.enabled, self.tool_v, self.tool_h = new_enabled, new_v, new_h
             self._update_kinematics()
-            self.toolhead.set_position(self.machine_to_tool(machine_pos))
+            self.toolhead.set_position(new_pos, branch=new_branch)
         gcmd.respond_info(
             "rtcp: enabled=%s tool_vertical_offset=%.6f"
             " tool_horizontal_offset=%.6f"

@@ -43,13 +43,14 @@ def header_defines():
 # Every number the header defines, and the Python name it mirrors
 MIRRORED = {
     'BED_CENTRE_RADIUS': 'CENTRE_RADIUS',
-    'BED_CENTRE_EPSILON': 'CENTRE_EPSILON',
 }
 
 # The names the copies used to go by.  Each was once a separate
-# definition of something bed_centre now owns.
+# definition of something bed_centre now owns - or, for the two
+# epsilons, a fallback that taking the way the bed faces made unneeded.
 RETIRED = re.compile(r'\b(BED_MIN_RADIUS|RADIAL_EPSILON'
-                     r'|bproject_cos_bed_angle)\b')
+                     r'|bproject_cos_bed_angle'
+                     r'|BED_CENTRE_EPSILON|CENTRE_EPSILON)\b')
 
 
 class TestMirror(unittest.TestCase):
@@ -408,60 +409,172 @@ class TestRateLimits(unittest.TestCase):
 
 
 ######################################################################
-# Signed radius
+# The two branches
 ######################################################################
 
-class TestSignedRadius(unittest.TestCase):
-    def test_round_trip_on_both_branches(self):
-        for x, y in ((30., 40.), (-30., 40.), (-30., -40.), (30., -40.),
-                     (5., 0.), (-5., 0.), (0., 5.), (0., -5.)):
+# The same table as test_bed_centre_branches() in test_kin_6axis.c:
+# (what, x, y, travel x, travel y, branch, branch_flip, angle, branch at
+# the sample).  On the negative branch the bed is turned the other half
+# turn; a move marked branch_flip changes over where it passes the centre.
+BRANCH_CASES = [
+    ("negative, static, +x",         50.,    0.,  0.,  0., -1, 0, math.pi,
+     -1),
+    ("negative, static, +y",         0.,     50., 0.,  0., -1, 0, -HALF_PI,
+     -1),
+    ("negative, on the centre",      0.,     0.,  0.,  0., -1, 0, math.pi,
+     -1),
+    ("negative, heading out +x",     0.005,  0.,  1.,  0., -1, 0, math.pi,
+     -1),
+    ("flip, before the centre",      0.005,  0.,  -1., 0., 1,  1, 0., 1),
+    ("flip, on the centre",          0.,     0.,  -1., 0., 1,  1, 0., -1),
+    ("flip, past the centre",        -0.005, 0.,  -1., 0., 1,  1, 0., -1),
+    ("flip, far past the centre",    -50.,   0.,  -1., 0., 1,  1, 0., -1),
+    ("flip back, before the centre", -0.005, 0.,  1.,  0., -1, 1, 0., -1),
+    ("flip back, past the centre",   0.005,  0.,  1.,  0., -1, 1, 0., 1),
+]
+
+
+class TestBranches(unittest.TestCase):
+    def test_the_shared_table(self):
+        for (what, x, y, rx, ry, branch, flip, angle,
+             at_sample) in BRANCH_CASES:
+            travel = (rx, ry) if (rx or ry) else None
+            got = bed_centre.sample_branch(x, y, travel, branch, flip)
+            self.assertEqual(got, at_sample, msg=what)
+            bed = bed_centre.bed_angle(x, y, travel, got)
+            self.assertAlmostEqual(math.cos(bed), math.cos(angle),
+                                   places=12, msg=what)
+            self.assertAlmostEqual(math.sin(bed), math.sin(angle),
+                                   places=12, msg=what)
+            self.assertAlmostEqual(bed_centre.arm_radius(x, y, got),
+                                   at_sample * math.hypot(x, y),
+                                   places=12, msg=what)
+
+    def test_the_facing_is_the_angle(self):
+        r = bed_centre.CENTRE_RADIUS
+        coords = [-3. * r, -.5 * r, 0., .5 * r, 3. * r]
+        travels = [None, (1., 0.), (-1., 0.), (.6, -.8)]
+        for x in coords:
+            for y in coords:
+                for travel in travels:
+                    for branch in (1, -1):
+                        angle = bed_centre.bed_angle(x, y, travel, branch)
+                        fx, fy = bed_centre.facing(x, y, travel, branch)
+                        self.assertAlmostEqual(fx, math.cos(angle), 12)
+                        self.assertAlmostEqual(fy, math.sin(angle), 12)
+                        self.assertEqual(
+                            bed_centre.cos_bed_angle(x, y, travel, branch),
+                            fx)
+
+    def test_the_branches_name_the_same_point(self):
+        # (r, theta) and (-r, theta + pi): the arm radius along the way the
+        # bed faces reaches the same x/y on both branches
+        for x, y in ((30., 40.), (-30., 40.), (0., -5.), (-5., 0.)):
             for branch in (1, -1):
-                r, theta = bed_centre.polar_position(x, y, branch)
+                fx, fy = bed_centre.facing(x, y, None, branch)
+                r = bed_centre.arm_radius(x, y, branch)
                 self.assertEqual(r < 0., branch < 0)
-                self.assertGreater(theta, -math.pi - 1e-15)
-                self.assertLessEqual(theta, math.pi)
-                back_x, back_y = bed_centre.cartesian_position(r, theta)
-                self.assertAlmostEqual(back_x, x)
-                self.assertAlmostEqual(back_y, y)
-                self.assertEqual(
-                    bed_centre.branch_for_angle(x, y, theta), branch)
-                self.assertAlmostEqual(
-                    bed_centre.signed_radius(x, y, theta), r)
+                self.assertAlmostEqual(r * fx, x)
+                self.assertAlmostEqual(r * fy, y)
 
-    def test_the_two_branches_are_half_a_turn_apart(self):
-        r_pos, t_pos = bed_centre.polar_position(30., 40., 1)
-        r_neg, t_neg = bed_centre.polar_position(30., 40., -1)
-        self.assertAlmostEqual(r_neg, -r_pos)
-        self.assertAlmostEqual(abs(t_pos - t_neg), math.pi)
+    def test_a_flip_holds_the_bed_through_the_centre(self):
+        # The point of the second branch: straight through the centre on a
+        # move marked branch_flip the bed never moves, and the arm radius
+        # runs smoothly through zero
+        for angle in (0., .7, HALF_PI, 2.5, -1.2):
+            ux, uy = math.cos(angle), math.sin(angle)
+            start, end = (40. * ux, 40. * uy), (-40. * ux, -40. * uy)
+            travel = (end[0] - start[0], end[1] - start[1])
+            radii = []
+            for i in range(401):
+                x, y = bed_centre.interpolate(start, end, i / 400.)
+                branch = bed_centre.sample_branch(x, y, travel, 1, True)
+                fx, fy = bed_centre.facing(x, y, travel, branch)
+                self.assertAlmostEqual(fx, ux, places=9)
+                self.assertAlmostEqual(fy, uy, places=9)
+                radii.append(bed_centre.arm_radius(x, y, branch))
+            for a, b in zip(radii, radii[1:]):
+                self.assertAlmostEqual(a - b, .2, places=9)
+            self.assertAlmostEqual(radii[200], 0., places=9)
+            self.assertAlmostEqual(radii[-1], -40.)
 
-    def test_the_centre(self):
-        self.assertEqual(bed_centre.polar_position(0., 0., 1), (0., 0.))
-        r, theta = bed_centre.polar_position(0., 0., -1)
-        self.assertEqual((r, theta), (0., math.pi))
+    def test_end_branch(self):
+        self.assertEqual(bed_centre.end_branch(1, False), 1)
+        self.assertEqual(bed_centre.end_branch(1, True), -1)
+        self.assertEqual(bed_centre.end_branch(-1, True), 1)
 
-    def test_a_line_through_the_centre_is_radial_with_the_angle_held(self):
-        # The point of the second branch.  Held at the angle the line
-        # starts on, the radius runs straight through zero and the bed
-        # angle never moves - where on the usual branch it steps by pi.
-        start, end = (30., 40.), (-30., -40.)
-        theta = bed_centre.polar_position(start[0], start[1])[1]
-        radii, branches = [], []
-        for i in range(11):
-            x, y = bed_centre.interpolate(start, end, i / 10.)
-            radius = bed_centre.signed_radius(x, y, theta)
-            # Holding theta reaches every point on the line
-            back_x, back_y = bed_centre.cartesian_position(radius, theta)
-            self.assertAlmostEqual(back_x, x)
-            self.assertAlmostEqual(back_y, y)
-            radii.append(radius)
-            branches.append(bed_centre.branch_for_angle(x, y, theta))
-        for a, b in zip(radii, radii[1:]):
-            self.assertAlmostEqual(a - b, 10.)
-        self.assertAlmostEqual(radii[0], 50.)
-        self.assertAlmostEqual(radii[5], 0.)
-        self.assertAlmostEqual(radii[-1], -50.)
-        self.assertEqual(branches[:5], [1] * 5)
-        self.assertEqual(branches[6:], [-1] * 5)
+
+######################################################################
+# Leaving rest and coming to rest at the centre
+######################################################################
+
+PARK = 1e-4
+
+class TestCentreTurns(unittest.TestCase):
+    def turns(self, start, end, branch=1, flip=False):
+        return bed_centre.centre_turns(start, end, branch, flip)
+
+    def test_away_from_the_centre_nothing_turns(self):
+        self.assertEqual(self.turns((40., 0.), (0., 40.)), (0., 0.))
+        self.assertEqual(self.turns((40., 0.), (40., 0.)), (0., 0.))
+
+    def test_arriving_on_the_ray_of_arrival(self):
+        # To the park point, and onto the bare centre along +x - the one
+        # ray the bare centre names
+        self.assertAlmostEqual(abs(self.turns((0., 40.), (0., PARK))[1]), 0.)
+        self.assertEqual(self.turns((40., 0.), (0., 0.)), (0., 0.))
+
+    def test_arriving_on_the_bare_centre_along_another_ray(self):
+        # The bed arrives facing +y, and (0, 0) names zero
+        self.assertAlmostEqual(self.turns((0., 40.), (0., 0.))[1], HALF_PI)
+        self.assertAlmostEqual(abs(self.turns((-40., 0.), (0., 0.))[1]),
+                               math.pi)
+
+    def test_leaving_along_the_line_the_bed_faces(self):
+        self.assertEqual(self.turns((0., PARK), (0., 40.)), (0., 0.))
+        self.assertEqual(self.turns((0., 0.), (40., 0.)), (0., 0.))
+        # And inward along it, stopping short of the centre
+        self.assertEqual(self.turns((0., PARK), (0., PARK / 2.)), (0., 0.))
+
+    def test_leaving_off_the_line_the_bed_faces(self):
+        self.assertAlmostEqual(self.turns((0., PARK), (40., PARK))[0],
+                               -HALF_PI, places=5)
+        self.assertAlmostEqual(self.turns((0., 0.), (0., 40.))[0], HALF_PI)
+
+    def test_carrying_on_through_the_centre(self):
+        # Without the flip the bed would face the far side at once; the
+        # crossing itself is refused elsewhere (crosses_centre)
+        self.assertEqual(self.turns((PARK, 0.), (-40., 0.), 1, True),
+                         (0., 0.))
+        self.assertEqual(self.turns((0., 0.), (-40., 0.), 1, True), (0., 0.))
+        self.assertAlmostEqual(abs(self.turns((0., 0.), (-40., 0.))[0]),
+                               math.pi)
+        # And back again from the far side
+        self.assertEqual(self.turns((-PARK, 0.), (40., 0.), -1, True),
+                         (0., 0.))
+        # On the negative branch the bare centre faces the other way, so
+        # it is -x that crosses over and +x that stays on the far side
+        self.assertEqual(self.turns((0., 0.), (-40., 0.), -1, True),
+                         (0., 0.))
+        self.assertEqual(self.turns((0., 0.), (40., 0.), -1), (0., 0.))
+
+    def test_the_negative_branch_at_rest(self):
+        # Parked on the far side: the bed faces the other half turn, and
+        # leaving further along the far side keeps it
+        self.assertEqual(self.turns((-PARK, 0.), (-40., 0.), -1), (0., 0.))
+        self.assertEqual(self.turns((-40., 0.), (-PARK, 0.), -1), (0., 0.))
+
+    def test_flips_through_centre(self):
+        flips = bed_centre.flips_through_centre
+        self.assertTrue(flips((PARK, 0.), (-40., 0.), 1))
+        self.assertFalse(flips((PARK, 0.), (40., 0.), 1))
+        self.assertFalse(flips((PARK, 0.), (PARK / 2., 0.), 1))
+        self.assertTrue(flips((0., 0.), (-40., 0.), 1))
+        self.assertTrue(flips((0., 0.), (-40., 0.), -1))
+        self.assertFalse(flips((0., 0.), (40., 0.), -1))
+        self.assertTrue(flips((-PARK, 0.), (40., 0.), -1))
+        # Only a move that starts in the dead zone
+        self.assertFalse(flips((40., 0.), (-40., 0.), 1))
 
 
 if __name__ == '__main__':

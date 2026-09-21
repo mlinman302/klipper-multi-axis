@@ -39,17 +39,23 @@ extern int bproject_set_sk(struct stepper_kinematics *sk,
                            struct stepper_kinematics *orig_sk);
 extern void bproject_set_params(struct stepper_kinematics *sk,
                                 double max_angle, double taper_range);
-extern double bproject_project_b(double b, double x, double y,
+extern double bproject_project_b(double b, double x, double y, int branch,
                                  double max_angle, double taper_range);
 extern struct stepper_kinematics *rtcp_alloc(void);
 extern int rtcp_set_sk(struct stepper_kinematics *sk,
                        struct stepper_kinematics *orig_sk);
 extern void rtcp_set_tool(struct stepper_kinematics *sk,
                           double tool_h, double tool_v, int frame);
-extern void rtcp_tool_to_machine(double tool_h, double tool_v, int frame,
-                                 double b, double *pos_xyz);
-extern void rtcp_machine_to_tool(double tool_h, double tool_v, int frame,
-                                 double b, double *pos_xyz);
+extern struct stepper_kinematics *input_shaper_alloc(void);
+extern int input_shaper_set_sk(struct stepper_kinematics *sk,
+                               struct stepper_kinematics *orig_sk);
+extern int input_shaper_set_shaper_params(struct stepper_kinematics *sk,
+                                          char axis, int n, double a[],
+                                          double t[]);
+extern int rtcp_tool_to_machine(double tool_h, double tool_v, int frame,
+                                double b, int branch, double *pos_xyz);
+extern int rtcp_machine_to_tool(double tool_h, double tool_v, int frame,
+                                double b, int branch, double *pos_xyz);
 
 #define NEVER_TIME 9999999999999999.9
 
@@ -537,15 +543,15 @@ test_rtcp(void)
 
     // The round trip through the standalone transforms must be exact
     double rt[3] = {30., -12., 4.};
-    rtcp_tool_to_machine(3., L, RTCP_FRAME_RADIAL, 37., rt);
-    rtcp_machine_to_tool(3., L, RTCP_FRAME_RADIAL, 37., rt);
+    rtcp_tool_to_machine(3., L, RTCP_FRAME_RADIAL, 37., 1, rt);
+    rtcp_machine_to_tool(3., L, RTCP_FRAME_RADIAL, 37., 1, rt);
     check("radial round trip: x", rt[0], 30., 1e-9);
     check("radial round trip: y", rt[1], -12., 1e-9);
     check("radial round trip: z", rt[2], 4., 1e-9);
     // In the radial frame the correction changes the arm radius and
     // leaves the bed angle alone
     double rad[3] = {0., 50., 0.};
-    rtcp_tool_to_machine(0., L, RTCP_FRAME_RADIAL, 90., rad);
+    rtcp_tool_to_machine(0., L, RTCP_FRAME_RADIAL, 90., 1, rad);
     check("radial B=90: x", rad[0], 0., 1e-9);
     check("radial B=90: radius", rad[1], 50. - L, 1e-9);
     check("radial B=90: z", rad[2], -L, 1e-9);
@@ -664,39 +670,39 @@ test_b_projection(void)
     // The pure mapping.  Holding B at 10 degrees through a turn of the
     // bed sweeps the machine's B over 10 -> 0 -> -10 -> 0.
     check("proj: bed angle 0 leaves B alone",
-          bproject_project_b(10., 100., 0., MA, TR), 10., 1e-12);
+          bproject_project_b(10., 100., 0., 1, MA, TR), 10., 1e-12);
     check("proj: bed angle 90 flattens B",
-          bproject_project_b(10., 0., 100., MA, TR), 0., 1e-12);
+          bproject_project_b(10., 0., 100., 1, MA, TR), 0., 1e-12);
     check("proj: bed angle 180 negates B",
-          bproject_project_b(10., -100., 0., MA, TR), -10., 1e-12);
+          bproject_project_b(10., -100., 0., 1, MA, TR), -10., 1e-12);
     check("proj: bed angle 45 scales B by cos",
-          bproject_project_b(10., S, S, MA, TR), 7.0710678, 1e-6);
+          bproject_project_b(10., S, S, 1, MA, TR), 7.0710678, 1e-6);
     check("proj: bed angle 270 flattens B",
-          bproject_project_b(10., 0., -100., MA, TR), 0., 1e-12);
+          bproject_project_b(10., 0., -100., 1, MA, TR), 0., 1e-12);
     check("proj: B=0 is a fixed point",
-          bproject_project_b(0., 0., 100., MA, TR), 0., 1e-12);
+          bproject_project_b(0., 0., 100., 1, MA, TR), 0., 1e-12);
 
     // Orientation angles beyond the band reach the machine untouched -
     // that is what lets RTCP_PROBE_ORIENT and G28 B mean what they say
     check("proj: probe angle passes through",
-          bproject_project_b(45., 0., 100., MA, TR), 45., 1e-12);
+          bproject_project_b(45., 0., 100., 1, MA, TR), 45., 1e-12);
     check("proj: park angle passes through",
-          bproject_project_b(-90., 0., 100., MA, TR), -90., 1e-12);
+          bproject_project_b(-90., 0., 100., 1, MA, TR), -90., 1e-12);
 
     // ...and the taper across the band keeps the machine's B continuous,
     // instead of jumping by up to max_angle in one step
     check("proj: mid-taper is half corrected",
-          bproject_project_b(42.5, 0., 100., MA, TR), 21.25, 1e-9);
-    double just_in = bproject_project_b(44.999, 0., 100., MA, TR);
-    double just_out = bproject_project_b(45.001, 0., 100., MA, TR);
+          bproject_project_b(42.5, 0., 100., 1, MA, TR), 21.25, 1e-9);
+    double just_in = bproject_project_b(44.999, 0., 100., 1, MA, TR);
+    double just_out = bproject_project_b(45.001, 0., 100., 1, MA, TR);
     check("proj: continuous at the top of the band",
           just_out - just_in, 0., 0.01);
-    double below = bproject_project_b(39.999, 0., 100., MA, TR);
-    double above = bproject_project_b(40.001, 0., 100., MA, TR);
+    double below = bproject_project_b(39.999, 0., 100., 1, MA, TR);
+    double above = bproject_project_b(40.001, 0., 100., 1, MA, TR);
     check("proj: continuous at the bottom of the band",
           above - below, 0., 0.01);
     check("proj: a zero max_angle is the identity",
-          bproject_project_b(10., 0., 100., 0., TR), 10., 1e-12);
+          bproject_project_b(10., 0., 100., 1, 0., TR), 10., 1e-12);
 
     // Wrapped around a corertheta gantry motor: the '+' solver is
     // b_ratio*B + radius, and it must see the projected B
@@ -970,6 +976,294 @@ test_centre_path_step_generation(void)
           run_bed_sequence(parked_tilt, 2, 50., 40.), 0., 0.);
 }
 
+// The branch rule of move_get_branch() in trapq.c and the bed angle and
+// arm radius bed_centre.h builds on it.  The table is repeated in
+// test/multi_axis/test_bed_centre.py against the Python mirror.
+struct branch_case {
+    const char *what;
+    double x, y, rx, ry;
+    int branch, flip;
+    double angle;
+    int at_sample;
+};
+
+static const struct branch_case branch_cases[] = {
+    { "negative, static, +x",      50.,    0.,  0.,  0., -1, 0, M_PI, -1 },
+    { "negative, static, +y",      0.,     50., 0.,  0., -1, 0, -M_PI/2., -1 },
+    { "negative, on the centre",   0.,     0.,  0.,  0., -1, 0, M_PI, -1 },
+    { "negative, heading out +x",  0.005,  0.,  1.,  0., -1, 0, M_PI, -1 },
+    { "flip, before the centre",   0.005,  0.,  -1., 0., 1,  1, 0.,   1 },
+    { "flip, on the centre",       0.,     0.,  -1., 0., 1,  1, 0.,   -1 },
+    { "flip, past the centre",     -0.005, 0.,  -1., 0., 1,  1, 0.,   -1 },
+    { "flip, far past the centre", -50.,   0.,  -1., 0., 1,  1, 0.,   -1 },
+    { "flip back, before",         -0.005, 0.,  1.,  0., -1, 1, 0.,   -1 },
+    { "flip back, past",           0.005,  0.,  1.,  0., -1, 1, 0.,   1 },
+};
+
+static void
+test_bed_centre_branches(void)
+{
+    printf("\n-- bed_centre.h: the two branches --\n");
+    size_t i;
+    for (i = 0; i < sizeof(branch_cases) / sizeof(branch_cases[0]); i++) {
+        const struct branch_case *bc = &branch_cases[i];
+        struct move m = { .axes_r = { .x = bc->rx, .y = bc->ry },
+                          .branch = bc->branch, .branch_flip = bc->flip };
+        struct coord c = { .x = bc->x, .y = bc->y };
+        char what[80];
+        snprintf(what, sizeof(what), "branch: %s", bc->what);
+        check(what, move_get_branch(&m, &c), bc->at_sample, 0.);
+        double angle = bed_centre_angle(&m, &c);
+        snprintf(what, sizeof(what), "cos:    %s", bc->what);
+        check(what, cos(angle), cos(bc->angle), 1e-12);
+        snprintf(what, sizeof(what), "sin:    %s", bc->what);
+        check(what, sin(angle), sin(bc->angle), 1e-12);
+        snprintf(what, sizeof(what), "facing: %s", bc->what);
+        check(what, bed_centre_cos(&m, &c), cos(bc->angle), 1e-12);
+        snprintf(what, sizeof(what), "radius: %s", bc->what);
+        check(what, bed_centre_radius(&m, &c),
+              bc->at_sample * sqrt(bc->x * bc->x + bc->y * bc->y), 1e-12);
+    }
+
+    // Setting a position solves it on the branch the queue is on
+    struct trapq *tq = trapq_alloc();
+    struct stepper_kinematics *bed = corertheta_stepper_alloc('c', 1.);
+    struct stepper_kinematics *plus = corertheta_stepper_alloc('+', 1.);
+    itersolve_set_trapq(bed, tq, 1.);
+    itersolve_set_trapq(plus, tq, 1.);
+    trapq_set_branch(tq, -1, 0);
+    itersolve_set_position(bed, -40., 0., 0., 0., 10., 0.);
+    check("set_position, negative branch: bed angle",
+          itersolve_get_commanded_pos(bed), 0., 1e-12);
+    check("set_position, negative branch: gantry b + r",
+          itersolve_calc_position_from_coord(plus, -40., 0., 0., 0., 10., 0.),
+          10. - 40., 1e-12);
+    trapq_set_branch(tq, 1, 0);
+    itersolve_set_position(bed, -40., 0., 0., 0., 10., 0.);
+    check("set_position, usual branch: bed angle",
+          itersolve_get_commanded_pos(bed), M_PI, 1e-12);
+    trapq_free(tq);
+
+    // The sentinel after a crossing holds the branch it ended on
+    struct trapq *tq_x = trapq_alloc();
+    trapq_set_branch(tq_x, 1, 1);
+    trapq_append(tq_x, .1, 0., 1., 0., 1e-4, 0., 0., 0., 0., 0.,
+                 -1., 0., 0., 0., 0., 0., 40., 40., 0.);
+    trapq_check_sentinels(tq_x);
+    struct move *tail = list_last_entry(&tq_x->moves, struct move, node);
+    check("tail sentinel after a crossing: branch", tail->branch, -1., 0.);
+    check("tail sentinel after a crossing: no flip",
+          tail->branch_flip, 0., 0.);
+    trapq_free(tq_x);
+
+    // And the stand-in for a pause between moves holds the branch the
+    // next move starts on
+    struct trapq *tq_g = trapq_alloc();
+    trapq_set_branch(tq_g, -1, 0);
+    trapq_append(tq_g, .1, 0., 1., 0., -40., 0., 0., 0., 0., 0.,
+                 -1., 0., 0., 0., 0., 0., 10., 10., 0.);
+    trapq_append(tq_g, 3., 0., 1., 0., -50., 0., 0., 0., 0., 0.,
+                 -1., 0., 0., 0., 0., 0., 10., 10., 0.);
+    struct move *mv;
+    int null_moves = 0, null_branch = 0;
+    list_for_each_entry(mv, &tq_g->moves, node) {
+        if (mv->print_time > 1. && mv->print_time < 3.
+            && !mv->start_v && !mv->half_accel) {
+            null_moves++;
+            null_branch = mv->branch;
+        }
+    }
+    check("gap between moves: one null move", null_moves, 1., 0.);
+    check("gap between moves: on the negative branch", null_branch, -1., 0.);
+    trapq_free(tq_g);
+}
+
+// One corertheta motor driven through a chain of moves by the real step
+// generator and step compressor.  pts[0] is where it starts and the
+// branch it stands on; each later entry is where a move ends, and the
+// branch and flip that move is marked with.  With 'tool_v' non-zero a
+// gantry motor runs under radial RTCP with that vertical tool offset -
+// the bed motor never does, as [rtcp] leaves it unwrapped - and with
+// 'project' non-zero under the B projection as well.
+struct branch_pt {
+    double x, y, b;
+    int branch, flip;
+};
+
+static int
+run_branch_sequence(const struct branch_pt *pts, int n, char type,
+                    double tool_v, int project, int wrap_bed, double *end)
+{
+    const double mcu_freq = 16000000.;
+    double step_dist = (type == 'c' ? 2. * M_PI / (200. * 16. * 4.)
+                        : 40. / (200. * 16.));
+    struct list_head msg_queue;
+    list_init(&msg_queue);
+    struct stepcompress *sc = stepcompress_alloc(&msg_queue);
+    stepcompress_fill(sc, 1, (uint32_t)(0.000025 * mcu_freq), 1, 2);
+    stepcompress_set_time(sc, 0., mcu_freq);
+    struct stepper_kinematics *sk = corertheta_stepper_alloc(type, 1.);
+    if (tool_v && (type != 'c' || wrap_bed)) {
+        struct stepper_kinematics *wrapped = rtcp_alloc();
+        rtcp_set_sk(wrapped, sk);
+        rtcp_set_tool(wrapped, 0., tool_v, RTCP_FRAME_RADIAL);
+        sk = wrapped;
+    }
+    if (project) {
+        struct stepper_kinematics *wrapped = bproject_alloc();
+        bproject_set_sk(wrapped, sk);
+        bproject_set_params(wrapped, 1e30, 1.);
+        sk = wrapped;
+    }
+    struct trapq *tq = trapq_alloc();
+    itersolve_set_trapq(sk, tq, step_dist);
+    trapq_set_branch(tq, pts[0].branch, 0);
+    itersolve_set_position(sk, pts[0].x, pts[0].y, 0., 0., pts[0].b, 0.);
+    double t = 0.1;
+    int i, ret = 0;
+    for (i = 0; i < n && !ret; i++) {
+        const struct branch_pt *a = &pts[i], *b = &pts[i + 1];
+        double dx = b->x - a->x, dy = b->y - a->y, db = b->b - a->b;
+        double len = sqrt(dx * dx + dy * dy), v = 50.;
+        if (!len) {
+            len = fabs(db);
+            v = 20.;
+        }
+        double move_t = len / v;
+        trapq_set_branch(tq, b->branch, b->flip);
+        trapq_append(tq, t, 0., move_t, 0.,
+                     a->x, a->y, 0., 0., a->b, 0.,
+                     dx / len, dy / len, 0., 0., db / len, 0., v, v, 0.);
+        t += move_t;
+        ret = itersolve_generate_steps(sk, sc, t);
+    }
+    if (!ret)
+        ret = stepcompress_flush(sc, (uint64_t)((t + 1.) * mcu_freq));
+    if (end)
+        *end = itersolve_get_commanded_pos(sk);
+    stepcompress_free(sc);
+    trapq_free(tq);
+    return ret;
+}
+
+// Straight across the centre, with the arm carried through it onto the
+// negative branch and the bed held still - the 'cross' policy of
+// klippy/kinematics/centre_path.py, as the kinematics marks it.
+static void
+test_centre_crossing_step_generation(void)
+{
+    printf("\n-- corertheta: crossing the centre on the other branch --\n");
+    double end;
+    static const struct branch_pt straight[] = {
+        {40., 0., 0., 1, 0}, {-40., 0., 0., 1, 0} };
+    check("across on one branch, bed: refused",
+          run_branch_sequence(straight, 1, 'c', 0., 0, 0, NULL) != 0, 1., 0.);
+    static const struct branch_pt planned[] = {
+        {40., 0., 0., 1, 0}, {CP_PARK, 0., 0., 1, 0}, {-40., 0., 0., 1, 1} };
+    check("across, flipped at the centre, bed: accepted",
+          run_branch_sequence(planned, 2, 'c', 0., 0, 0, &end), 0., 0.);
+    check("across, flipped at the centre: the bed held still", end, 0., 1e-9);
+    check("across, flipped at the centre, gantry +: accepted",
+          run_branch_sequence(planned, 2, '+', 0., 0, 0, &end), 0., 0.);
+    check("across, flipped at the centre: gantry + at b + r", end, -40.,
+          0.0125);
+    check("across, flipped at the centre, gantry -: accepted",
+          run_branch_sequence(planned, 2, '-', 0., 0, 0, &end), 0., 0.);
+    check("across, flipped at the centre: gantry - at b - r", end, 40.,
+          0.0125);
+
+    // And back again, off the far side of a diagonal
+    const double d = 40. / sqrt(2.), p = CP_PARK / sqrt(2.);
+    const struct branch_pt there_and_back[] = {
+        {d, d, 0., 1, 0}, {p, p, 0., 1, 0}, {-d, -d, 0., 1, 1},
+        {-p, -p, 0., -1, 0}, {d, d, 0., -1, 1} };
+    check("diagonal and back, bed: accepted",
+          run_branch_sequence(there_and_back, 4, 'c', 0., 0, 0, &end),
+          0., 0.);
+    check("diagonal and back: the bed held still", end, M_PI / 4., 1e-9);
+    check("diagonal and back, gantry +: accepted",
+          run_branch_sequence(there_and_back, 4, '+', 0., 0, 0, &end),
+          0., 0.);
+    check("diagonal and back: gantry + at b + r", end, 40., 0.0125);
+
+    // With the head tilted to B10 under RTCP the carriage passes through
+    // the centre well before the tip does - at a tip radius of
+    // 40 * sin(10) - on the arriving move, not the flipping one
+    static const struct branch_pt tilted[] = {
+        {40., 0., 10., 1, 0}, {CP_PARK, 0., 10., 1, 0},
+        {-40., 0., 10., 1, 1} };
+    const double dh = -40. * sin(10. * M_PI / 180.);
+    check("tilted, under RTCP, gantry +: accepted",
+          run_branch_sequence(tilted, 2, '+', 40., 0, 0, &end), 0., 0.);
+    check("tilted, under RTCP: gantry + at b + r + dh",
+          end, 10. - 40. + dh, 0.0125);
+    check("tilted, under RTCP, gantry -: accepted",
+          run_branch_sequence(tilted, 2, '-', 40., 0, 0, &end), 0., 0.);
+    // The bed held still keeps the projected B where it was, so the
+    // projection adds nothing to the crossing
+    check("tilted, projected, under RTCP, gantry +: accepted",
+          run_branch_sequence(tilted, 2, '+', 40., 1, 0, &end), 0., 0.);
+    check("tilted, projected, under RTCP: gantry + unchanged",
+          end, 10. - 40. + dh, 0.0125);
+
+    // Why [rtcp] leaves the bed motor unwrapped.  Tilted to B10 the
+    // carriage sits 6.95mm inboard of the tip; pass the tip across the
+    // arm at a radius a few microns beyond that, and the carriage runs
+    // through the centre's dead zone while the tip is nowhere near it.
+    // Wrapped, the bed takes its angle from the carriage there - from the
+    // direction of travel, a quarter turn off.  Unwrapped, it follows the
+    // tip, which is what it is meant to follow.
+    const double r = -dh + 0.004;
+    const struct branch_pt tangent[] = {
+        {r, -5., 10., 1, 0}, {r, 5., 10., 1, 0} };
+    check("tangent past the carriage's centre, bed wrapped: refused",
+          run_branch_sequence(tangent, 1, 'c', 40., 0, 1, NULL) != 0, 1., 0.);
+    check("tangent past the carriage's centre, bed unwrapped: accepted",
+          run_branch_sequence(tangent, 1, 'c', 40., 0, 0, NULL), 0., 0.);
+
+    // The host's conversions carry the branch across too
+    double pos[3] = {5., 0., 0.};
+    check("tool_to_machine: carried through the centre",
+          rtcp_tool_to_machine(0., 40., RTCP_FRAME_RADIAL, 10., 1, pos),
+          -1., 0.);
+    check("tool_to_machine: carriage x", pos[0], 5. + dh, 1e-12);
+    check("machine_to_tool: back onto the usual branch",
+          rtcp_machine_to_tool(0., 40., RTCP_FRAME_RADIAL, 10., -1, pos),
+          1., 0.);
+    check("machine_to_tool: tip x", pos[0], 5., 1e-12);
+    double far[3] = {-5., 0., 0.};
+    check("tool_to_machine: outboard on the far side is towards +x",
+          rtcp_tool_to_machine(0., 40., RTCP_FRAME_RADIAL, 10., -1, far),
+          -1., 0.);
+    check("tool_to_machine: far side carriage x", far[0], -5. + dh, 1e-12);
+}
+
+// [input_shaper] hands its wrapped solver a stand-in move carrying the
+// shaped position.  The branch and the direction of travel have to go
+// with it, or the far side of the bed is solved on the wrong branch.
+static void
+test_shaper_carries_the_branch(void)
+{
+    printf("\n-- input shaper: the branch reaches the wrapped solver --\n");
+    struct stepper_kinematics *minus = corertheta_stepper_alloc('-', 1.);
+    struct stepper_kinematics *is = input_shaper_alloc();
+    check("input_shaper_set_sk", input_shaper_set_sk(is, minus), 0., 0.);
+    double a[2] = {.5, .5}, t[2] = {0., .02};
+    check("shaper x", input_shaper_set_shaper_params(is, 'x', 2, a, t),
+          0., 0.);
+    check("shaper y", input_shaper_set_shaper_params(is, 'y', 2, a, t),
+          0., 0.);
+    // Constant velocity along the far side of the centre, which a shaper
+    // reproduces exactly: the arm radius is the negative of the distance
+    struct trapq *tq = trapq_alloc();
+    trapq_set_branch(tq, -1, 0);
+    trapq_append(tq, .1, 0., 1., 0., -40., 0., 0., 0., 0., 0.,
+                 -1., 0., 0., 0., 0., 0., 20., 20., 0.);
+    check("shaped, far side: gantry - at b - r", sample(tq, is, .6),
+          50., 1e-9);
+    trapq_free(tq);
+}
+
 int
 main(void)
 {
@@ -984,6 +1278,9 @@ main(void)
     test_b_projection();
     test_bed_centre();
     test_centre_path_step_generation();
+    test_bed_centre_branches();
+    test_centre_crossing_step_generation();
+    test_shaper_carries_the_branch();
     benchmark();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures != 0;

@@ -20,7 +20,10 @@
 //
 // Holding B at 10 degrees through a full turn of the bed therefore sweeps
 // the machine's B over 10 -> 0 -> -10 -> 0 -> 10.  cos(theta) is x/|xy|,
-// so no trigonometry is needed.
+// so no trigonometry is needed.  theta is the angle the bed is really
+// driven to, which on the negative branch is the other half turn (see
+// bed_centre.h) - so a tool carried straight through the centre with the
+// bed held keeps the same machine B, as it physically should.
 //
 // The projection is only wanted for print moves.  Angles beyond max_angle
 // are orientation commands - swinging the probe down, parking the head -
@@ -54,9 +57,10 @@ struct bproject_stepper {
 };
 
 // The projection itself.  Exposed so that the host code can apply the
-// same mapping to a single position without going through a stepper.
+// same mapping to a single position, standing still on the given branch
+// (see bed_centre.h), without going through a stepper.
 double __visible
-bproject_project_b(double b, double x, double y
+bproject_project_b(double b, double x, double y, int branch
                    , double max_angle, double taper_range)
 {
     double ab = fabs(b);
@@ -65,6 +69,7 @@ bproject_project_b(double b, double x, double y
         return b;
     struct move m;
     memset(&m, 0, sizeof(m));
+    m.branch = branch;
     struct coord c = { .x = x, .y = y };
     double cos_t = bed_centre_cos(&m, &c);
     double w = 1.;
@@ -100,9 +105,12 @@ bproject_calc_position(struct stepper_kinematics *sk, struct move *m
         pos.b *= 1. + w * (cos_t - 1.);
     }
     bs->m.start_pos = pos;
-    // Carry the direction of travel through as well - the bed solver
-    // needs it to resolve the angle inside the dead zone
+    // Carry the direction of travel and the branch through as well - the
+    // wrapped solvers need them to resolve the bed angle and the arm
+    // radius at the centre
     bs->m.axes_r = m->axes_r;
+    bs->m.branch = m->branch;
+    bs->m.branch_flip = m->branch_flip;
     return bs->orig_sk->calc_position_cb(bs->orig_sk, &bs->m, DUMMY_T);
 }
 

@@ -66,6 +66,17 @@ class Move:
         # Setup for minimum_cruise_ratio checks
         self.max_mcr_start_v2 = 0.
         self.mcr_delta_v2 = 2.0 * move_d * toolhead.mcr_pseudo_accel
+        # Which of the two solutions of a kinematics with a redundant
+        # representation the move is on, and whether it changes over to
+        # the other where it passes the centre - see
+        # klippy/kinematics/bed_centre.py.  Only such a kinematics
+        # (corertheta) ever sets branch_flip, in its check_move().
+        self.branch = toolhead.branch
+        self.branch_flip = False
+    def get_end_branch(self):
+        if self.branch_flip:
+            return -self.branch
+        return self.branch
     def limit_speed(self, speed, accel):
         speed2 = speed**2
         if speed2 < self.max_cruise_v2:
@@ -223,6 +234,10 @@ class ToolHead:
         self.lookahead.set_flush_time(BUFFER_TIME_HIGH)
         # [x, y, z, e, a, b, c] - see ROTARY_POS above
         self.commanded_pos = [0.] * BASE_POS_LEN
+        # The branch the toolhead is on at commanded_pos (see Move), and
+        # the one last stamped onto the motion queue
+        self.branch = 1
+        self.trapq_branch = (0, False)
         # Velocity and acceleration control
         self.max_velocity = config.getfloat('max_velocity', above=0.)
         self.max_accel = config.getfloat('max_accel', above=0.)
@@ -253,6 +268,8 @@ class ToolHead:
                                                     can_add_trapq=True)
         self.trapq = self.motion_queuing.allocate_trapq()
         self.trapq_append = self.motion_queuing.lookup_trapq_append()
+        ffi_main, ffi_lib = chelper.get_ffi()
+        self.trapq_set_branch = ffi_lib.trapq_set_branch
         # Create kinematics class
         gcode = self.printer.lookup_object('gcode')
         self.Coord = gcode.Coord
@@ -308,6 +325,7 @@ class ToolHead:
         with self.reactor.assert_no_pause():
             for move in moves:
                 if move.needs_trapq:
+                    self._stamp_branch(move.branch, move.branch_flip)
                     sp, ar = move.start_pos, move.axes_r
                     self.trapq_append(
                         self.trapq, next_move_time,
@@ -325,6 +343,12 @@ class ToolHead:
         # Generate steps for moves
         self._advance_move_time(next_move_time)
         self.motion_queuing.note_mcu_movequeue_activity(next_move_time)
+    def _stamp_branch(self, branch, branch_flip):
+        # Moves take their branch from the motion queue as they are added
+        # to it; only tell it when that changes
+        if (branch, branch_flip) != self.trapq_branch:
+            self.trapq_branch = (branch, branch_flip)
+            self.trapq_set_branch(self.trapq, branch, int(branch_flip))
     def _flush_lookahead(self, is_runout=False):
         # Transit from "NeedPrime"/"Priming"/main state to "NeedPrime"
         prev_print_time = self.print_time
@@ -408,8 +432,20 @@ class ToolHead:
     # Movement commands
     def get_position(self):
         return list(self.commanded_pos)
-    def set_position(self, newpos, homing_axes=""):
+    def get_branch(self):
+        return self.branch
+    def set_branch(self, branch):
+        # Declare which branch the toolhead is standing on, for a
+        # kinematics that is about to set its position.  The steppers
+        # solve a position on the motion queue's current branch.
+        self.branch = branch
+        self._stamp_branch(branch, False)
+    def set_position(self, newpos, homing_axes="", branch=None):
+        # 'branch' is for a caller that knows the new position lies on
+        # the other branch; otherwise it stays on the current one, unless
+        # the kinematics decides otherwise in its set_position()
         self.flush_step_generation()
+        self.set_branch(self.branch if branch is None else branch)
         ffi_main, ffi_lib = chelper.get_ffi()
         kc = stepper.kin_coords(newpos)
         ffi_lib.trapq_set_position(self.trapq, self.print_time,
@@ -439,6 +475,7 @@ class ToolHead:
             if move.axes_d[e_index + 3]:
                 ea.check_move(move, e_index + 3)
         self.commanded_pos[:] = move.end_pos
+        self.branch = move.get_end_branch()
         want_flush = self.lookahead.add_move(move)
         if want_flush:
             self._process_lookahead(lazy=True)
@@ -513,11 +550,13 @@ class ToolHead:
         # Queue move into trapezoid motion queue (trapq)
         if submit_move.move_d:
             self.commanded_pos[:] = submit_move.end_pos
+            self.branch = submit_move.get_end_branch()
             self.lookahead.add_move(submit_move)
         moves = self.lookahead.flush()
         self._calc_print_time()
         start_time = end_time = self.print_time
         for move in moves:
+            self._stamp_branch(move.branch, move.branch_flip)
             sp, ar = move.start_pos, move.axes_r
             self.trapq_append(
                 self.trapq, end_time,

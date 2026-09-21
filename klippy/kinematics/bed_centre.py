@@ -52,6 +52,32 @@
 # rate zero with no special case.  It is also the chord dead through the
 # centre, whose rates are all zero while the bed still has half a turn to
 # make.  That one is caught by the swept angle, never by a rate.
+#
+# TWO BRANCHES
+#
+# Every x/y position has two polar names, (r, theta) and (-r, theta + pi).
+# A move's branch says which one it is solved on: the usual one, with the
+# arm at a positive radius, or - on a machine whose arm can travel through
+# the centre - the other, with the arm at a negative radius and the bed
+# turned the other half turn.  On the negative branch a straight line
+# through the centre is a plain radial move with the bed held still, so a
+# move marked branch_flip changes over to the other branch where it passes
+# the centre.  That is the only way the branch ever changes: at the
+# centre, where the arm radius is zero on both.
+#
+# THE POSITION NAMES THE BED ANGLE
+#
+# Standing still, the bed faces atan2(y, x) - the other half turn on the
+# negative branch, and zero on the centre itself - and that is what
+# setting a position tells the bed motor it is at.  Inside the dead zone a
+# moving tool's bed angle comes from its direction of travel instead, so
+# a move that ends there, or starts there, can leave the bed facing
+# somewhere its position does not name.  The next position set would then
+# quietly redefine the bed angle, and everything printed afterwards would
+# be turned by the difference.  centre_turns() measures that mismatch and
+# [polar_singularity] refuses any move that has one: a move may only come
+# to rest in the dead zone on the ray it arrived along, and only leave it
+# along the line the bed faces.
 import math
 
 
@@ -64,20 +90,14 @@ import math
 # up to pi.  Inside it, while the tool is moving in x/y, the bed angle is
 # taken from the direction of travel instead - see bed_angle() below.
 CENTRE_RADIUS = 0.010
-# A position this close to the centre line is on it, to within rounding.
-# The radial RTCP correction scales x and y about the centre, which has no
-# direction to scale along here.
-#
-# This is not CENTRE_RADIUS, and the gap between them is deliberate but
-# worth knowing: between the two, the RTCP correction is applied along the
-# position's own angle while the bed is driven to the angle of travel.
-# The two agree on every path that stays radial inside the zone - the only
-# paths [polar_singularity] lets in there - and disagree on the paths it
-# refuses.
-CENTRE_EPSILON = 1e-9
 
 # A sweep smaller than this is not worth refusing a move over
 MIN_SWEPT_ANGLE = math.radians(1.)
+# A step in the bed angle this small (in radians), made in a single
+# sample, is left to the step generator - well under a microstep on any
+# bed this is likely to drive.  Anything larger where a move leaves or
+# comes to rest at the centre is refused (see centre_turns()).
+ANGLE_TOLERANCE = 1e-4
 # |u| / |offset| at which the geometric part of theta_ddot peaks, and the
 # peak itself as a multiple of v^2 / offset^2
 ANGULAR_ACCEL_PEAK_U = 1. / math.sqrt(3.)
@@ -85,8 +105,9 @@ ANGULAR_ACCEL_PEAK = 9. / (8. * math.sqrt(3.))
 
 
 ######################################################################
-# The bed angle at a sample - mirrors bed_centre_angle() and
-# bed_centre_cos() in klippy/chelper/bed_centre.h
+# The bed angle at a sample - mirrors move_get_branch() in
+# klippy/chelper/trapq.c and bed_centre_angle(), bed_centre_facing(),
+# bed_centre_cos() and bed_centre_radius() in klippy/chelper/bed_centre.h
 ######################################################################
 
 # 'travel' is the move's direction in x/y (its axes_r.x and axes_r.y), or
@@ -95,21 +116,18 @@ ANGULAR_ACCEL_PEAK = 9. / (8. * math.sqrt(3.))
 # it, while moving, the angle is the one the path has where it leaves the
 # zone - or, while the tool is still heading inward, where it entered.
 # The bed is then already at the right angle by the time the radius means
-# something again, so nothing has to turn at the boundary.
+# something again, so nothing has to turn at the boundary.  On the
+# negative branch the bed is turned the other half turn.
 #
 # This is the rule the step generators actually run, which is why it is
 # mirrored here rather than improved.  It is right for the homing sweep
 # it was written for, which departs from the centre along +x.  It is not
-# right in general, in two ways the real step generator confirms (see
-# test_centre_path_step_generation() in test/multi_axis/test_kin_6axis.c):
-#
-#   * A move that leaves the centre along any ray but the one the bed
-#     already faces - including one that carries straight on through it -
-#     steps the bed at its first sample.
-#   * A sample on the bare centre while the bed is live falls back to
-#     atan2 of whatever is there: zero at (0, 0), or with RTCP on, the
-#     direction the tool offset has pushed the carriage - so tilting the
-#     head while standing on the bare centre steps the bed as well.
+# right in general: a move that leaves the centre along any ray but the
+# line the bed already faces steps the bed at its first sample - the real
+# step generator confirms it (see test_centre_path_step_generation() in
+# test/multi_axis/test_kin_6axis.c) - and a move that comes to rest in the
+# dead zone off the ray it arrived along leaves the bed facing somewhere
+# its position does not name.  centre_turns() below measures both.
 #
 # The rule also hands the very last instant of a move that arrives on the
 # centre the angle of travel rather than the angle arrived at, but the
@@ -125,6 +143,10 @@ def half_turn(angle):
     # applies, so both sides agree to the bit
     return angle + (-math.pi if angle > 0. else math.pi)
 
+def wrap_angle(angle):
+    # Into (-pi, pi]
+    return math.atan2(math.sin(angle), math.cos(angle))
+
 def _moving(travel):
     return travel is not None and bool(travel[0] or travel[1])
 
@@ -134,27 +156,55 @@ def _in_zone(x, y, travel):
 def _heading_inward(x, y, travel):
     return x * travel[0] + y * travel[1] < 0.
 
-def bed_angle(x, y, travel=None):
-    # The bed angle for a sample, in (-pi, pi], before unwrapping
+def sample_branch(x, y, travel, branch, branch_flip=False):
+    # The branch a sample of a move is solved on: -1 or 1.  A move marked
+    # branch_flip changes over from the point where it stops heading
+    # towards the centre.
+    negative = branch < 0
+    if (branch_flip and travel is not None
+            and x * travel[0] + y * travel[1] >= 0.):
+        negative = not negative
+    return -1 if negative else 1
+
+def bed_angle(x, y, travel=None, branch=1):
+    # The bed angle for a sample on the given branch (already resolved
+    # with sample_branch()), in (-pi, pi], before unwrapping
     if not _in_zone(x, y, travel):
-        return math.atan2(y, x)
-    angle = math.atan2(travel[1], travel[0])
-    if _heading_inward(x, y, travel):
+        angle = math.atan2(y, x)
+    else:
+        angle = math.atan2(travel[1], travel[0])
+        if _heading_inward(x, y, travel):
+            angle = half_turn(angle)
+    if branch < 0:
         return half_turn(angle)
     return angle
 
-def cos_bed_angle(x, y, travel=None):
-    # cos(bed_angle()), computed without the atan2 on the common path
+def facing(x, y, travel=None, branch=1):
+    # The unit vector bed_angle() points along - the direction of
+    # increasing arm radius, in bed coordinates - without the atan2
     if not _in_zone(x, y, travel):
-        r2 = x*x + y*y
-        if r2 <= 0.:
+        r = math.sqrt(x*x + y*y)
+        if r > 0.:
+            fx, fy = x / r, y / r
+        else:
             # atan2(0, 0) is zero
-            return 1.
-        return x / math.sqrt(r2)
-    cos_t = travel[0] / math.sqrt(travel[0]**2 + travel[1]**2)
-    if _heading_inward(x, y, travel):
-        return -cos_t
-    return cos_t
+            fx, fy = 1., 0.
+    else:
+        length = math.sqrt(travel[0]**2 + travel[1]**2)
+        fx, fy = travel[0] / length, travel[1] / length
+        if _heading_inward(x, y, travel):
+            fx, fy = -fx, -fy
+    if branch < 0:
+        return -fx, -fy
+    return fx, fy
+
+def cos_bed_angle(x, y, travel=None, branch=1):
+    # cos(bed_angle())
+    return facing(x, y, travel, branch)[0]
+
+def arm_radius(x, y, branch=1):
+    # The arm radius at a position - negative on the negative branch
+    return branch * math.sqrt(x*x + y*y)
 
 def unwrap_angle(angle, reference):
     # Bring an atan2 result to within half a turn of where the bed already
@@ -325,42 +375,67 @@ def limits_for_angular_rates(offset, r_min, u_start, u_end,
 
 
 ######################################################################
-# Signed radius
+# Leaving rest and coming to rest at the centre
 ######################################################################
 
-# Every x/y position has two polar names: (r, theta) and (-r, theta + pi).
-# The kinematics only ever use the first, which is why a straight line
-# through the centre is a half turn of the bed.  On the second branch the
-# same line is a plain radial move through r = 0 with theta held - no
-# rotation at all - provided the arm can travel to a negative radius.
-#
-# Nothing drives a signed radius yet.  These are the conversions a move
-# carrying its branch will need, kept here so that the arithmetic has one
-# definition from the start.  The angle is kept in (-pi, pi] on both
-# branches by half_turn(), the same half turn the dead zone applies.
+def _travel(start_pos, end_pos):
+    dx, dy = end_pos[0] - start_pos[0], end_pos[1] - start_pos[1]
+    if not dx and not dy:
+        return None
+    return dx, dy
 
-def polar_position(x, y, branch=1):
-    # (r, theta) for a position on the given branch: +1 is the usual
-    # non-negative radius, -1 the negative one
-    r = math.sqrt(x*x + y*y)
-    theta = math.atan2(y, x)
-    if branch < 0:
-        return -r, half_turn(theta)
-    return r, theta
+def end_branch(branch, branch_flip):
+    # The branch a move leaves the tool standing on
+    return -branch if branch_flip else branch
 
-def cartesian_position(r, theta):
-    # The inverse of polar_position(), for either branch
-    return r * math.cos(theta), r * math.sin(theta)
+def _last_sample_angle(x, y, travel, branch, branch_flip):
+    # The bed angle a move approaches as it comes to rest at x/y: the
+    # limit of the dead zone rule from before the move's end.  Only the
+    # very last instant can differ from it, and the step generator stops
+    # short of that instant - a move that ends on the centre was still
+    # heading in.
+    along = x * travel[0] + y * travel[1]
+    negative = branch < 0
+    if branch_flip and along > 0.:
+        negative = not negative
+    if x*x + y*y < CENTRE_RADIUS * CENTRE_RADIUS:
+        angle = math.atan2(travel[1], travel[0])
+        if along <= 0.:
+            angle = half_turn(angle)
+    else:
+        angle = math.atan2(y, x)
+    if negative:
+        return half_turn(angle)
+    return angle
 
-def signed_radius(x, y, theta):
-    # The radius at which bed angle theta puts the tool at x/y - negative
-    # when the position lies behind theta.  Exact only for positions on
-    # the line through the centre at that angle, which are the only ones a
-    # branch-holding move ever visits.
-    return x * math.cos(theta) + y * math.sin(theta)
+def centre_turns(start_pos, end_pos, branch=1, branch_flip=False):
+    # How far the bed angle steps, in a single sample, where a move leaves
+    # rest at its start and where it comes back to rest at its end: the
+    # difference between the angle the position names standing still and
+    # the one the dead zone rule drives the bed to there.  Both are zero
+    # for a move that starts and ends outside the dead zone, and for one
+    # that does not move in x/y.  A non-zero turn at the start is a step
+    # the step compressor has to swallow; one at the end leaves the bed
+    # facing somewhere the toolhead position does not name.
+    travel = _travel(start_pos, end_pos)
+    if travel is None:
+        return 0., 0.
+    sx, sy = start_pos[0], start_pos[1]
+    ex, ey = end_pos[0], end_pos[1]
+    at_rest = bed_angle(sx, sy, None, branch)
+    first = bed_angle(sx, sy, travel,
+                      sample_branch(sx, sy, travel, branch, branch_flip))
+    last = _last_sample_angle(ex, ey, travel, branch, branch_flip)
+    to_rest = bed_angle(ex, ey, None, end_branch(branch, branch_flip))
+    return wrap_angle(first - at_rest), wrap_angle(last - to_rest)
 
-def branch_for_angle(x, y, theta):
-    # Which branch names x/y at bed angle theta
-    if signed_radius(x, y, theta) < 0.:
-        return -1
-    return 1
+def flips_through_centre(start_pos, end_pos, branch=1):
+    # Whether a move that starts in the dead zone ends on the far side of
+    # the centre along the line the bed faces.  With the bed held still it
+    # can only get there by changing over to the other branch where it
+    # passes the centre, with the arm travelling through zero radius.
+    sx, sy = start_pos[0], start_pos[1]
+    if sx*sx + sy*sy >= CENTRE_RADIUS * CENTRE_RADIUS:
+        return False
+    fx, fy = facing(sx, sy, None, branch)
+    return branch * (end_pos[0] * fx + end_pos[1] * fy) < 0.

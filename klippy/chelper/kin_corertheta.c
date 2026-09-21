@@ -22,12 +22,16 @@
 // the same six-axis motion queue - see 'struct coord' in trapq.h.  The
 // b_ratio converts a degree of B rotation into the motor travel it costs,
 // so that the two terms of the sum share the units of the belt.
+//
+// All three solvers take the move's branch into account (see
+// bed_centre.h): on the negative branch the arm radius is negative and
+// the bed is turned the other half turn, which names the same point.
 
-#include <math.h> // sqrt, atan2
+#include <math.h> // M_PI
 #include <stddef.h> // offsetof
 #include <stdlib.h> // malloc
 #include <string.h> // memset
-#include "bed_centre.h" // bed_centre_angle
+#include "bed_centre.h" // bed_centre_angle, bed_centre_radius
 #include "compiler.h" // __visible
 #include "itersolve.h" // struct stepper_kinematics
 #include "pyhelper.h" // errorf
@@ -40,7 +44,7 @@ struct corertheta_stepper {
 
 // Bed rotation - the polar angle of the commanded cartesian position.
 // The radius that goes with it is what the two gantry solvers below
-// compute as sqrt(x*x + y*y) - the R coordinate of the arm.
+// compute - the R coordinate of the arm.
 static double
 corertheta_stepper_bed_calc_position(struct stepper_kinematics *sk
                                      , struct move *m, double move_time)
@@ -81,7 +85,7 @@ corertheta_stepper_plus_calc_position(struct stepper_kinematics *sk
     struct corertheta_stepper *cs = container_of(
         sk, struct corertheta_stepper, sk);
     struct coord c = move_get_coord(m, move_time);
-    return cs->b_ratio * c.b + sqrt(c.x*c.x + c.y*c.y);
+    return cs->b_ratio * c.b + bed_centre_radius(m, &c);
 }
 
 // Second gantry motor: B rotation minus the arm radius R
@@ -92,7 +96,7 @@ corertheta_stepper_minus_calc_position(struct stepper_kinematics *sk
     struct corertheta_stepper *cs = container_of(
         sk, struct corertheta_stepper, sk);
     struct coord c = move_get_coord(m, move_time);
-    return cs->b_ratio * c.b - sqrt(c.x*c.x + c.y*c.y);
+    return cs->b_ratio * c.b - bed_centre_radius(m, &c);
 }
 
 struct stepper_kinematics * __visible

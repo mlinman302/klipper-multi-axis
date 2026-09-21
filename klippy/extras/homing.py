@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math
 import stepper
+from kinematics import bed_centre
 
 HOMING_START_DELAY = 0.001
 ENDSTOP_SAMPLE_TIME = .000015
@@ -114,16 +115,21 @@ class HomingMove:
                     break
         # calc_position() works in machine (carriage) coordinates.  With
         # RTCP active those differ from the tool tip coordinates that
-        # g-code uses, so convert back before reporting.
+        # g-code uses, so convert back before reporting.  A homing or
+        # probing move does not turn the bed, so the toolhead's own
+        # position says which way it faces - which a carriage standing on
+        # the centre could not.
+        branch = self.toolhead.get_branch()
         rtcp = self.printer.lookup_object('rtcp', None)
         if rtcp is not None:
-            res = rtcp.machine_to_tool(res)
+            direction = bed_centre.facing(thpos[0], thpos[1], None, branch)
+            res, branch = rtcp.machine_to_tool_branch(res, branch, direction)
         # calc_position() likewise reports the B the head is really turned
         # to; with [b_projection] active that is the projection of the
         # commanded B, so map it back into the commanded frame
         bproj = self.printer.lookup_object('b_projection', None)
         if bproj is not None:
-            res = bproj.machine_to_commanded(res, thpos)
+            res = bproj.machine_to_commanded(res, thpos, branch)
         return res
     def homing_move(self, movepos, speed, probe_pos=False,
                     triggered=True, check_triggered=True):

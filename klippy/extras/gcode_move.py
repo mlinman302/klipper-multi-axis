@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 import stepper
+from kinematics import bed_centre
 
 class GCodeMove:
     def __init__(self, config):
@@ -317,7 +318,11 @@ class GCodeMove:
                 # machine_to_tool() undoes the tip swing, so it needs the
                 # angle the head is really turned to, not the commanded one
                 mpos[stepper.KIN_AXIS_INDEXES[4]] = calc_pos[4]
-            calc_pos[:3] = rtcp.machine_to_tool(mpos)[:3]
+            # And the way the bed faces, which the commanded position
+            # names and a carriage standing on the centre would not
+            tpos, branch = toolhead.get_position(), toolhead.get_branch()
+            direction = bed_centre.facing(tpos[0], tpos[1], None, branch)
+            calc_pos[:3] = rtcp.machine_to_tool(mpos, branch, direction)[:3]
         kinfo = zip("XYZ", calc_pos)
         kin_pos = " ".join(["%s:%.6f" % (a, v) for a, v in kinfo])
         anames = self._get_axis_names()

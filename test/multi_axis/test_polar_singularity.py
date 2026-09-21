@@ -47,6 +47,10 @@ class FakeMove:
         self.move_d = math.sqrt(sum([d*d for d in self.axes_d[:3]]))
         self.max_cruise_v2 = velocity ** 2
         self.accel = 3000.
+        self.branch = 1
+        self.branch_flip = False
+    def get_end_branch(self):
+        return -self.branch if self.branch_flip else self.branch
     def limit_speed(self, speed, accel):
         if speed ** 2 < self.max_cruise_v2:
             self.max_cruise_v2 = speed ** 2
@@ -66,6 +70,7 @@ def build_checker(max_angular_v=5., max_angular_a=0., min_velocity=0.5):
     chk.planner = centre_path.CentrePlanner(max_angular_v, max_angular_a,
                                             min_velocity)
     chk.last_radius = chk.last_swept = chk.last_velocity_limit = 0.
+    chk.toolhead = None
     return chk
 
 
@@ -206,6 +211,132 @@ class TestKinematicsLimit(unittest.TestCase):
         move = FakeMove((0., 0.), (80., 0.), 100.)
         polar.limit_centre_speed(move, 5.)
         self.assertAlmostEqual(move.cruise_velocity(), 100.)
+
+
+######################################################################
+# The position names the bed angle
+######################################################################
+
+PARK = 1e-4
+
+
+class TestCentreRest(unittest.TestCase):
+    # A move may only come to rest in the dead zone on the ray it arrived
+    # along, and only leave it along the line the bed faces
+    def setUp(self):
+        self.chk = build_checker()
+
+    def refused(self, start, end, branch=1, flip=False):
+        move = FakeMove(start, end, 100.)
+        move.branch, move.branch_flip = branch, flip
+        try:
+            self.chk._check_move(move)
+        except CommandError as e:
+            return str(e)
+        return None
+
+    def test_leaving_the_bare_centre_off_the_line_it_faces(self):
+        # Standing on (0, 0) names a bed angle of zero
+        self.assertIn("leaves the centre", self.refused((0., 0.), (0., 10.)))
+        self.assertIn("leaves the centre",
+                      self.refused((0., 0.), (-10., 0.)))
+        self.assertIsNone(self.refused((0., 0.), (10., 0.)))
+
+    def test_leaving_a_park_point_off_its_ray(self):
+        self.assertIsNotNone(self.refused((0., PARK), (10., PARK)))
+        self.assertIsNone(self.refused((0., PARK), (0., 10.)))
+
+    def test_coming_to_rest_on_the_bare_centre_off_its_ray(self):
+        self.assertIn("comes to rest", self.refused((0., 40.), (0., 0.)))
+        self.assertIsNone(self.refused((40., 0.), (0., 0.)))
+        self.assertIsNone(self.refused((0., 40.), (0., PARK)))
+
+    def test_a_small_turn_is_left_to_the_step_generator(self):
+        # Off the line by well under ANGLE_TOLERANCE
+        self.assertIsNone(self.refused((PARK, 0.), (40., 40e-6)))
+
+
+class TestCrossingMoves(unittest.TestCase):
+    def setUp(self):
+        self.chk = build_checker(max_angular_v=5., max_angular_a=50.)
+
+    def check(self, start, end, branch=1, flip=False):
+        move = FakeMove(start, end, 100.)
+        move.branch, move.branch_flip = branch, flip
+        self.chk._check_move(move)
+        return move
+
+    def test_straight_through_on_the_flip(self):
+        # Off the line by rounding alone, as a planned move is.  The bed
+        # does not turn, so it is neither refused nor slowed.
+        move = self.check((PARK, 1e-12), (-40., 0.), flip=True)
+        self.assertAlmostEqual(move.cruise_velocity(), 100.)
+        self.assertEqual(self.chk.last_swept, 0.)
+        # ...and back
+        move = self.check((-PARK, 0.), (40., 0.), branch=-1, flip=True)
+        self.assertAlmostEqual(move.cruise_velocity(), 100.)
+
+    def test_the_same_move_without_it_is_refused(self):
+        self.assertRaises(CommandError, self.check, (PARK, 1e-12),
+                          (-40., 0.))
+
+    def test_a_flip_off_the_line_the_bed_faces_is_refused(self):
+        self.assertRaises(CommandError, self.check, (PARK, 0.), (-40., 5.),
+                          1, True)
+
+    def test_a_flip_that_does_not_reach_the_far_side(self):
+        # Marked, but stopping short of the centre: the last instant would
+        # hand the bed the far side's angle
+        self.assertRaises(CommandError, self.check, (PARK, 0.),
+                          (PARK / 2., 0.), 1, True)
+
+
+class FakeKinematics:
+    def __init__(self, can_cross):
+        self.can_cross = can_cross
+    def can_cross_centre(self):
+        return self.can_cross
+
+
+class FakeToolhead:
+    def __init__(self, can_cross=False, position=(0., 0., 0., 0.),
+                 branch=1):
+        self.kin = FakeKinematics(can_cross)
+        self.position = list(position)
+        self.branch = branch
+    def get_kinematics(self):
+        return self.kin
+    def get_position(self):
+        return list(self.position)
+    def get_branch(self):
+        return self.branch
+
+
+class TestConfigAtConnect(unittest.TestCase):
+    def build(self, travel_policy='bypass', print_policy='error'):
+        chk = build_checker()
+        chk.name = 'polar_singularity'
+        chk.travel_policy, chk.print_policy = travel_policy, print_policy
+        chk.reorient_radius = None
+        chk.upright_transit = True
+        return chk
+
+    def test_cross_needs_the_kinematics_to_allow_it(self):
+        chk = self.build(travel_policy='cross')
+        self.assertRaises(CommandError, chk._make_planner, False, None,
+                          CommandError)
+        planner = chk._make_planner(True, 5, CommandError)
+        self.assertEqual(planner.travel_policy, 'cross')
+        self.assertEqual(planner.tilt_index, 5)
+
+    def test_status_reports_where_the_tool_stands(self):
+        chk = self.build()
+        chk.toolhead = FakeToolhead(position=(PARK, 0., 0., 0.), branch=-1)
+        status = chk.get_status(0.)
+        self.assertTrue(status['at_centre'])
+        self.assertEqual(status['branch'], -1)
+        chk.toolhead.position = [40., 0., 0., 0.]
+        self.assertFalse(chk.get_status(0.)['at_centre'])
 
 
 if __name__ == '__main__':
