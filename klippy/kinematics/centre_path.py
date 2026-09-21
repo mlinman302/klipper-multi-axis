@@ -130,12 +130,16 @@
 # say - only the departing half is left, which blends too, over a
 # distance four times shorter for the same tolerance.
 #
-# A near miss can use the same machinery.  On an arm that can cross, a
-# print move that would crawl past the centre at the bed's angular limit
-# - which takes about pi / max_angular_velocity however near it passes -
-# is instead routed through the centre when it passes within
-# blend_tolerance of it, and blended there: the bed turns only as much
-# as the dogleg does, a fraction of a degree, instead of half a turn.
+# A near miss uses the same machinery.  One so close that holding the
+# bed's limits would take it below min_velocity is routed through the
+# centre by its policy, and there it is now blended where it used to stop
+# and turn on the circle - under 'cross' the bend is a fraction of a
+# degree, so it runs at full speed.  And under 'cross', a move that is
+# merely slowed - crawling past at the bed's angular limit, which takes
+# about pi / max_angular_velocity however near it passes - is routed the
+# same way when it passes within blend_tolerance of the centre.  With the
+# defaults every near miss that close is already too tight to slow for;
+# the second case matters for a larger tolerance or a faster bed.
 import math
 from . import bed_centre
 

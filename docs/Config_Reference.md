@@ -2745,8 +2745,8 @@ centre may also leave along the far half of the line the bed faces, so
 the bed never turns more than a quarter turn. A move that is merely
 slowed is split so that only its part close to the centre runs slowly -
 except that under `cross`, one that passes within `blend_tolerance` of
-the centre is taken through it instead, which turns the bed a fraction
-of a degree where passing by would have crawled for about
+the centre is taken through it and blended, which turns the bed a
+fraction of a degree where passing by would have crawled for about
 `pi / max_angular_velocity` seconds.
 
 The head's tilt is never changed by any of this: `B` follows the G-Code

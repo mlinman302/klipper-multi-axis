@@ -954,10 +954,14 @@ one slows blends and sends sharp ones back to the circle; it ships unset.
 
 A near miss uses the same machinery.  Passing the centre at a small
 offset is a half turn of the bed however close it passes, so the move
-check holds it to `max_angular_velocity * r_min` and it crawls for about
-`pi / max_angular_velocity` seconds.  Under `cross`, one within
-`blend_tolerance` of the centre is routed through it as a dogleg and
-blended: the bed turns a fraction of a degree, at full speed.
+check holds it to `max_angular_velocity * r_min`.  One too close to hold
+above `min_velocity` is routed through the centre by its policy, and is
+now blended there instead of stopping on it — under `cross` the bend is
+a fraction of a degree, so it runs at full speed.  Under `cross` a miss
+that is merely slowed, crawling for about `pi / max_angular_velocity`
+seconds, is routed the same way when it is within `blend_tolerance`.
+With the defaults every miss that close is already too tight to slow
+for; the second case matters for a larger tolerance or a faster bed.
 
 ### Looking ahead across the centre
 

@@ -1007,19 +1007,34 @@ class TestLookahead(unittest.TestCase):
 
 
 class TestNearMissThroughTheCentre(unittest.TestCase):
-    def test_a_close_print_move_goes_through_instead_of_crawling(self):
+    def test_a_close_print_move_goes_through_without_stopping(self):
+        # Too close to slow for (5 * 0.02 = 0.1 mm/s is below the floor),
+        # so routed through the centre - blended, where it used to stop
+        # there and turn a fraction of a degree on the circle
         start, end = pos(-20., .02, 10., 0.), pos(20., .02, 10., 4.)
         obj = build_transform(blend_planner(), start)
         obj.move(end, 60.)
         moves = obj.toolhead.moves
         check_all(self, moves)
-        # Onto the far branch at full speed, with the bed barely turning,
-        # where passing by would have crawled at 5 * 0.02 = 0.1 mm/s
+        # Onto the far branch at full speed, extruding the whole way
         self.assertEqual(obj.toolhead.branch, -1)
         self.assertEqual(set(m[4] for m in moves), {60.})
         self.assertLessEqual(deviation(moves, [start[:2], end[:2]]),
                              TOLERANCE)
         self.assertEqual(moves[-1][1], end)
+
+    def test_a_slowed_move_within_tolerance_goes_through_too(self):
+        # A 0.2 mm tolerance takes in a miss the bed's limit would only
+        # slow, to 5 * 0.15 = 0.75 mm/s, rather than refuse
+        planner = blend_planner(blend_tolerance=.2)
+        start, end = pos(-20., .15, 10., 0.), pos(20., .15, 10., 4.)
+        obj = build_transform(planner, start)
+        obj.move(end, 60.)
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        self.assertEqual(obj.toolhead.branch, -1)
+        self.assertGreater(min(m[4] for m in moves), 10.)
+        self.assertLessEqual(deviation(moves, [start[:2], end[:2]]), .2)
 
     def test_further_out_it_is_only_slowed(self):
         start, end = pos(-20., .2, 10., 0.), pos(20., .2, 10., 4.)
