@@ -20,7 +20,10 @@
 //
 // Holding B at 10 degrees through a full turn of the bed therefore sweeps
 // the machine's B over 10 -> 0 -> -10 -> 0 -> 10.  cos(theta) is x/|xy|,
-// so no trigonometry is needed.
+// so no trigonometry is needed.  theta is the angle the bed is really
+// driven to, which on the negative branch is the other half turn (see
+// bed_centre.h) - so a tool carried straight through the centre with the
+// bed held keeps the same machine B, as it physically should.
 //
 // The projection is only wanted for print moves.  Angles beyond max_angle
 // are orientation commands - swinging the probe down, parking the head -
@@ -39,17 +42,12 @@
 #include <stddef.h> // offsetof
 #include <stdlib.h> // malloc
 #include <string.h> // memset
+#include "bed_centre.h" // bed_centre_cos
 #include "compiler.h" // __visible
 #include "itersolve.h" // struct stepper_kinematics
 #include "trapq.h" // struct move
 
 #define DUMMY_T 500.0
-
-// Below this radius (in mm) the bed angle is not meaningfully defined.
-// Kept identical to kin_corertheta.c, whose dead zone handling this
-// mirrors so that the bed angle used here is the one the bed motor is
-// actually being driven to.
-#define BED_MIN_RADIUS 0.010
 
 struct bproject_stepper {
     struct stepper_kinematics sk;
@@ -58,33 +56,11 @@ struct bproject_stepper {
     double max_angle, taper_range;
 };
 
-// cos() of the bed angle at a sampled position.  Inside the dead zone the
-// angle comes from the direction of travel, exactly as the bed solver in
-// kin_corertheta.c resolves it, so the two never disagree.
-static double
-bproject_cos_bed_angle(struct move *m, struct coord *c)
-{
-    double r2 = c->x * c->x + c->y * c->y;
-    if (r2 >= BED_MIN_RADIUS * BED_MIN_RADIUS)
-        return c->x / sqrt(r2);
-    double rx = m->axes_r.x, ry = m->axes_r.y;
-    double rn2 = rx * rx + ry * ry;
-    if (rn2 <= 0.)
-        // Not moving in xy and sitting on the centre - the bed angle has
-        // no effect on anything, so leave B alone
-        return 1.;
-    double cos_t = rx / sqrt(rn2);
-    if (c->x * rx + c->y * ry < 0.)
-        // Heading inward - the zone was entered from the far side, which
-        // is the bed angle turned by pi
-        cos_t = -cos_t;
-    return cos_t;
-}
-
 // The projection itself.  Exposed so that the host code can apply the
-// same mapping to a single position without going through a stepper.
+// same mapping to a single position, standing still on the given branch
+// (see bed_centre.h), without going through a stepper.
 double __visible
-bproject_project_b(double b, double x, double y
+bproject_project_b(double b, double x, double y, int branch
                    , double max_angle, double taper_range)
 {
     double ab = fabs(b);
@@ -93,8 +69,9 @@ bproject_project_b(double b, double x, double y
         return b;
     struct move m;
     memset(&m, 0, sizeof(m));
+    m.branch = branch;
     struct coord c = { .x = x, .y = y };
-    double cos_t = bproject_cos_bed_angle(&m, &c);
+    double cos_t = bed_centre_cos(&m, &c);
     double w = 1.;
     if (ab > max_angle) {
         // Smoothstep the correction away over the taper band, so the
@@ -119,7 +96,7 @@ bproject_calc_position(struct stepper_kinematics *sk, struct move *m
     double ab = fabs(pos.b);
     double none_angle = bs->max_angle + bs->taper_range;
     if (bs->max_angle > 0. && ab < none_angle) {
-        double cos_t = bproject_cos_bed_angle(m, &pos);
+        double cos_t = bed_centre_cos(m, &pos);
         double w = 1.;
         if (ab > bs->max_angle) {
             double t = (ab - bs->max_angle) / bs->taper_range;
@@ -128,9 +105,12 @@ bproject_calc_position(struct stepper_kinematics *sk, struct move *m
         pos.b *= 1. + w * (cos_t - 1.);
     }
     bs->m.start_pos = pos;
-    // Carry the direction of travel through as well - the bed solver
-    // needs it to resolve the angle inside the dead zone
+    // Carry the direction of travel and the branch through as well - the
+    // wrapped solvers need them to resolve the bed angle and the arm
+    // radius at the centre
     bs->m.axes_r = m->axes_r;
+    bs->m.branch = m->branch;
+    bs->m.branch_flip = m->branch_flip;
     return bs->orig_sk->calc_position_cb(bs->orig_sk, &bs->m, DUMMY_T);
 }
 

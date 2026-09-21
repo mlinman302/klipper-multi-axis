@@ -1,0 +1,49 @@
+# Tests for the bed centre on an arm that reaches only 5 mm past it
+# (arm_crosses_centre, position_min: -5).  The branch changes only at the
+# centre, so a tool that has crossed has to come back through the centre
+# before it is further out than that.  The planner holds a move that
+# takes the tool onto the far side until it sees whether the next ones
+# bring it back, and otherwise turns the bed half a turn on the centre -
+# which it also does for every line straight across the bed.
+#
+# test/multi_axis/test_centre_path.py (TestShortReach) checks the plans
+# and test_kin_6axis.c runs one through the real step compressor.
+DICTIONARY atmega2560.dict
+CONFIG polar_singularity_reach.cfg
+
+G28 X
+G28 B
+G28 Z
+G90
+G1 X40 Y0 Z0.3 F6000
+
+# A line across the bed: too long for the far side, so the bed turns
+# half a turn on the centre - with the filament drawn back 0.8mm while it
+# does (retract_length)
+G1 X-40 Y0 E4 F1500
+
+# Across to 3mm past the centre and straight back: the far side carries
+# it both ways and the bed never turns
+G1 X40 Y0 F6000
+G1 X-3 Y0 E6 F1500
+G1 X40 Y0 E10 F1500
+
+# Across to 3mm past, then on along the far side out of reach: planned
+# again on the near side, with the half turn on the centre
+G1 X-3 Y0 E12 F1500
+G1 X-3 Y10 E13 F1500
+
+# The same as travel: back through the centre, off the path, no blob
+G1 X40 Y0 F6000
+G1 X-3 Y0 F6000
+G1 X-3 Y10 F6000
+
+# Onto the far side and then a wait: given up, the half turn made
+G1 X40 Y0 F6000
+G1 X-3 Y0 E15 F1500
+M400
+G1 X40 Y0 E19 F1500
+
+GET_POSITION
+G1 Z10 F600
+M84

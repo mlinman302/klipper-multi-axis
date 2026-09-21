@@ -30,6 +30,7 @@ import stepper as stepper_mod
 import toolhead as toolhead_mod
 from extras import gcode_move as gcode_move_mod
 from kinematics import rotary_axis as rotary_axis_mod
+from kinematics import bed_centre
 from extras import rtcp as rtcp_mod
 from extras import b_projection as bproject_mod
 
@@ -147,6 +148,7 @@ class FakeToolHead:
         self.print_time = 0.
         self.trapq_log = []   # (print_time, start_pos6, axes_r6) per move
         self.commanded_pos = [0.] * toolhead_mod.BASE_POS_LEN
+        self.branch = 1
         # extra_axes[i] <-> position index i+3, with fixed rotary slots
         self.extra_axes = [FakeExtruder()] + [
             rotary_axis_mod.DummyRotaryAxis(printer, letter)
@@ -172,8 +174,14 @@ class FakeToolHead:
                                   for e_index, n in enumerate(enames) if n}
     def get_position(self):
         return list(self.commanded_pos)
-    def set_position(self, newpos, homing_axes=""):
+    def get_branch(self):
+        return self.branch
+    def set_branch(self, branch):
+        self.branch = branch
+    def set_position(self, newpos, homing_axes="", branch=None):
         self.commanded_pos[:] = list(newpos)
+        if branch is not None:
+            self.branch = branch
     def get_extra_axes(self):
         return [None, None, None] + self.extra_axes
     def get_rotary_axes(self):
@@ -194,6 +202,7 @@ class FakeToolHead:
             if move.axes_d[e_index + 3]:
                 ea.check_move(move, e_index + 3)
         self.commanded_pos[:] = move.end_pos
+        self.branch = move.get_end_branch()
         self.lookahead.add_move(move)
     def flush(self):
         # Mirrors ToolHead._process_lookahead()
@@ -642,10 +651,14 @@ class _FakeMove:
         self.move_d = move_d
         self.max_cruise_v2 = 100.
         self.limited = None
+        self.branch = 1
+        self.branch_flip = False
     def move_error(self, msg="Move out of range"):
         return _CheckMoveError(msg)
     def limit_speed(self, v, a):
         self.limited = (v, a)
+    def get_end_branch(self):
+        return -self.branch if self.branch_flip else self.branch
 
 
 class TestCoreRThetaCheckMove(unittest.TestCase):
@@ -659,6 +672,8 @@ class TestCoreRThetaCheckMove(unittest.TestCase):
         kin.limit_xy2 = limit_xy2
         kin.limit_z = limit_z
         kin.v_rad_max = 0.
+        kin.arm_crosses_centre = False
+        kin.arm_r_min, kin.arm_r_max = 0., 200.
         kin.max_velocity = kin.max_accel = 300.
         kin.max_z_velocity = 5.
         kin.max_z_accel = 100.
@@ -870,12 +885,12 @@ class TestCoreRThetaCalcPosition(unittest.TestCase):
 # stands in for it here so the host-side logic built on top of it - the
 # inverse and the speed limiting - can be tested without a compiled
 # c_helper.so.
-def _project_b(b, x, y, max_angle, taper_range):
+def _project_b(b, x, y, branch, max_angle, taper_range):
     ab = abs(b)
     if max_angle <= 0. or ab >= max_angle + taper_range:
         return b
-    r2 = x * x + y * y
-    cos_t = x / math.sqrt(r2) if r2 >= 0.010**2 else 1.
+    # A position, not a move, so the static form of the bed angle
+    cos_t = bed_centre.cos_bed_angle(x, y, None, branch)
     w = 1.
     if ab > max_angle:
         t = (ab - max_angle) / taper_range
@@ -902,8 +917,8 @@ class FakeSK:
 
 class FakeFFILib:
     @staticmethod
-    def bproject_project_b(b, x, y, max_angle, taper_range):
-        return _project_b(b, x, y, max_angle, taper_range)
+    def bproject_project_b(b, x, y, branch, max_angle, taper_range):
+        return _project_b(b, x, y, branch, max_angle, taper_range)
     @staticmethod
     def rtcp_alloc():
         return FakeSK('rtcp')
@@ -1279,6 +1294,341 @@ class TestBProjection(unittest.TestCase):
         m = r.tool_to_machine(self._pos(0., 100., 10.))
         self.assertAlmostEqual(m[1], 100. - 40. * math.sin(math.radians(10.)),
                                places=9)
+
+
+######################################################################
+# Crossing the centre on the other branch
+######################################################################
+
+PARK = 1e-4
+
+
+class TestToolheadBranch(unittest.TestCase):
+    # The branch travels with each move, is committed once every check
+    # has passed, and reaches the motion queue only when it changes
+    def test_a_move_starts_on_the_toolhead_branch(self):
+        printer, gcode, gmove, th, resp = build_env()
+        th.branch = -1
+        move = toolhead_mod.Move(th, [0.] * 7, [10.] + [0.] * 6, 100.)
+        self.assertEqual((move.branch, move.branch_flip), (-1, False))
+        self.assertEqual(move.get_end_branch(), -1)
+        move.branch_flip = True
+        self.assertEqual(move.get_end_branch(), 1)
+
+    def test_a_refused_move_leaves_the_branch_alone(self):
+        printer, gcode, gmove, th, resp = build_env()
+        def flip_then_refuse(move):
+            move.branch_flip = True
+            raise move.move_error("refused")
+        th.kin.check_move = flip_then_refuse
+        self.assertRaises(gcode_mod.CommandError,
+                          gcode.run_script, "G1 X10 F600")
+        self.assertEqual(th.get_branch(), 1)
+
+    def test_the_queue_is_told_only_of_changes(self):
+        th = toolhead_mod.ToolHead.__new__(toolhead_mod.ToolHead)
+        calls = []
+        th.trapq = 'trapq'
+        th.trapq_branch = (0, False)
+        th.trapq_set_branch = lambda tq, b, f: calls.append((tq, b, f))
+        th._stamp_branch(1, False)
+        th._stamp_branch(1, False)
+        th._stamp_branch(1, True)
+        th._stamp_branch(-1, False)
+        self.assertEqual(calls, [('trapq', 1, 0), ('trapq', 1, 1),
+                                 ('trapq', -1, 0)])
+        # Declaring the branch at rest stamps it with no flip
+        th.set_branch(1)
+        self.assertEqual(th.get_branch(), 1)
+        self.assertEqual(calls[-1], ('trapq', 1, 0))
+
+
+class _RangeRail:
+    def __init__(self, lo, hi):
+        self.range = (lo, hi)
+    def get_range(self):
+        return self.range
+
+
+class _BranchRecorder:
+    def __init__(self):
+        self.branches = []
+    def set_branch(self, branch):
+        self.branches.append(branch)
+
+
+class TestCoreRThetaCrossing(unittest.TestCase):
+    def _kin(self, crosses=True, v_rad_max=5., reach=200.):
+        from kinematics import corertheta
+        kin = object.__new__(corertheta.CoreRThetaKinematics)
+        kin.limit_xy2 = 200. ** 2
+        kin.limit_z = (0., 250.)
+        kin.v_rad_max = v_rad_max
+        kin.arm_crosses_centre = crosses
+        kin.arm_r_min = -reach if crosses else 0.
+        kin.arm_r_max = 200.
+        kin.max_velocity = kin.max_accel = 300.
+        kin.max_z_velocity = 5.
+        kin.max_z_accel = 100.
+        return kin
+
+    def _move(self, start, end, branch=1):
+        m = _FakeMove([end[0] - start[0], end[1] - start[1], 0.],
+                      list(end) + [0.])
+        m.start_pos = list(start) + [0.]
+        m.max_cruise_v2 = 100. ** 2
+        m.branch = branch
+        return m
+
+    def test_leaving_the_centre_for_the_far_side_flips(self):
+        # Off the line by rounding alone, as a planned move is
+        m = self._move((PARK, 1e-12), (-40., 0.))
+        self._kin().check_move(m)
+        self.assertTrue(m.branch_flip)
+        # The flip holds the bed still, so its angular limit - which would
+        # have this crawl, its offset being all rounding - does not apply
+        self.assertIsNone(m.limited)
+
+    def test_and_back_from_the_far_side(self):
+        m = self._move((-PARK, 0.), (40., 0.), branch=-1)
+        self._kin().check_move(m)
+        self.assertTrue(m.branch_flip)
+
+    def test_leaving_on_the_near_side_does_not(self):
+        for start, end, branch in (((PARK, 0.), (40., 0.), 1),
+                                   ((-PARK, 0.), (-40., 0.), -1),
+                                   ((40., 0.), (-40., 0.), 1)):
+            m = self._move(start, end, branch)
+            self._kin().check_move(m)
+            self.assertFalse(m.branch_flip, msg=(start, end, branch))
+
+    def test_only_an_arm_that_can(self):
+        m = self._move((PARK, 1e-12), (-40., 0.))
+        self._kin(crosses=False).check_move(m)
+        self.assertFalse(m.branch_flip)
+        # ...and without the flip the move is limited as before
+        self.assertIsNotNone(m.limited)
+
+    def test_capability(self):
+        self.assertTrue(self._kin().can_cross_centre())
+        self.assertFalse(self._kin(crosses=False).can_cross_centre())
+        self.assertIsNone(self._kin().get_centre_reach())
+        self.assertEqual(self._kin(reach=5.).get_centre_reach(), 5.)
+        self.assertEqual(self._kin(reach=5.).get_arm_range(), (-5., 200.))
+
+    def test_the_far_side_only_as_far_as_the_arm_reaches(self):
+        kin = self._kin(reach=5.)
+        # Through the centre to 4mm out on the far side: fine
+        m = self._move((PARK, 1e-12), (-4., 0.))
+        kin.check_move(m)
+        self.assertTrue(m.branch_flip)
+        # ...to 6mm, beyond position_min: refused
+        m = self._move((PARK, 1e-12), (-6., 0.))
+        self.assertRaises(_CheckMoveError, kin.check_move, m)
+        # And on the far side already, out of reach
+        m = self._move((-4., 0.), (-4., 5.), branch=-1)
+        self.assertRaises(_CheckMoveError, kin.check_move, m)
+        # The near side is not limited by it
+        m = self._move((40., 0.), (40., 30.))
+        kin.check_move(m)
+
+    def test_homing_r_puts_the_arm_on_the_usual_branch(self):
+        kin = self._kin()
+        kin.toolhead = _BranchRecorder()
+        kin.steppers = []
+        kin.rail_r = _RangeRail(-200., 200.)
+        kin.rail_z = _RangeRail(0., 250.)
+        kin.set_position([0.] * 7, "z")
+        self.assertEqual(kin.toolhead.branches, [])
+        kin.set_position([0.] * 7, "xy")
+        self.assertEqual(kin.toolhead.branches, [1])
+
+
+class _CrossingKinematics(FakeKinematics):
+    def can_cross_centre(self):
+        return True
+
+
+class TestRTCPBranches(unittest.TestCase):
+    def _pos(self, x=0., y=0., z=0., b=0.):
+        return [x, y, z, 0., 0., b, 0.]
+
+    def _build(self, crosses=False, tool_v=40.):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        if crosses:
+            th.kin = _CrossingKinematics()
+        th.kin.status = {'axis_minimum': [-200., -200., -200.],
+                         'axis_maximum': [200., 200., 200.]}
+        r = make_rtcp(printer, th, tool_v=tool_v,
+                      frame=rtcp_mod.FRAME_RADIAL)
+        th.register_move_check(r._check_move)
+        return printer, gcode, th, r
+
+    def test_outboard_is_plus_r_on_either_branch(self):
+        printer, gcode, th, r = self._build()
+        dh = -40. * math.sin(math.radians(10.))
+        # The usual branch: outboard is away from the centre
+        m, mb = r.tool_to_machine_branch(self._pos(50., 0., 0., 10.), 1)
+        self.assertAlmostEqual(m[0], 50. + dh)
+        self.assertEqual(mb, 1)
+        # The negative branch at the same point: the bed faces the other
+        # way, so outboard is towards the centre
+        m, mb = r.tool_to_machine_branch(self._pos(-50., 0., 0., 10.), -1)
+        self.assertAlmostEqual(m[0], -50. + dh)
+        self.assertEqual(mb, -1)
+
+    def test_a_large_correction_carries_the_carriage_through(self):
+        printer, gcode, th, r = self._build()
+        dh = -40. * math.sin(math.radians(10.))
+        m, mb = r.tool_to_machine_branch(self._pos(5., 0., 0., 10.), 1)
+        self.assertAlmostEqual(m[0], 5. + dh)
+        self.assertEqual(mb, -1)
+        back, tb = r.machine_to_tool_branch(m, mb)
+        self.assertAlmostEqual(back[0], 5.)
+        self.assertEqual(tb, 1)
+
+    def test_through_the_centre_only_on_an_arm_that_can(self):
+        # At B90 the carriage sits 40mm inboard of the tip, which from a
+        # radius of 10 is 30mm through the centre
+        printer, gcode, th, r = self._build()
+        self.assertRaises(gcode_mod.CommandError,
+                          gcode.run_script, "G1 X10 Y0 B90 F600")
+        printer, gcode, th, r = self._build(crosses=True)
+        gcode.run_script("G1 X10 Y0 B90 F600")
+        self.assertAlmostEqual(th.commanded_pos[5], 90.)
+
+    def test_the_far_side_ends_where_the_near_one_does(self):
+        # Standing on the far side, at an arm radius of -190.  At B-90 the
+        # carriage comes 40mm in towards the centre, to -150; at B90 it
+        # goes 40mm out, to -230, past the end of the rail
+        printer, gcode, th, r = self._build(crosses=True)
+        th.commanded_pos[0] = -190.
+        th.branch = -1
+        printer.lookup_object('gcode_move').reset_last_position()
+        gcode.run_script("G1 B-90 F600")
+        gcode.run_script("G1 B0 F600")
+        self.assertRaises(gcode_mod.CommandError,
+                          gcode.run_script, "G1 B90 F600")
+        # The same tilt on the near side stays inside it
+        printer, gcode, th, r = self._build(crosses=True)
+        th.commanded_pos[0] = 190.
+        printer.lookup_object('gcode_move').reset_last_position()
+        gcode.run_script("G1 B90 F600")
+
+    def test_the_arm_radius_itself_is_the_limit(self):
+        # The square x/y bounds reach 200 * sqrt(2) on the diagonal; the
+        # arm does not
+        printer, gcode, th, r = self._build(tool_v=40.)
+        self.assertRaises(gcode_mod.CommandError,
+                          gcode.run_script, "G1 X130 Y130 B-90 F600")
+
+    def test_change_offsets_holds_the_carriage_still(self):
+        printer, gcode, th, r = self._build()
+        for pos, branch in ((self._pos(50., 20., 5., 12.), 1),
+                            (self._pos(-30., 40., 5., -20.), -1)):
+            machine = r.tool_to_machine(pos, branch)
+            new, new_branch = r.change_offsets(pos, branch, (0., 40.),
+                                               (3., 30.))
+            r.tool_h, r.tool_v = 3., 30.
+            again, again_branch = r.tool_to_machine_branch(new, new_branch)
+            r.tool_h, r.tool_v = 0., 40.
+            for i in range(3):
+                self.assertAlmostEqual(again[i], machine[i], places=9)
+
+    def test_change_offsets_through_the_centre(self):
+        # RTCP off at B10 from a tip radius of 5: the carriage is at
+        # -1.95, on the far side, and that is now where the tool is
+        printer, gcode, th, r = self._build()
+        new, branch = r.change_offsets(self._pos(5., 0., 0., 10.), 1,
+                                       (0., 40.), (0., 0.))
+        self.assertAlmostEqual(new[0], 5. - 40. * math.sin(math.radians(10.)))
+        self.assertEqual(branch, -1)
+
+    def test_change_offsets_refuses_to_lose_the_bed_angle(self):
+        # A carriage exactly on the centre under a bed facing +y: with
+        # RTCP off the tool would stand on (0, 0), which names +x
+        printer, gcode, th, r = self._build()
+        dh = -40. * math.sin(math.radians(10.))
+        self.assertRaises(gcode_mod.CommandError, r.change_offsets,
+                          self._pos(0., -dh, 0., 10.), 1,
+                          (0., 40.), (0., 0.))
+        # Facing +x it can: (0, 0) names that
+        new, branch = r.change_offsets(self._pos(-dh, 0., 0., 10.), 1,
+                                       (0., 40.), (0., 0.))
+        self.assertEqual(branch, 1)
+
+    def test_set_rtcp_hands_the_new_branch_to_the_toolhead(self):
+        printer, gcode, th, r = self._build()
+        r._update_kinematics = lambda: None
+        gcode.register_command('SET_RTCP', r.cmd_SET_RTCP)
+        th.commanded_pos[:] = self._pos(5., 0., 0., 10.)
+        gcode.run_script("SET_RTCP ENABLE=0")
+        self.assertFalse(r.enabled)
+        self.assertEqual(th.get_branch(), -1)
+        self.assertAlmostEqual(th.commanded_pos[0],
+                               5. - 40. * math.sin(math.radians(10.)))
+        gcode.run_script("SET_RTCP ENABLE=1")
+        self.assertEqual(th.get_branch(), 1)
+        self.assertAlmostEqual(th.commanded_pos[0], 5.)
+
+    def test_a_crossing_move_is_checked_along_the_held_bed(self):
+        # Straight through the centre on the flip, at B10: the carriage
+        # runs along the line the bed faces the whole way
+        printer, gcode, th, r = self._build(crosses=True)
+        move = toolhead_mod.Move(th, self._pos(PARK, 0., 0., 10.),
+                                 self._pos(-40., 0., 0., 10.), 100.)
+        move.branch_flip = True
+        r._check_move(move)
+
+
+class TestBProjectionBranches(unittest.TestCase):
+    def test_the_negative_branch_faces_the_other_way(self):
+        real = bproject_mod.chelper
+        bproject_mod.chelper = FakeChelper
+        try:
+            printer, gcode, gmove, th, resp = build_env(('b',))
+            bp = make_bprojection(printer, th)
+            pos = [-40., 0., 0., 0., 0., 10., 0.]
+            # At (-40, 0) the usual branch faces pi, the negative one zero
+            self.assertAlmostEqual(bp.project_pos(pos, 1), -10.)
+            self.assertAlmostEqual(bp.project_pos(pos, -1), 10.)
+            self.assertAlmostEqual(
+                bp.machine_to_commanded(bp.commanded_to_machine(pos, -1),
+                                        None, -1)[5], 10.)
+        finally:
+            bproject_mod.chelper = real
+
+
+class TestRTCPLeavesTheBedUnwrapped(unittest.TestCase):
+    def setUp(self):
+        self._real = rtcp_mod.chelper
+        rtcp_mod.chelper = FakeChelper
+
+    def tearDown(self):
+        rtcp_mod.chelper = self._real
+
+    def _wrap(self, frame):
+        printer, gcode, gmove, th, resp = build_env(('b',))
+        printer.add_object('motion_queuing', FakeMotionQueuing())
+        bed = FakeWrappedStepper('stepper_c')
+        gantry = FakeWrappedStepper('stepper_r')
+        kin = FakeWrappedKin([bed, gantry])
+        kin.get_bed_angle_steppers = lambda: [bed]
+        r = make_rtcp(printer, FakeWrappingToolhead(kin), tool_v=40.,
+                      frame=frame)
+        r._update_kinematics()
+        return bed, gantry
+
+    def test_radial(self):
+        bed, gantry = self._wrap(rtcp_mod.FRAME_RADIAL)
+        self.assertEqual(bed.get_stepper_kinematics().chain(), [None])
+        self.assertEqual(gantry.get_stepper_kinematics().chain(),
+                         ['rtcp', None])
+
+    def test_cartesian_wraps_everything(self):
+        bed, gantry = self._wrap(rtcp_mod.FRAME_CARTESIAN)
+        self.assertEqual(bed.get_stepper_kinematics().chain(),
+                         ['rtcp', None])
 
 
 if __name__ == '__main__':

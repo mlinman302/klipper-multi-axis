@@ -43,6 +43,20 @@ move_get_coord(struct move *m, double move_time)
         .c = m->start_pos.c + m->axes_r.c * move_dist };
 }
 
+// The branch a move is solved on at position 'c' along it: -1 or 1.  A
+// move marked with branch_flip changes over to the other branch where it
+// passes the centre - from the point where it stops heading towards the
+// x/y origin onwards.  See bed_centre.h for what the branches are.
+int
+move_get_branch(struct move *m, struct coord *c)
+{
+    int negative = m->branch < 0;
+    if (m->branch_flip
+        && c->x * m->axes_r.x + c->y * m->axes_r.y >= 0.)
+        negative = !negative;
+    return negative ? -1 : 1;
+}
+
 #define NEVER_TIME 9999999999999999.9
 
 // Allocate a new 'trapq' object
@@ -95,6 +109,10 @@ trapq_check_sentinels(struct trapq *tq)
     }
     tail_sentinel->print_time = m->print_time + m->move_t;
     tail_sentinel->start_pos = move_get_coord(m, m->move_t);
+    // The sentinel holds the tool where the last move left it, so it is
+    // on the branch that move ended on
+    tail_sentinel->branch = move_get_branch(m, &tail_sentinel->start_pos);
+    tail_sentinel->branch_flip = 0;
 }
 
 #define MAX_NULL_MOVE 1.0
@@ -109,6 +127,8 @@ trapq_add_move(struct trapq *tq, struct move *m)
         // Add a null move to fill time gap
         struct move *null_move = move_alloc();
         null_move->start_pos = m->start_pos;
+        // Standing still where the next move starts, on its branch
+        null_move->branch = m->branch;
         if (prev->print_time <= 0. && m->print_time > MAX_NULL_MOVE)
             // Limit the first null move to improve numerical stability
             null_move->print_time = m->print_time - MAX_NULL_MOVE;
@@ -119,6 +139,17 @@ trapq_add_move(struct trapq *tq, struct move *m)
     }
     list_add_before(&m->node, &tail_sentinel->node);
     tail_sentinel->print_time = 0.;
+}
+
+// Set the branch trapq_append() stamps onto the moves it adds.  Zero and
+// one both mean the usual branch, and only a kinematics with a redundant
+// representation ever makes it negative or sets the flip; the toolhead
+// sets it before each move that differs from the last.
+void __visible
+trapq_set_branch(struct trapq *tq, int branch, int branch_flip)
+{
+    tq->branch = branch;
+    tq->branch_flip = branch_flip;
 }
 
 // Fill and add a move to the trapezoid velocity queue
@@ -144,6 +175,8 @@ trapq_append(struct trapq *tq, double print_time
         m->half_accel = .5 * accel;
         m->start_pos = start_pos;
         m->axes_r = axes_r;
+        m->branch = tq->branch;
+        m->branch_flip = tq->branch_flip;
         trapq_add_move(tq, m);
 
         print_time += accel_t;
@@ -157,6 +190,8 @@ trapq_append(struct trapq *tq, double print_time
         m->half_accel = 0.;
         m->start_pos = start_pos;
         m->axes_r = axes_r;
+        m->branch = tq->branch;
+        m->branch_flip = tq->branch_flip;
         trapq_add_move(tq, m);
 
         print_time += cruise_t;
@@ -170,6 +205,8 @@ trapq_append(struct trapq *tq, double print_time
         m->half_accel = -.5 * accel;
         m->start_pos = start_pos;
         m->axes_r = axes_r;
+        m->branch = tq->branch;
+        m->branch_flip = tq->branch_flip;
         trapq_add_move(tq, m);
     }
 }

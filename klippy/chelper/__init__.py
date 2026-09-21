@@ -28,7 +28,8 @@ SOURCE_FILES = [
 DEST_LIB = "c_helper.so"
 OTHER_FILES = [
     'list.h', 'serialqueue.h', 'stepcompress.h', 'steppersync.h',
-    'itersolve.h', 'pyhelper.h', 'trapq.h', 'pollreactor.h', 'msgblock.h'
+    'itersolve.h', 'pyhelper.h', 'trapq.h', 'pollreactor.h', 'msgblock.h',
+    'bed_centre.h'
 ]
 
 defs_stepcompress = """
@@ -108,6 +109,7 @@ defs_trapq = """
         , double axes_r_x, double axes_r_y, double axes_r_z
         , double axes_r_a, double axes_r_b, double axes_r_c
         , double start_v, double cruise_v, double accel);
+    void trapq_set_branch(struct trapq *tq, int branch, int branch_flip);
     void trapq_finalize_moves(struct trapq *tq, double print_time
         , double clear_history_time);
     void trapq_set_position(struct trapq *tq, double print_time
@@ -192,7 +194,7 @@ defs_kin_bproject = """
         , struct stepper_kinematics *orig_sk);
     void bproject_set_params(struct stepper_kinematics *sk
         , double max_angle, double taper_range);
-    double bproject_project_b(double b, double x, double y
+    double bproject_project_b(double b, double x, double y, int branch
         , double max_angle, double taper_range);
 """
 

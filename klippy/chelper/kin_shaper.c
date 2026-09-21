@@ -129,6 +129,17 @@ struct input_shaper {
     struct shaper_pulses sp[3];
 };
 
+// The shaped position is handed on in a move of its own, standing in for
+// 'm'.  A solver that resolves the bed centre from the direction of
+// travel and the branch (see bed_centre.h) needs those from 'm' too.
+static inline void
+shaper_carry_move(struct input_shaper *is, struct move *m)
+{
+    is->m.axes_r = m->axes_r;
+    is->m.branch = m->branch;
+    is->m.branch_flip = m->branch_flip;
+}
+
 // Optimized calc_position when only x axis is needed
 static double
 shaper_x_calc_position(struct stepper_kinematics *sk, struct move *m
@@ -139,6 +150,7 @@ shaper_x_calc_position(struct stepper_kinematics *sk, struct move *m
     if (!sx->num_pulses)
         return is->orig_sk->calc_position_cb(is->orig_sk, m, move_time);
     is->m.start_pos.x = calc_position(m, 'x', move_time, sx);
+    shaper_carry_move(is, m);
     return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
 }
 
@@ -152,6 +164,7 @@ shaper_y_calc_position(struct stepper_kinematics *sk, struct move *m
     if (!sy->num_pulses)
         return is->orig_sk->calc_position_cb(is->orig_sk, m, move_time);
     is->m.start_pos.y = calc_position(m, 'y', move_time, sy);
+    shaper_carry_move(is, m);
     return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
 }
 
@@ -165,6 +178,7 @@ shaper_z_calc_position(struct stepper_kinematics *sk, struct move *m
     if (!sz->num_pulses)
         return is->orig_sk->calc_position_cb(is->orig_sk, m, move_time);
     is->m.start_pos.z = calc_position(m, 'z', move_time, sz);
+    shaper_carry_move(is, m);
     return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
 }
 
@@ -183,6 +197,7 @@ shaper_xyz_calc_position(struct stepper_kinematics *sk, struct move *m
         is->m.start_pos.y = calc_position(m, 'y', move_time, &is->sp[1]);
     if (is->sp[2].num_pulses)
         is->m.start_pos.z = calc_position(m, 'z', move_time, &is->sp[2]);
+    shaper_carry_move(is, m);
     return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
 }
 

@@ -66,6 +66,17 @@ class Move:
         # Setup for minimum_cruise_ratio checks
         self.max_mcr_start_v2 = 0.
         self.mcr_delta_v2 = 2.0 * move_d * toolhead.mcr_pseudo_accel
+        # Which of the two solutions of a kinematics with a redundant
+        # representation the move is on, and whether it changes over to
+        # the other where it passes the centre - see
+        # klippy/kinematics/bed_centre.py.  Only such a kinematics
+        # (corertheta) ever sets branch_flip, in its check_move().
+        self.branch = toolhead.branch
+        self.branch_flip = False
+    def get_end_branch(self):
+        if self.branch_flip:
+            return -self.branch
+        return self.branch
     def limit_speed(self, speed, accel):
         speed2 = speed**2
         if speed2 < self.max_cruise_v2:
@@ -223,6 +234,13 @@ class ToolHead:
         self.lookahead.set_flush_time(BUFFER_TIME_HIGH)
         # [x, y, z, e, a, b, c] - see ROTARY_POS above
         self.commanded_pos = [0.] * BASE_POS_LEN
+        # The branch the toolhead is on at commanded_pos (see Move), and
+        # the one last stamped onto the motion queue
+        self.branch = 1
+        self.trapq_branch = (0, False)
+        # Move transforms holding a move back to plan it with the next one
+        # (see register_held_moves())
+        self.held_move_releases = []
         # Velocity and acceleration control
         self.max_velocity = config.getfloat('max_velocity', above=0.)
         self.max_accel = config.getfloat('max_accel', above=0.)
@@ -253,6 +271,8 @@ class ToolHead:
                                                     can_add_trapq=True)
         self.trapq = self.motion_queuing.allocate_trapq()
         self.trapq_append = self.motion_queuing.lookup_trapq_append()
+        ffi_main, ffi_lib = chelper.get_ffi()
+        self.trapq_set_branch = ffi_lib.trapq_set_branch
         # Create kinematics class
         gcode = self.printer.lookup_object('gcode')
         self.Coord = gcode.Coord
@@ -308,6 +328,7 @@ class ToolHead:
         with self.reactor.assert_no_pause():
             for move in moves:
                 if move.needs_trapq:
+                    self._stamp_branch(move.branch, move.branch_flip)
                     sp, ar = move.start_pos, move.axes_r
                     self.trapq_append(
                         self.trapq, next_move_time,
@@ -325,6 +346,12 @@ class ToolHead:
         # Generate steps for moves
         self._advance_move_time(next_move_time)
         self.motion_queuing.note_mcu_movequeue_activity(next_move_time)
+    def _stamp_branch(self, branch, branch_flip):
+        # Moves take their branch from the motion queue as they are added
+        # to it; only tell it when that changes
+        if (branch, branch_flip) != self.trapq_branch:
+            self.trapq_branch = (branch, branch_flip)
+            self.trapq_set_branch(self.trapq, branch, int(branch_flip))
     def _flush_lookahead(self, is_runout=False):
         # Transit from "NeedPrime"/"Priming"/main state to "NeedPrime"
         prev_print_time = self.print_time
@@ -343,9 +370,11 @@ class ToolHead:
         if step_gen_time >= self.print_time - kin_flush_delay - 0.001:
             self._flush_lookahead(is_runout=True)
     def flush_step_generation(self):
+        self.release_held_moves()
         self._flush_lookahead()
         self.motion_queuing.flush_all_steps()
     def get_last_move_time(self):
+        self.release_held_moves()
         if self.special_queuing_state:
             self._flush_lookahead()
             self._calc_print_time()
@@ -408,8 +437,21 @@ class ToolHead:
     # Movement commands
     def get_position(self):
         return list(self.commanded_pos)
-    def set_position(self, newpos, homing_axes=""):
+    def get_branch(self):
+        return self.branch
+    def set_branch(self, branch):
+        # Declare which branch the toolhead is standing on, for a
+        # kinematics that is about to set its position.  The steppers
+        # solve a position on the motion queue's current branch.
+        self.branch = branch
+        self._stamp_branch(branch, False)
+    def set_position(self, newpos, homing_axes="", branch=None):
+        # 'branch' is for a caller that knows the new position lies on
+        # the other branch; otherwise it stays on the current one, unless
+        # the kinematics decides otherwise in its set_position()
+        self.release_held_moves()
         self.flush_step_generation()
+        self.set_branch(self.branch if branch is None else branch)
         ffi_main, ffi_lib = chelper.get_ffi()
         kc = stepper.kin_coords(newpos)
         ffi_lib.trapq_set_position(self.trapq, self.print_time,
@@ -425,6 +467,7 @@ class ToolHead:
         if last_move is not None:
             last_move.limit_next_junction_speed(speed)
     def move(self, newpos, speed):
+        self.release_held_moves()
         move = Move(self, self.commanded_pos, newpos, speed)
         if not move.move_d:
             return
@@ -439,12 +482,14 @@ class ToolHead:
             if move.axes_d[e_index + 3]:
                 ea.check_move(move, e_index + 3)
         self.commanded_pos[:] = move.end_pos
+        self.branch = move.get_end_branch()
         want_flush = self.lookahead.add_move(move)
         if want_flush:
             self._process_lookahead(lazy=True)
         if self.print_time > self.need_check_pause:
             self._check_pause()
     def manual_move(self, coord, speed):
+        self.release_held_moves()
         curpos = list(self.commanded_pos)
         for i in range(len(coord)):
             if coord[i] is not None:
@@ -452,11 +497,13 @@ class ToolHead:
         self.move(curpos, speed)
         self.printer.send_event("toolhead:manual_move")
     def dwell(self, delay):
+        self.release_held_moves()
         self._flush_lookahead()
         next_print_time = self.get_last_move_time() + max(0., delay)
         self._advance_move_time(next_print_time)
         self._check_pause()
     def wait_moves(self):
+        self.release_held_moves()
         self._flush_lookahead()
         eventtime = self.reactor.monotonic()
         while (not self.special_queuing_state
@@ -513,11 +560,13 @@ class ToolHead:
         # Queue move into trapezoid motion queue (trapq)
         if submit_move.move_d:
             self.commanded_pos[:] = submit_move.end_pos
+            self.branch = submit_move.get_end_branch()
             self.lookahead.add_move(submit_move)
         moves = self.lookahead.flush()
         self._calc_print_time()
         start_time = end_time = self.print_time
         for move in moves:
+            self._stamp_branch(move.branch, move.branch_flip)
             sp, ar = move.start_pos, move.axes_r
             self.trapq_append(
                 self.trapq, end_time,
@@ -536,6 +585,7 @@ class ToolHead:
         # like x/y/z), so they must be carried over from newpos;
         # dropping them made a rotation-only homing move zero length,
         # which generated no steps at all.
+        self.release_held_moves()
         dripmove = list(self.commanded_pos)
         for i in stepper.KIN_AXIS_INDEXES:
             if i < len(newpos):
@@ -589,9 +639,22 @@ class ToolHead:
         # kinematics' own check_move().  Should raise command_error to
         # reject the move.
         self.move_checks.append(callback)
+    def register_held_moves(self, release):
+        # For a move transform that holds part of a move back, to plan it
+        # together with the move that follows ([polar_singularity] does
+        # this at the bed centre).  'release' sends whatever is held on to
+        # the toolhead, and is called before anything that must see every
+        # move made so far: another move, a dwell, a wait, a timed
+        # callback, setting a position.  It must do nothing when nothing
+        # is held, and must not hold anything back while it runs.
+        self.held_move_releases.append(release)
+    def release_held_moves(self):
+        for release in self.held_move_releases:
+            release()
     def get_trapq(self):
         return self.trapq
     def register_lookahead_callback(self, callback):
+        self.release_held_moves()
         last_move = self.lookahead.get_last()
         if last_move is None:
             callback(self.get_last_move_time())

@@ -49,8 +49,8 @@
 # is what makes every consumer see one consistent B - the angle the head
 # is really turned to - and lets the projection be re-evaluated at every
 # sample time, since the bed angle changes continuously *within* a move.
-import math
 import chelper, stepper
+from kinematics import bed_centre
 
 # Index of the B coordinate within a toolhead position vector
 B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
@@ -62,9 +62,6 @@ B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
 NO_BAND_ANGLE = 1e30
 NO_BAND_TAPER = 1.
 
-# Below this radius (in mm) the bed angle is not meaningfully defined.
-# Kept identical to kin_bproject.c and kin_corertheta.c.
-BED_MIN_RADIUS = 0.010
 # Below this |cos(theta)| the projection has no inverse: every commanded B
 # maps onto a machine B of nearly zero.
 COS_EPSILON = 1e-6
@@ -193,37 +190,35 @@ class BAxisProjection:
     ######################################################################
     # Coordinate transforms
     ######################################################################
-    def cos_bed_angle(self, x, y):
-        # cos(theta) at a position, matching bproject_cos_bed_angle() in
-        # kin_bproject.c for a position that is not moving.  Inside the
-        # dead zone at the centre the C resolves the angle from the
-        # direction of travel; a static position has none, and there the
-        # bed angle has no effect on anything, so leave B alone.
-        r2 = x * x + y * y
-        if r2 < BED_MIN_RADIUS * BED_MIN_RADIUS:
-            return 1.
-        return x / math.sqrt(r2)
+    def cos_bed_angle(self, x, y, branch=1):
+        # cos(theta) at a position that is not moving, on the given branch
+        # - the angle the bed solver drives the bed to there, so that the
+        # projection agrees with the bed about which way it is facing.
+        # See bed_centre.py.
+        return bed_centre.cos_bed_angle(x, y, None, branch)
 
-    def project(self, b, x, y):
-        # Machine B for a commanded B at bed position x/y.  The C helper
-        # is the one the steppers run, so calling it keeps the host side
-        # and the step generation in exact agreement.
+    def project(self, b, x, y, branch=1):
+        # Machine B for a commanded B at bed position x/y, standing still
+        # on the given branch.  The C helper is the one the steppers run,
+        # so calling it keeps the host side and the step generation in
+        # exact agreement.
         if not self.enabled:
             return b
         ffi_main, ffi_lib = chelper.get_ffi()
         max_angle, taper_range = self.get_params()
-        return ffi_lib.bproject_project_b(b, x, y, max_angle, taper_range)
+        return ffi_lib.bproject_project_b(b, x, y, branch,
+                                          max_angle, taper_range)
 
-    def project_pos(self, pos):
+    def project_pos(self, pos, branch=1):
         # Machine B for a toolhead position vector
-        return self.project(pos[B_POS_INDEX], pos[0], pos[1])
+        return self.project(pos[B_POS_INDEX], pos[0], pos[1], branch)
 
-    def commanded_to_machine(self, pos):
+    def commanded_to_machine(self, pos, branch=1):
         res = list(pos)
-        res[B_POS_INDEX] = self.project_pos(pos)
+        res[B_POS_INDEX] = self.project_pos(pos, branch)
         return res
 
-    def machine_to_commanded(self, pos, fallback_pos=None):
+    def machine_to_commanded(self, pos, fallback_pos=None, branch=1):
         # Inverse of the above - used when reading a position back out of
         # the steppers (after homing) so B is reported in the frame g-code
         # uses.  The projection is a plain scaling by cos(theta), so the
@@ -235,7 +230,7 @@ class BAxisProjection:
         res = list(pos)
         if not self.enabled:
             return res
-        cos_t = self.cos_bed_angle(pos[0], pos[1])
+        cos_t = self.cos_bed_angle(pos[0], pos[1], branch)
         if abs(cos_t) < COS_EPSILON:
             if fallback_pos is not None:
                 res[B_POS_INDEX] = fallback_pos[B_POS_INDEX]
@@ -255,12 +250,10 @@ class BAxisProjection:
         # which for a path that is not radial is an interior point.  The
         # two ends can therefore say nothing at all is happening.
         sp, ep = move.start_pos, move.end_pos
-        if (sp[1] < 0.) == (ep[1] < 0.):
+        t = bed_centre.axis_crossing_fraction(sp, ep, 1)
+        if t is None:
             return None
-        t = sp[1] / (sp[1] - ep[1])
-        if not 0. < t < 1.:
-            return None
-        return [s + t * (e - s) for s, e in zip(sp, ep)]
+        return bed_centre.interpolate(sp, ep, t)
 
     def _check_move(self, move):
         # The commanded B and the machine B do not move at the same rate:
@@ -269,14 +262,19 @@ class BAxisProjection:
         # a move down so the gantry can follow.
         if not self.enabled or not move.move_d:
             return
-        b_vals = [self.project_pos(move.start_pos),
-                  self.project_pos(move.end_pos)]
+        b_vals = [self.project_pos(move.start_pos, move.branch),
+                  self.project_pos(move.end_pos, move.get_end_branch())]
         crossing = self.x_axis_crossing(move)
         if crossing is not None:
             # Held at B10, a chord from (10, -30) to (10, 30) reads as ten
             # times cos(72 degrees) at both ends - no machine B travel at
             # all - while really running out to the full 10 in the middle
-            b_vals.append(self.project_pos(crossing))
+            sp, ep = move.start_pos, move.end_pos
+            travel = (ep[0] - sp[0], ep[1] - sp[1])
+            branch = bed_centre.sample_branch(crossing[0], crossing[1],
+                                              travel, move.branch,
+                                              move.branch_flip)
+            b_vals.append(self.project_pos(crossing, branch))
         axis_d = max(b_vals) - min(b_vals)
         if not axis_d:
             return
@@ -324,10 +322,12 @@ class BAxisProjection:
         # frames coincide and this is a no-op, which is why the example
         # macros toggle there.
         pos = self.toolhead.get_position()
-        machine_pos = self.commanded_to_machine(pos)
+        branch = self.toolhead.get_branch()
+        machine_pos = self.commanded_to_machine(pos, branch)
         self.enabled = enabled
         self._update_kinematics()
-        self.toolhead.set_position(self.machine_to_commanded(machine_pos, pos))
+        self.toolhead.set_position(
+            self.machine_to_commanded(machine_pos, pos, branch))
 
     cmd_SET_B_PROJECTION_help = \
         "Turn the bed-frame B projection off for homing or probing" \

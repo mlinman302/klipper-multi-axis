@@ -271,6 +271,10 @@ itersolve_calc_position_from_coord(struct stepper_kinematics *sk
     m.start_pos.a = a;
     m.start_pos.b = b;
     m.start_pos.c = c;
+    // A position is solved on the branch the stepper's queue is on - the
+    // one the kinematics set before setting the position
+    if (sk->tq)
+        m.branch = sk->tq->branch;
     m.move_t = 1000.;
     return sk->calc_position_cb(sk, &m, 500.);
 }

@@ -42,7 +42,8 @@
 # get_axis_rail() below.
 import logging, math
 import stepper
-from .polar import distance_to_center
+from .bed_centre import flips_through_centre
+from .polar import limit_centre_speed
 from .rotary_axis import parse_additional_axes
 
 
@@ -124,6 +125,35 @@ class CoreRThetaKinematics:
             'max_z_accel', self.max_accel, above=0., maxval=self.max_accel)
         self.v_rad_max = config.getfloat(
             'max_angular_velocity', above=0., default=0)
+        # Whether the arm carriage can travel straight through the centre
+        # of the bed and on to the far side.  Every x/y position then has
+        # a second solution, with the arm at a negative radius and the bed
+        # turned the other half turn (see bed_centre.py), and a move that
+        # carries straight on through the centre can take it with the bed
+        # held still.  How far past the centre the arm reaches is
+        # position_min of [stepper_r]: it may be the whole bed, or - as on
+        # the machine this was written for - only a few millimetres, in
+        # which case a tool that crossed over has to come back through the
+        # centre before it goes further out than that.  centre_path.py
+        # plans for that; the check below refuses anything that does not.
+        self.arm_crosses_centre = config.getboolean('arm_crosses_centre',
+                                                    False)
+        r_min, r_max = rail_r.get_range()
+        if self.arm_crosses_centre and r_min >= 0.:
+            raise config.error(
+                "arm_crosses_centre needs the arm to reach past the centre"
+                " - set position_min of [stepper_r] to how far it goes on"
+                " the far side, as a negative radius, or leave"
+                " arm_crosses_centre off")
+        self.arm_r_min = r_min if self.arm_crosses_centre else 0.
+        self.arm_r_max = r_max
+        self.toolhead = toolhead
+        # The bed angle is derived from x/y, so it is singular on the line
+        # x = y = 0 - the tool tip travelling through [0, 0, N] asks the
+        # bed for a half turn in no time at all.  This module owns the
+        # limits and the refusals; it is loaded unconditionally so that
+        # the check cannot be left out of a config by accident.
+        self.printer.load_object(config, 'polar_singularity')
         self.limit_z = (1.0, -1.0)
         self.limit_xy2 = -1.
         max_r = rail_r.get_range()[1]
@@ -132,6 +162,23 @@ class CoreRThetaKinematics:
         self.axes_max = toolhead.Coord((max_r, max_r, max_z))
     def get_steppers(self):
         return list(self.steppers)
+    def get_bed_angle_steppers(self):
+        # The steppers that follow the bed angle alone.  The radial RTCP
+        # correction moves the arm and never turns the bed, so [rtcp]
+        # leaves these unwrapped - see kin_rtcp.c.
+        return [self.stepper_bed]
+    def can_cross_centre(self):
+        return self.arm_crosses_centre
+    def get_arm_range(self):
+        # The arm radii a carriage may be driven to: below zero only on an
+        # arm that crosses the centre
+        return self.arm_r_min, self.arm_r_max
+    def get_centre_reach(self):
+        # How far past the centre the arm reaches, or None when it reaches
+        # as far there as on the near side
+        if not self.arm_crosses_centre or -self.arm_r_min >= self.arm_r_max:
+            return None
+        return -self.arm_r_min
     def get_axis_drive_steppers(self, axis_name):
         # Every motor that turns B.  Both gantry motors hold the head
         # through the differential, so both are energised before B is
@@ -186,6 +233,10 @@ class CoreRThetaKinematics:
         return [math.cos(bed_angle) * radius, math.sin(bed_angle) * radius,
                 z_pos, None, b_pos, None]
     def set_position(self, newpos, homing_axes):
+        if "x" in homing_axes and "y" in homing_axes:
+            # Homing R puts the arm at a positive radius, facing the bed
+            # angle it defines as zero
+            self.toolhead.set_branch(1)
         for s in self.steppers:
             s.set_position(newpos)
         if "z" in homing_axes:
@@ -279,19 +330,41 @@ class CoreRThetaKinematics:
             z_ratio = move.move_d / abs(move.axes_d[2])
             move.limit_speed(self.max_z_velocity * z_ratio,
                              self.max_z_accel * z_ratio)
-        # Slow down near center
-        if move.axes_d[0] or move.axes_d[1]:
-            if self.v_rad_max == 0:
-                return
-            min_dist = distance_to_center(move.start_pos[0:2],
-                                          move.end_pos[0:2])
-            if min_dist == 0:
-                return
-            v_angular = math.sqrt(move.max_cruise_v2) / min_dist
-            if self.v_rad_max < v_angular:
-                scale_radius = self.v_rad_max / v_angular
-                move.limit_speed(self.max_velocity * scale_radius,
-                                 self.max_accel * scale_radius)
+        if not move.axes_d[0] and not move.axes_d[1]:
+            return
+        # A move leaving the centre for the far side of the line the bed
+        # faces carries straight on through it, the arm travelling through
+        # zero radius onto the other branch with the bed held still.
+        # Without arm_crosses_centre it would have to turn the bed half a
+        # turn in no time, which [polar_singularity] refuses.
+        if self.arm_crosses_centre and flips_through_centre(
+                move.start_pos, move.end_pos, move.branch):
+            move.branch_flip = True
+        if move.get_end_branch() < 0 or move.branch < 0:
+            # On the far side the arm radius is negative, and may only go
+            # as far as position_min.  A straight move is furthest from
+            # the centre at one of its ends.
+            for pos, branch in ((move.start_pos, move.branch),
+                                (end_pos, move.get_end_branch())):
+                radius = branch * math.sqrt(pos[0]**2 + pos[1]**2)
+                if radius < self.arm_r_min - 0.000000001:
+                    raise move.move_error(
+                        "Move needs an arm radius of %.3f on the far side of"
+                        " the centre, beyond the %.3f the arm reaches"
+                        % (radius, self.arm_r_min))
+        if move.branch_flip:
+            # The bed does not follow atan2 through the middle of such a
+            # move, so the limit below - whose rates assume it does, and
+            # run away on a path this close to the centre - does not apply
+            return
+        # Slow down near center.  A move whose closest approach to the
+        # centre was zero used to return here without being limited at
+        # all - the one move that most needs the limit was the one move
+        # that escaped it.  See the geometry notes in bed_centre.py.
+        # [polar_singularity], loaded above, adds the angular acceleration
+        # limit and refuses the moves no feedrate can rescue.
+        if self.v_rad_max:
+            limit_centre_speed(move, self.v_rad_max)
     def get_status(self, eventtime):
         xy_home = "xy" if self.limit_xy2 >= 0. else ""
         z_home = "z" if self.limit_z[0] <= self.limit_z[1] else ""

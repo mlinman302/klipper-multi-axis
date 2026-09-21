@@ -5,25 +5,43 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math
 import stepper
+from .bed_centre import path_geometry, limits_for_angular_rates
+
+# A feedrate low enough to stand in for "as slow as this axis can go".
+# Only reached within microns of the centre of the bed.
+MIN_CENTRE_VELOCITY = 0.01
+# Passed to move.limit_speed() where only the velocity is being limited
+NO_ACCEL_LIMIT = 999999999.9
 
 
-def distance_to_center(p1, p2):
-    ab_x = p2[0]-p1[0]
-    ab_y = p2[1]-p1[1]
-    ap_x = -p1[0]
-    ap_y = -p1[1]
+# The bed angle is derived from x/y, so it is singular at the centre and
+# its rates diverge on the approach.  The geometry is in bed_centre.py;
+# this applies it to a move.
+def limit_centre_speed(move, max_angular_v, max_angular_a=0.):
+    # Apply the bed's angular limits to a move as a feedrate limit.  Left
+    # here rather than in the two kinematics so that both apply the same
+    # arithmetic.
+    offset, r_min, u_start, u_end = path_geometry(move.start_pos,
+                                                  move.end_pos)
+    v_limit, a_limit = limits_for_angular_rates(
+        offset, r_min, u_start, u_end, max_angular_v, max_angular_a)
+    if v_limit is None and a_limit is None:
+        return
+    # A path that passes near enough to the centre asks for a feedrate of
+    # zero.  Clamping to a floor rather than returning early is deliberate:
+    # the move that most needs limiting used to be the one move that
+    # escaped this check altogether.  [polar_singularity] is what turns
+    # such a move into an error rather than a crawl.
+    if v_limit is None:
+        v_limit = NO_ACCEL_LIMIT
+    move.limit_speed(max(v_limit, MIN_CENTRE_VELOCITY),
+                     NO_ACCEL_LIMIT if a_limit is None else a_limit)
 
-    ab_ap_dot_product = ab_x * ap_x + ab_y * ap_y
-    ab_length = math.sqrt(ab_x ** 2 + ab_y ** 2)
 
-    # Check if the projected point lies on the bounded line segment
-    if ab_ap_dot_product <= 0:
-        dist = math.sqrt(ap_x ** 2 + ap_y ** 2)
-    elif ab_ap_dot_product >= ab_length ** 2:
-        dist = math.sqrt(p2[0] ** 2 + p2[1] ** 2)
-    else:
-        dist = abs(ab_x * ap_y - ab_y * ap_x) / ab_length
-    return dist
+# distance_to_center() used to live here.  It returned the closest a
+# segment came to the centre, which is now the second value of
+# bed_centre.path_geometry() - computed the same way, alongside the two
+# other numbers a limit needs.
 
 
 class PolarKinematics:
@@ -124,19 +142,14 @@ class PolarKinematics:
             z_ratio = move.move_d / abs(move.axes_d[2])
             move.limit_speed(self.max_z_velocity * z_ratio,
                              self.max_z_accel * z_ratio)
-        # Slow down near center
-        if move.axes_d[0] or move.axes_d[1]:
-            if self.v_rad_max == 0:
-                return
-            min_dist = distance_to_center(move.start_pos[0:2],
-                                              move.end_pos[0:2])
-            if min_dist == 0:
-                return
-            v_angular = math.sqrt(move.max_cruise_v2) / min_dist
-            if self.v_rad_max < v_angular:
-                scale_radius = self.v_rad_max/v_angular
-                move.limit_speed(self.max_velocity * scale_radius,
-                                 self.max_accel * scale_radius)
+        # Slow down near center.  A move whose closest approach to the
+        # centre was zero used to return here without being limited at
+        # all - the one move that most needs the limit was the one move
+        # that escaped it.  See the geometry notes in bed_centre.py;
+        # [polar_singularity] is what refuses the moves no feedrate can
+        # rescue.
+        if self.v_rad_max and (move.axes_d[0] or move.axes_d[1]):
+            limit_centre_speed(move, self.v_rad_max)
 
     def get_status(self, eventtime):
         xy_home = "xy" if self.limit_xy2 >= 0. else ""

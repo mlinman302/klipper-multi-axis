@@ -618,8 +618,9 @@ see [common kinematic settings](#common-kinematic-settings) for
 available parameters.
 
 CORE R-THETA KINEMATICS ARE A WORK IN PROGRESS.  As with polar
-kinematics, moves around the 0, 0 position are known to not work
-properly.
+kinematics, the 0, 0 position is a singularity of the bed angle. Moves
+near it are slowed, and moves onto, off and across it are planned or
+refused - see [[polar_singularity]](#polar_singularity).
 
 ```
 [printer]
@@ -642,6 +643,18 @@ max_z_velocity:
 max_z_accel:
 #max_angular_velocity: 0
 #   These behave as they do for polar kinematics (see above).
+#arm_crosses_centre: False
+#   Set this to True if the arm carriage can travel through the centre
+#   of the bed and on to the far side, as far as position_min of
+#   [stepper_r] (which must then be negative). Every X/Y position then has
+#   a second solution - the arm at a negative radius with the bed turned
+#   the other half turn - and a move that carries on through the centre
+#   takes it, with the bed held still, instead of turning the bed half a
+#   turn. The tool can only change back where it next passes the centre,
+#   so where the far side reaches less far than position_max, only moves
+#   that come back through the centre within that reach use it. It
+#   is what the "cross" policy of [polar_singularity] needs. The default
+#   is False.
 
 # The stepper_c section is used to describe the stepper controlling the
 # rotating bed. As on a polar printer its angle is derived from the
@@ -653,9 +666,10 @@ gear_ratio:
 
 # The stepper_r section describes the first gantry motor. It carries the
 # endstop and position_min/position_max of the R axis - the arm radius in
-# mm from the centre of the bed. A negative position_min is allowed - it
-# denotes the far side of the bed, reached by turning the bed rather than
-# by driving the arm through the middle - but position_endstop must not be
+# mm from the centre of the bed. A negative position_min is allowed; with
+# arm_crosses_centre set it is how far the carriage travels past the
+# centre, and otherwise the far side of the bed is reached by turning the
+# bed rather than by driving the arm through the middle. position_endstop must not be
 # negative. Homing R always sweeps from a radius of zero, since a homing
 # sweep across the centre would be a half turn of the bed at the instant
 # the sign of the radius flips.
@@ -2780,6 +2794,149 @@ off. The machine does not move either way, but the commanded B changes
 meaning, so the toolhead is resynced to name the angle the head is
 already at; toggle at `B0`, where the two frames coincide and nothing
 has to be converted.
+
+### [polar_singularity]
+
+Bed centre singularity limits for the rotating-bed kinematics. Loaded
+automatically by `corertheta`, so the section only has to appear in a
+config file to change one of the values below; `polar` may load it by
+naming the section.
+
+On a rotating-bed machine the bed angle is derived from the commanded
+`X`/`Y` rather than commanded directly, so it has no value at all on the
+line `X=0 Y=0`: a tool tip travelling through `[0, 0, N]` asks the bed
+for a half turn in the instant the sign flips. The approach is the same
+problem with a finite number attached - the bed's angular velocity
+diverges as `1/r` and its angular acceleration as `1/r²` - so this
+module limits the feedrate of a move that passes near the centre and
+refuses one that crosses it.
+
+On the axis itself the bed angle is not determined by the position at
+all, so G-Code moves that start or end there are planned: a move onto
+the centre stops a tenth of a micron short, on the ray it arrived along,
+so the bed keeps facing that way; and a move off the centre along a
+different ray turns the bed on the way. Where it can, the turn is
+blended into the moves either side of the centre: the tool keeps moving
+and extruding along a path that stays within `blend_tolerance` of the
+commanded one, and the bed turns as it goes. To see the move after the
+centre in time, a move onto the centre is sent only as far as
+`blend_radius` short of it and the rest is held back until the next
+move arrives - or until anything else touches the toolhead (a wait, a
+dwell, a fan or heater change, setting a position), or a tenth of a
+second passes with no command, when it is sent on its own. A turn too
+sharp to blend at `min_velocity` or better is made the old way, by
+carrying the tool round a small circle of `reorient_radius` at the bed's
+angular velocity limit with `Z`, `E` and rotary axes held - which on a
+printing move leaves a blob, and is what the blend exists to avoid. A
+pure `Z` move along the axis, and a move that leaves along the ray the
+bed already faces, are unaffected.
+
+A move that crosses the axis - or passes so close that it would have to
+run below `min_velocity` - is handled according to `travel_policy` or
+`print_policy`: `error` refuses it, naming its closest approach and the
+rate it would have needed; `bypass` routes it through the centre and
+turns the bed there; `cross` carries it straight on through the centre
+with the bed held still and the arm travelling through zero radius, which
+needs `arm_crosses_centre` in `[printer]`. Bypass stops on the axis for
+up to half a turn of the bed, which is harmless on a travel move and
+leaves a blob on a printed one, hence the different defaults on an arm
+that cannot cross; `cross`
+keeps a move dead through the centre on its path and at its speed, and
+is the only policy fit for printing. With `cross` a move leaving the
+centre may also leave along the far half of the line the bed faces, so
+the bed never turns more than a quarter turn. A move that is merely
+slowed is split so that only its part close to the centre runs slowly -
+except that under `cross`, one that passes within `blend_tolerance` of
+the centre is taken through it and blended, which turns the bed a
+fraction of a degree where passing by would have crawled for about
+`pi / max_angular_velocity` seconds.
+
+On an arm that reaches only a little way past the centre - a
+`position_min` of `[stepper_r]` above `-position_max` - the far side is
+used only for moves that come back through the centre within that
+reach: a line straight across the bed turns the bed half a turn on the
+centre as it would on an arm that cannot cross. A move that would take
+the tool onto the far side is held back until the moves after it show
+whether it comes back in time; if a printing move would be left out of
+reach first, or anything else needs the toolhead before then, the
+crossing is planned again with the half turn on the centre. A travel
+move left out of reach detours back through the centre instead.
+
+The head's tilt is never changed by any of this: `B` follows the G-Code
+along every planned move, interpolated like `Z` and `E`. Turning the bed
+under a tilted head swings the machine's `B` with `[b_projection]` and
+the arm with `[rtcp]`; on an arm that cannot travel through the centre
+that is refused by the `[rtcp]` reach check, and the G-Code has to stand
+the head up itself. `cross` holds the bed still and keeps the tilt.
+
+Every move, planned or not, is checked so that the toolhead position
+always names the angle the bed faces: a move may only come to rest near
+the centre on the ray it arrived along, and only leave it along the line
+the bed faces. Setting the position anywhere else would redefine the bed
+angle and turn everything printed afterwards. Only G-Code moves are
+planned; moves made directly on the toolhead are only limited and
+refused.
+
+See [Multi_Axis.md](Multi_Axis.md).
+
+```
+[polar_singularity]
+#max_angular_velocity:
+#   Maximum bed rotation rate, in rad/s. The default is the
+#   max_angular_velocity of the [printer] section, so a machine normally
+#   states this figure once and does not repeat it here.
+#max_angular_accel: 0
+#   Maximum bed angular acceleration, in rad/s^2. The default is 0,
+#   which leaves it unchecked. This is the limit that bites first -
+#   angular acceleration diverges as 1/r^2 where angular velocity
+#   diverges as 1/r - and it is what bounds a move's own acceleration
+#   near the centre. Note that where the velocity limit above is the
+#   binding one it already holds the angular acceleration below
+#   0.65 * max_angular_velocity^2, so a value above that figure will
+#   never limit a feedrate; it will still limit acceleration.
+#min_velocity: 0.5
+#   The feedrate (in mm/s) below which slowing down has stopped being an
+#   answer. A move that would have to run slower than this to hold the
+#   limits above is handled as if it crossed the centre. The default is
+#   0.5.
+#travel_policy:
+#   What to do with a move that crosses the centre and does not extrude:
+#   "bypass" to route it through the centre and turn the bed there,
+#   "cross" to carry it straight on through the centre with the bed held
+#   still (needs arm_crosses_centre in [printer]), or "error" to refuse
+#   it. The default is cross where arm_crosses_centre is set, and bypass
+#   otherwise.
+#print_policy:
+#   The same for a move that extrudes. The default is cross where
+#   arm_crosses_centre is set, and error otherwise.
+#blend_tolerance: 0.05
+#   How far (in mm) a turn blended through the centre may take the tool
+#   off its commanded path. Larger values let sharper turns through the
+#   centre run faster. 0 turns the bed on the reorient_radius circle
+#   alone and never holds a move back. The default is 0.05.
+#blend_radius: 2.0
+#   How far from the centre (in mm) a blend may reach, and so how much
+#   of a move onto the centre is held back for the move after it. It
+#   must be at least 0.1. The default is 2.0.
+#retract_length: 0
+#   Where a printing move still has to stop on the centre while the bed
+#   turns on the reorient_radius circle - a line straight across the
+#   centre that the arm cannot follow onto the far side, or a turn too
+#   sharp to blend - draw the filament back by this many mm as it stops,
+#   and push it back just before it sets off, so the nozzle does not wait
+#   under pressure. The line after the turn extrudes exactly what the
+#   G-Code asked for. Travel moves and blended turns are never retracted.
+#   The default is 0, which does not retract.
+#retract_speed: 30
+#   The speed (in mm/s of filament) of that retraction and of pushing it
+#   back. The default is 30.
+#reorient_radius:
+#   The radius (in mm) of the circle the tool follows while the bed turns
+#   on the axis, for a turn too sharp to blend. It must be at least 0.04, and large enough that the
+#   bed's angular velocity limit does not hold the circle below
+#   min_velocity. The default is the smallest radius that satisfies
+#   both - 0.125 for a 5 rad/s bed and a 0.5 mm/s floor.
+```
 
 ### [rtcp_probe]
 

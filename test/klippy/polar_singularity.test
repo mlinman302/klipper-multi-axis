@@ -1,0 +1,112 @@
+# Tests for the bed centre - the moves near the bed's rotation axis that
+# are legal, those that are legal only slowly, and the ones that sit on the
+# axis itself and need the bed angle scheduled around them.  The moves
+# that are refused outright are in polar_singularity_refuse.test, which
+# needs a file of its own because SHOULD_FAIL applies to a whole test.
+#
+# test/multi_axis/test_centre_path.py checks the plans these moves are
+# turned into, and test_kin_6axis.c runs the same plans through the real
+# step compressor.  This runs them end to end through klippy.
+DICTIONARY atmega2560.dict
+CONFIG polar_singularity.cfg
+
+# Home.  The R sweep runs along y == 0 at a fixed bed angle, so it is
+# radial by construction and does not turn the bed at all - which is why
+# it may start from a radius of zero.
+G28 X
+G28 B
+G28 Z
+G90
+
+# Well clear of the centre: untouched at any feedrate the machine has
+G1 X80 Y0 Z10 F6000
+G1 X80 Y40 F6000
+G1 X40 Y80 F6000
+G1 X0 Y80 F6000
+
+# Chords that pass near the centre.  Each is held to 5 * r_min mm/s
+# whatever feedrate is asked for, so the F6000 below arrives as 200mm/s
+# at a closest approach of 40mm, 25mm/s at 5mm and 5mm/s at 1mm.
+G1 X40 Y-30 F6000
+G1 X40 Y30 F6000
+
+G1 X5 Y-20 F6000
+G1 X5 Y20 F6000
+
+G1 X1 Y-10 F6000
+G1 X1 Y10 F6000
+
+# The same on the other side of the axis, and at an angle to it
+G1 X-1 Y10 F6000
+G1 X-1 Y-10 F6000
+G1 X-15 Y-15 F6000
+G1 X-15 Y15 F6000
+G1 X15 Y15 F6000
+
+# Just inside the refusal threshold: a chord passing 0.15mm from the
+# centre needs 0.75mm/s, which clears the 0.5mm/s floor
+G1 X20 Y20 F3000
+G1 X0.15 Y-10 F6000
+G1 X0.15 Y10 F6000
+
+# A quarter turn at a comfortable radius, then a half turn taken the
+# long way round rather than across the middle
+G1 X50 Y0 F3000
+G1 X0 Y50 F3000
+G1 X-50 Y0 F3000
+G1 X0 Y-50 F3000
+G1 X50 Y0 F3000
+
+# Rotating the head near the centre does not turn the bed, so it is not
+# limited by any of this
+G1 X2 Y-8 F3000
+G1 B20 F600
+G1 B-20 F600
+G1 B0 F600
+
+# Printing near the centre still works, just slowly
+G1 X20 Y0 Z0.3 F1500
+G1 X2 Y-8 E1 F1500
+G1 X2 Y8 E2 F1500
+G1 X20 Y8 E3 F1500
+
+# On the axis.  Arrive from +x, work along the axis - the N in [0, 0, N]
+# - and leave along +y.  The arrival parks a tenth of a micron short, on
+# the +x ray, and the departure turns the bed on a small arc before it
+# leaves, so the bed is never asked to step.
+G1 X40 Y0 Z10 F3000
+G1 X0 Y0 F3000
+G1 Z50 F600
+G1 Z10 F600
+GET_POSITION
+G1 B20 F600
+G1 B0 F600
+G1 X0 Y40 F3000
+
+# Back to the centre and out again the way it came - no turn needed
+G1 X0 Y0 F3000
+G1 X0 Y30 F3000
+
+# Leaving in the opposite direction to the arrival is a half turn
+G1 X0 Y0 F3000
+G1 X0 Y-30 F3000
+
+# Straight across the centre on a travel move is routed through it,
+# stopping on the axis while the bed turns
+G1 X-40 Y0 F3000
+G1 X40 Y0 F3000
+G1 X0.003 Y40 F3000
+G1 X-0.003 Y-40 F3000
+
+# A travel move so close to the centre that it would have to crawl is
+# routed the same way
+G1 X-20 Y0.05 F3000
+G1 X20 Y0.05 F3000
+
+# Printing away from the centre after all of that
+G1 X20 Y0 Z0.3 F1500
+G1 X20 Y8 E4 F1500
+
+GET_POSITION
+M114
+M84
