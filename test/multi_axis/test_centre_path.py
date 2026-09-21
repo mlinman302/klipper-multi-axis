@@ -496,7 +496,7 @@ class TestTransform(unittest.TestCase):
         obj.planner = make_planner()
         obj.toolhead = obj.next_transform = FakeToolhead(position)
         obj.last_position = [0., 0., 0., 0.]
-        obj.held = obj.reactor = obj.hold_timer = None
+        obj.pending, obj.reactor, obj.hold_timer = [], None, None
         obj.get_position()
         return obj
 
@@ -763,7 +763,7 @@ def build_transform(planner, position, can_cross=True):
     obj.toolhead = obj.next_transform = FakeCrossingToolhead(position,
                                                              can_cross)
     obj.last_position = [0., 0., 0., 0.]
-    obj.held = obj.reactor = obj.hold_timer = None
+    obj.pending, obj.reactor, obj.hold_timer = [], None, None
     obj.get_position()
     return obj
 
@@ -930,7 +930,7 @@ class TestLookahead(unittest.TestCase):
         here = obj.toolhead.position
         self.assertAlmostEqual(here[0], centre_path.DEFAULT_BLEND_RADIUS)
         self.assertAlmostEqual(here[3], 1.8)
-        self.assertIsNotNone(obj.held)
+        self.assertTrue(obj.pending)
         self.assertEqual(obj.last_position, pos(0., 0., 10., 2.))
 
     def test_a_short_move_is_held_whole(self):
@@ -942,7 +942,7 @@ class TestLookahead(unittest.TestCase):
         obj = build_transform(blend_planner(), pos(20., 0.))
         obj.move(pos(0., 0., 10., 2.), 60.)
         obj.release()
-        self.assertIsNone(obj.held)
+        self.assertEqual(obj.pending, [])
         self.assertAlmostEqual(obj.toolhead.position[0],
                                centre_path.PARK_RADIUS)
         self.assertEqual(obj.toolhead.position[2:], [10., 2.])
@@ -955,7 +955,7 @@ class TestLookahead(unittest.TestCase):
         obj = build_transform(blend_planner(), pos(20., 0.))
         obj.move(pos(0., 0., 10., 2.), 60.)
         self.assertEqual(obj.get_position(), pos(0., 0., 10., 2.))
-        self.assertIsNone(obj.held)
+        self.assertEqual(obj.pending, [])
 
     def test_the_timer_releases_it(self):
         obj = build_transform(blend_planner(), pos(20., 0.))
@@ -964,13 +964,13 @@ class TestLookahead(unittest.TestCase):
             NEVER = 9999999999999999.
         obj.reactor = Reactor()
         self.assertEqual(obj._hold_timeout(1.), Reactor.NEVER)
-        self.assertIsNone(obj.held)
+        self.assertEqual(obj.pending, [])
 
     def test_staying_on_the_centre_releases_then_stays(self):
         obj = build_transform(blend_planner(), pos(20., 0.))
         obj.move(pos(0., 0., 10., 2.), 60.)
         obj.move(pos(0., 0., 12., 2.), 5.)
-        self.assertIsNone(obj.held)
+        self.assertEqual(obj.pending, [])
         self.assertAlmostEqual(obj.toolhead.position[0],
                                centre_path.PARK_RADIUS)
         self.assertEqual(obj.toolhead.position[2], 12.)
@@ -997,11 +997,11 @@ class TestLookahead(unittest.TestCase):
 
     def test_blending_off_holds_nothing(self):
         planner = blend_planner(blend_tolerance=0.)
-        self.assertIsNone(planner.hold_point((20., 0.), pos(20., 0.),
+        self.assertIsNone(planner.hold_point(pos(20., 0.),
                                              pos(0., 0.)))
         obj = build_transform(planner, pos(20., 0.))
         obj.move(pos(0., 0.), 60.)
-        self.assertIsNone(obj.held)
+        self.assertEqual(obj.pending, [])
         self.assertAlmostEqual(obj.toolhead.position[0],
                                centre_path.PARK_RADIUS)
 
@@ -1089,6 +1089,158 @@ class TestBlendConfig(unittest.TestCase):
             blend_planner(blend_radius=.05)
 
 ######################################################################
+# An arm that reaches only a little way past the centre
+######################################################################
+
+REACH = 5.
+
+def reach_planner(**kw):
+    kw.setdefault('far_reach', REACH)
+    return blend_planner(**kw)
+
+def check_reach(test, moves, reach=REACH):
+    # Nothing is sent to the far side further out than the arm goes
+    for start, end, branch, flip, speed in moves:
+        for pos, br in ((start, branch),
+                        (end, bed_centre.end_branch(branch, flip))):
+            if br < 0:
+                test.assertLessEqual(math.hypot(pos[0], pos[1]),
+                                     reach + 1e-9, msg=(start, end))
+
+def run_moves(planner, start, targets, release=True):
+    obj = build_transform(planner, start)
+    for target, speed in targets:
+        obj.move(target, speed)
+    if release:
+        obj.release()
+    return obj
+
+def e_held(moves):
+    # Moves in x/y that carry no extrusion
+    return [m for m in moves if m[1][3] == m[0][3]
+            and (m[1][0] != m[0][0] or m[1][1] != m[0][1])]
+
+
+class TestShortReach(unittest.TestCase):
+    def test_a_line_across_the_bed_turns_the_bed_on_the_centre(self):
+        # The far side cannot hold a tool 40mm out, so the bed makes its
+        # half turn on the centre, as on an arm that cannot cross
+        obj = run_moves(reach_planner(), pos(40., 0., 10., 0.),
+                        [(pos(-40., 0., 10., 4.), 60.)])
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        check_reach(self, moves)
+        self.assertFalse(any(m[3] for m in moves))
+        self.assertEqual(obj.toolhead.position, pos(-40., 0., 10., 4.))
+
+    def test_a_short_excursion_crosses_and_comes_back(self):
+        planner = reach_planner()
+        obj = run_moves(planner, pos(40., 0., 10., 0.),
+                        [(pos(-3., 0., 10., 2.), 60.)], release=False)
+        # Held until it is known the tool comes back
+        self.assertEqual(obj.toolhead.moves, [])
+        self.assertTrue(obj.pending)
+        obj.move(pos(40., 0., 10., 4.), 60.)
+        self.assertEqual(obj.pending, [])
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        check_reach(self, moves)
+        # Across and back on the far side, the bed never turning, at full
+        # speed and extruding throughout
+        self.assertEqual([m[3] for m in moves].count(True), 2)
+        self.assertEqual(obj.toolhead.branch, 1)
+        trace = branch_trace(moves)
+        self.assertLess(max(abs(centre_path.wrap_angle(a - trace[0]))
+                            for a in trace), 1e-6)
+        self.assertEqual(set(m[4] for m in moves), {60.})
+        self.assertEqual(e_held(moves), [])
+
+    def test_a_print_that_would_be_stranded_stays_on_the_near_side(self):
+        # Across to 3mm past the centre, then on along the far side out
+        # of reach: the far side would strand it, so the crossing is
+        # planned again with a half turn on the centre instead
+        obj = run_moves(reach_planner(), pos(40., 0., 10., 0.),
+                        [(pos(-3., 0., 10., 2.), 60.),
+                         (pos(-3., 10., 10., 4.), 60.)], release=False)
+        self.assertEqual(obj.pending, [])
+        moves = obj.toolhead.moves
+        # Passing a few mm from the centre on the near side is
+        # slowed by the move check, as any such move is
+        check_all(self, moves, exact=False)
+        check_reach(self, moves)
+        self.assertFalse(any(m[3] for m in moves))
+        # And the second line is printed where it was asked for
+        last = [m for m in moves if m[1][3] > 2.]
+        for start, end, branch, flip, speed in last:
+            self.assertAlmostEqual(end[0], -3.)
+
+    def test_a_stranded_travel_detours_back_through_the_centre(self):
+        obj = run_moves(reach_planner(), pos(40., 0.),
+                        [(pos(-3., 0.), 100.), (pos(-3., 10.), 100.)],
+                        release=False)
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        check_reach(self, moves)
+        # Onto the far side and back, with no half turn of the bed
+        self.assertEqual([m[3] for m in moves].count(True), 2)
+        self.assertEqual(obj.toolhead.branch, 1)
+        self.assertEqual(obj.toolhead.position, pos(-3., 10.))
+
+    def test_a_release_gives_up_the_far_side(self):
+        obj = run_moves(reach_planner(), pos(40., 0., 10., 0.),
+                        [(pos(-3., 0., 10., 2.), 60.)])
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        self.assertFalse(any(m[3] for m in moves))
+        self.assertEqual(obj.toolhead.position, pos(-3., 0., 10., 2.))
+
+    def test_a_bend_through_the_centre_that_comes_back(self):
+        # In along -x, out 7 degrees off, 4mm past the centre, and back
+        # through it: the far side carries both bends
+        out = math.radians(180. - 7.)
+        far = pos(4. * math.cos(out), 4. * math.sin(out), 10., 3.)
+        back = pos(-20. * math.cos(out), -20. * math.sin(out), 10., 5.)
+        obj = run_moves(reach_planner(), pos(20., 0., 10., 0.),
+                        [(pos(0., 0., 10., 2.), 60.), (far, 60.),
+                         (back, 60.)], release=False)
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        check_reach(self, moves)
+        self.assertEqual(obj.toolhead.branch, 1)
+        self.assertEqual(e_held(moves), [])
+        self.assertTrue(any(m[3] for m in moves))
+
+    def test_a_long_chain_on_the_far_side_is_given_up(self):
+        targets = [(pos(-2., 0., 10., 1.), 60.)]
+        e = 1.
+        for i in range(centre_path.MAX_FAR_CHAIN + 2):
+            e += .1
+            targets.append((pos(-2., .5 * (i % 2), 10., e), 60.))
+        obj = run_moves(reach_planner(), pos(40., 0., 10., 0.), targets,
+                        release=False)
+        moves = obj.toolhead.moves
+        # Passing a few mm from the centre on the near side is
+        # slowed by the move check, as any such move is
+        check_all(self, moves, exact=False)
+        check_reach(self, moves)
+        self.assertFalse(any(m[3] for m in moves))
+        self.assertEqual(obj.pending, [])
+
+    def test_every_sequence_stays_in_reach(self):
+        for targets in TestNoBedSteps().sequences():
+            obj = build_transform(reach_planner(), targets[0])
+            for target in targets[1:]:
+                obj.move(target, 100.)
+            obj.release()
+            check_all(self, obj.toolhead.moves)
+            check_reach(self, obj.toolhead.moves)
+            self.assertEqual(obj.toolhead.branch, 1)
+
+    def test_the_reach_must_hold_the_arc(self):
+        with self.assertRaises(ValueError):
+            reach_planner(far_reach=.1)
+
+######################################################################
 # The plans test_kin_6axis.c runs through the real step compressor
 ######################################################################
 
@@ -1120,6 +1272,10 @@ def blend_plans():
     obj.move(pos(20., .02, 10., 4.), 60.)
     plans.append(("a near miss taken through the centre",
                   obj.toolhead.moves))
+    obj = run_moves(reach_planner(), pos(40., 0., 10., 0.),
+                    [(pos(-3., 0., 10., 2.), 60.),
+                     (pos(40., 0., 10., 4.), 60.)])
+    plans.append(("3mm past the centre and back", obj.toolhead.moves))
     return plans
 
 def render_c_tables():
@@ -1170,10 +1326,11 @@ class TestTheCTables(unittest.TestCase):
                          msg="centre_blend_plans.h is stale - run with"
                          " CENTRE_BLEND_REGENERATE=1")
 
-    def test_every_plan_turns_the_bed(self):
+    def test_every_plan_gets_past_the_check(self):
         for what, moves in blend_plans():
-            self.assertGreater(len(moves), 5, msg=what)
+            self.assertGreater(len(moves), 3, msg=what)
             check_all(self, moves)
+            check_reach(self, moves, REACH if 'past' in what else 1e9)
 
 
 if __name__ == '__main__':

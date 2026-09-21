@@ -283,6 +283,7 @@ alongside the linear axes.
 | `test/klippy/polar_singularity.test` | Linux (`scripts/test_klippy.py`) | Bed centre: chords near the axis, and the feedrates they are held to |
 | `test/klippy/polar_singularity_refuse.test` | Linux (`scripts/test_klippy.py`) | Bed centre: a move straight across the axis is refused |
 | `test/klippy/polar_singularity_cross.test` | Linux (`scripts/test_klippy.py`) | Bed centre on an arm that can cross it: travel and printing straight through, onto the far branch and back |
+| `test/klippy/polar_singularity_reach.test` | Linux (`scripts/test_klippy.py`) | Bed centre on an arm that reaches 5 mm past it: excursions that come back, stranded prints planned on the near side, travel detours |
 
 ```bash
 bash test/multi_axis/run_c_tests.sh && python test/multi_axis/test_gcode_pipeline.py     && python test/multi_axis/test_rtcp_probe.py     && python test/multi_axis/test_bed_centre.py     && python test/multi_axis/test_polar_singularity.py     && python test/multi_axis/test_centre_path.py
@@ -1056,11 +1057,29 @@ move all the way to the step generators:
   `[input_shaper]`, `[rtcp]` and `[b_projection]` pass the branch
   through the stand-in moves they hand their wrapped solvers.
 
-The far side has to reach as far as the near one because the tool stays
-on that branch until it next passes the centre — a tool that crossed
-over must still be able to get to the edge of the bed.  The branch
-changes nowhere else: only at the centre, where the arm radius is zero
-on both.
+The branch changes nowhere else: only at the centre, where the arm
+radius is zero on both.  So how far the far side reaches — `position_min`
+of `[stepper_r]`, 5 mm on the machine this was written for — decides
+what the far side is good for.  An arm that reaches the whole bed there
+can stay on the far side indefinitely.  One that reaches 5 mm has to
+come back through the centre before the tool is further out than that,
+which no line straight across the bed does: such a line turns the bed
+half a turn on the centre exactly as on an arm that cannot cross.
+
+The planner takes the far side only where a move's end is within reach
+(`CentrePlanner.far_reach`), and whether the tool then gets back in time
+is a question about the moves after it.  So `[polar_singularity]` holds a
+move that leaves the tool on the far side, and every move after it,
+until one brings the tool back through the centre; then the whole chain
+is sent.  If instead a printing move would carry the tool out of reach
+without passing the centre — stranded, with no way back but a detour —
+or the chain grows past `MAX_FAR_CHAIN` (32) moves, or anything else
+needs the toolhead first, the chain is planned again from where it first
+crossed, on the near side throughout.  That costs a half turn on the
+centre and never strands a printing move.  A stranded travel move just
+detours back through the centre: it deposits nothing.  `corertheta`'s
+`check_move()` refuses anything sent to the far side beyond
+`position_min`, and `[rtcp]` checks the carriage against it too.
 
 `test_centre_crossing_step_generation()` in `test_kin_6axis.c` runs a
 crossing through the real step compressor on the bed and both gantry
@@ -1146,6 +1165,3 @@ faces, which is defined everywhere, the bare centre included.
   ramp.  That is inside the move check's limits, but with an angular
   acceleration limit measured, an S-shaped ramp would let sharper turns
   blend.
-* **Measure the bed's angular acceleration limit** and set
-  `max_angular_accel`, and confirm on the machine whether its arm can
-  travel through the centre (`arm_crosses_centre`).

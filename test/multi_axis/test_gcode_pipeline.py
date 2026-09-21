@@ -657,6 +657,8 @@ class _FakeMove:
         return _CheckMoveError(msg)
     def limit_speed(self, v, a):
         self.limited = (v, a)
+    def get_end_branch(self):
+        return -self.branch if self.branch_flip else self.branch
 
 
 class TestCoreRThetaCheckMove(unittest.TestCase):
@@ -671,6 +673,7 @@ class TestCoreRThetaCheckMove(unittest.TestCase):
         kin.limit_z = limit_z
         kin.v_rad_max = 0.
         kin.arm_crosses_centre = False
+        kin.arm_r_min, kin.arm_r_max = 0., 200.
         kin.max_velocity = kin.max_accel = 300.
         kin.max_z_velocity = 5.
         kin.max_z_accel = 100.
@@ -1355,13 +1358,15 @@ class _BranchRecorder:
 
 
 class TestCoreRThetaCrossing(unittest.TestCase):
-    def _kin(self, crosses=True, v_rad_max=5.):
+    def _kin(self, crosses=True, v_rad_max=5., reach=200.):
         from kinematics import corertheta
         kin = object.__new__(corertheta.CoreRThetaKinematics)
         kin.limit_xy2 = 200. ** 2
         kin.limit_z = (0., 250.)
         kin.v_rad_max = v_rad_max
         kin.arm_crosses_centre = crosses
+        kin.arm_r_min = -reach if crosses else 0.
+        kin.arm_r_max = 200.
         kin.max_velocity = kin.max_accel = 300.
         kin.max_z_velocity = 5.
         kin.max_z_accel = 100.
@@ -1407,6 +1412,25 @@ class TestCoreRThetaCrossing(unittest.TestCase):
     def test_capability(self):
         self.assertTrue(self._kin().can_cross_centre())
         self.assertFalse(self._kin(crosses=False).can_cross_centre())
+        self.assertIsNone(self._kin().get_centre_reach())
+        self.assertEqual(self._kin(reach=5.).get_centre_reach(), 5.)
+        self.assertEqual(self._kin(reach=5.).get_arm_range(), (-5., 200.))
+
+    def test_the_far_side_only_as_far_as_the_arm_reaches(self):
+        kin = self._kin(reach=5.)
+        # Through the centre to 4mm out on the far side: fine
+        m = self._move((PARK, 1e-12), (-4., 0.))
+        kin.check_move(m)
+        self.assertTrue(m.branch_flip)
+        # ...to 6mm, beyond position_min: refused
+        m = self._move((PARK, 1e-12), (-6., 0.))
+        self.assertRaises(_CheckMoveError, kin.check_move, m)
+        # And on the far side already, out of reach
+        m = self._move((-4., 0.), (-4., 5.), branch=-1)
+        self.assertRaises(_CheckMoveError, kin.check_move, m)
+        # The near side is not limited by it
+        m = self._move((40., 0.), (40., 30.))
+        kin.check_move(m)
 
     def test_homing_r_puts_the_arm_on_the_usual_branch(self):
         kin = self._kin()

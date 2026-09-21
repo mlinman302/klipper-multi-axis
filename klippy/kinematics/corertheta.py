@@ -118,19 +118,23 @@ class CoreRThetaKinematics:
         # a second solution, with the arm at a negative radius and the bed
         # turned the other half turn (see bed_centre.py), and a move that
         # carries straight on through the centre can take it with the bed
-        # held still.  The far side has to be as reachable as the near
-        # one: a tool that crossed over stays on that branch until it next
-        # passes the centre, and has to be able to get to the edge of the
-        # bed from there.
+        # held still.  How far past the centre the arm reaches is
+        # position_min of [stepper_r]: it may be the whole bed, or - as on
+        # the machine this was written for - only a few millimetres, in
+        # which case a tool that crossed over has to come back through the
+        # centre before it goes further out than that.  centre_path.py
+        # plans for that; the check below refuses anything that does not.
         self.arm_crosses_centre = config.getboolean('arm_crosses_centre',
                                                     False)
         r_min, r_max = rail_r.get_range()
-        if self.arm_crosses_centre and r_min > -r_max:
+        if self.arm_crosses_centre and r_min >= 0.:
             raise config.error(
-                "arm_crosses_centre needs the arm to reach position_max on"
-                " the far side of the centre as well - set position_min of"
-                " [stepper_r] to %.3f or less, or leave arm_crosses_centre"
-                " off" % (-r_max,))
+                "arm_crosses_centre needs the arm to reach past the centre"
+                " - set position_min of [stepper_r] to how far it goes on"
+                " the far side, as a negative radius, or leave"
+                " arm_crosses_centre off")
+        self.arm_r_min = r_min if self.arm_crosses_centre else 0.
+        self.arm_r_max = r_max
         self.toolhead = toolhead
         # The bed angle is derived from x/y, so it is singular on the line
         # x = y = 0 - the tool tip travelling through [0, 0, N] asks the
@@ -153,6 +157,16 @@ class CoreRThetaKinematics:
         return [self.stepper_bed]
     def can_cross_centre(self):
         return self.arm_crosses_centre
+    def get_arm_range(self):
+        # The arm radii a carriage may be driven to: below zero only on an
+        # arm that crosses the centre
+        return self.arm_r_min, self.arm_r_max
+    def get_centre_reach(self):
+        # How far past the centre the arm reaches, or None when it reaches
+        # as far there as on the near side
+        if not self.arm_crosses_centre or -self.arm_r_min >= self.arm_r_max:
+            return None
+        return -self.arm_r_min
     def get_axis_rail(self, axis_name):
         # Called by rotary_axis.CoupledRotaryAxis to find the range and
         # endstop of the B axis, which has no stepper of its own.  'r' is
@@ -285,6 +299,19 @@ class CoreRThetaKinematics:
         if self.arm_crosses_centre and flips_through_centre(
                 move.start_pos, move.end_pos, move.branch):
             move.branch_flip = True
+        if move.get_end_branch() < 0 or move.branch < 0:
+            # On the far side the arm radius is negative, and may only go
+            # as far as position_min.  A straight move is furthest from
+            # the centre at one of its ends.
+            for pos, branch in ((move.start_pos, move.branch),
+                                (end_pos, move.get_end_branch())):
+                radius = branch * math.sqrt(pos[0]**2 + pos[1]**2)
+                if radius < self.arm_r_min - 0.000000001:
+                    raise move.move_error(
+                        "Move needs an arm radius of %.3f on the far side of"
+                        " the centre, beyond the %.3f the arm reaches"
+                        % (radius, self.arm_r_min))
+        if move.branch_flip:
             # The bed does not follow atan2 through the middle of such a
             # move, so the limit below - whose rates assume it does, and
             # run away on a path this close to the centre - does not apply

@@ -120,15 +120,42 @@
 # LOOKING AHEAD
 #
 # A symmetric blend needs the move after the centre before the move onto
-# it has finished.  So hold_point() says how much of an arriving move to
-# send now - all but the last blend_radius of it - and plan_held() plans
-# the rest together with the next move once it is known: a blend through
-# the centre if the next move leaves it, or the usual park point if it
-# does not.  [polar_singularity] holds the tail in between, and gives it
-# up to the toolhead on its own (release()) before anything else touches
-# the toolhead.  Starting from rest on the centre - after a z move there,
-# say - only the departing half is left, which blends too, over a
-# distance four times shorter for the same tolerance.
+# it has finished.  So commit() sends a move onto the centre only as far
+# as hold_point() - all but the last blend_radius of it - and keeps the
+# rest, to plan it together with the next move once it is known: a blend
+# through the centre if the next move leaves it, or the usual park point
+# if it does not.  [polar_singularity] holds what is kept in between, and
+# commits it with 'final' - on to the park point - before anything else
+# touches the toolhead.  Starting from rest on the centre - after a z
+# move there, say - only the departing half is left, which blends too,
+# over a distance four times shorter for the same tolerance.
+#
+# HOW FAR THE FAR SIDE REACHES
+#
+# The arm may reach less far past the centre than it does on the near
+# side - on the machine this was written for, 5 mm (far_reach, from
+# position_min of [stepper_r]).  The branch changes only where the tool
+# passes the centre, so a tool that has crossed onto the far side has to
+# come back through the centre before it gets further out than that.  A
+# line straight across the bed therefore cannot use the far side at all:
+# the bed has to make its half turn on the centre, as it would on an arm
+# that cannot cross.  What the far side is good for is the path that
+# comes back - short moves about the centre, a bend there whose way out
+# stays within reach - and, under [rtcp], a tilted head whose carriage
+# sits inboard of the tip.
+#
+# The planner only takes the far side where the move's end is within
+# reach.  Whether the tool can then get back is a question about the
+# moves after it, so commit() plans the moves still held back together,
+# and holds a chain that leaves the tool on the far side until a later
+# move brings it back through the centre.  If one would carry a printing
+# move out of reach first - stranded, with no way back but a detour
+# through the centre - or the chain grows past MAX_FAR_CHAIN, or
+# anything else needs the toolhead before it is resolved, the chain is
+# planned again from where it first crossed, on the near side
+# throughout.  That costs a half turn on the centre and never strands a
+# printing move.  A travel move that is stranded simply detours back
+# through the centre: it deposits nothing.
 #
 # A near miss uses the same machinery.  One so close that holding the
 # bed's limits would take it below min_velocity is routed through the
@@ -184,6 +211,9 @@ BLEND_DESIGN_MARGIN = .9
 # from the centre a blend may reach (mm), when nothing configures them
 DEFAULT_BLEND_TOLERANCE = .05
 DEFAULT_BLEND_RADIUS = 2.
+# The most commanded moves held back while a chain on the far side waits
+# to come back through the centre
+MAX_FAR_CHAIN = 32
 
 
 def default_reorient_radius(max_angular_v, min_velocity):
@@ -225,15 +255,32 @@ def _ramp_error(share, radius, core):
     return share * peak * (radius - peak) / (radius - core)
 
 
+class ChainStep:
+    # One commanded move of a chain, or two planned as one blend: where it
+    # starts in the chain, its planned moves, where the tool stood and on
+    # which branch before them and after, and whether it had to detour
+    # back through the centre while printing
+    def __init__(self, index, moves, start_xy, start_branch, branch_after,
+                 detour):
+        self.index = index
+        self.moves = moves
+        self.start_xy = start_xy
+        self.start_branch = start_branch
+        self.branch_after = branch_after
+        self.detour = detour
+
+
 class CentrePlanner:
     def __init__(self, max_angular_v=0., max_angular_a=0., min_velocity=.5,
                  reorient_radius=None, travel_policy='bypass',
                  print_policy='error', can_cross=False,
                  blend_tolerance=DEFAULT_BLEND_TOLERANCE,
-                 blend_radius=DEFAULT_BLEND_RADIUS):
+                 blend_radius=DEFAULT_BLEND_RADIUS, far_reach=None):
         # 'can_cross' says the arm can travel through the centre to a
-        # negative radius.  A blend_tolerance of zero turns the bed on the
-        # arc alone and never holds a move back.
+        # negative radius, and 'far_reach' how far (mm) - None when it
+        # reaches as far on the far side as on the near one.  A
+        # blend_tolerance of zero turns the bed on the arc alone and never
+        # holds a move back.
         for policy in (travel_policy, print_policy):
             if policy not in POLICIES:
                 raise ValueError("Unknown centre policy '%s'" % (policy,))
@@ -265,10 +312,15 @@ class CentrePlanner:
                 "blend_radius must be at least %.3f mm - room for the"
                 " straight core of a blend and a chord either side of it"
                 % (min_blend,))
+        if can_cross and far_reach is not None and far_reach < reorient_radius:
+            raise ValueError(
+                "The arm reaches only %.3f mm past the centre, less than"
+                " reorient_radius %.3f mm" % (far_reach, reorient_radius))
         self.max_angular_v = max_angular_v
         self.max_angular_a = max_angular_a
         self.min_velocity = min_velocity
         self.reorient_radius = reorient_radius
+        self.far_reach = far_reach if can_cross else None
         self.reorient_v = max_angular_v or DEFAULT_REORIENT_VELOCITY
         self.travel_policy = travel_policy
         self.print_policy = print_policy
@@ -284,14 +336,20 @@ class CentrePlanner:
     def blending(self):
         return self.blend_tolerance > 0.
 
-    def plan(self, machine_xy, start, end, speed, branch=1):
+    def within_reach(self, pos):
+        # Whether the tool may stand at 'pos' on the far side
+        return (self.far_reach is None
+                or math.sqrt(pos[0]**2 + pos[1]**2) <= self.far_reach + 1e-9)
+
+    def plan(self, machine_xy, start, end, speed, branch=1, allow_far=True):
         # The moves that carry out start -> end.  'start' and 'end' are
         # full position vectors in the frame of the caller; 'machine_xy'
         # is where the toolhead really is, which on the centre is a park
         # point rather than the (0, 0) the caller asked for, and 'branch'
         # the branch it is on (see bed_centre.py).  Returns a list of
         # (position, speed).  A move that has no plan is returned as it
-        # is, for the move check to refuse.
+        # is, for the move check to refuse.  With 'allow_far' False the
+        # tool is not taken onto the far side, whatever the policy.
         from_centre = at_centre(machine_xy)
         if at_centre(end):
             if from_centre:
@@ -301,48 +359,140 @@ class CentrePlanner:
                          speed)]
             return self._arrive(machine_xy, end, speed)
         if from_centre:
-            return self._depart(machine_xy, start, end, speed, branch,
-                                self.policy(start, end) == 'cross')
-        return self._through(start, end, speed, branch)
+            return self._depart(
+                machine_xy, start, end, speed, branch,
+                self.policy(start, end) == 'cross' and allow_far)
+        return self._through(start, end, speed, branch, allow_far)
 
     ######################################################################
     # Looking ahead across the centre
     ######################################################################
-    def hold_point(self, machine_xy, start, end):
+    def hold_point(self, start, end):
         # For a move onto the centre, the point to send it to now - the
-        # rest is held back to be planned with whatever follows, see
-        # plan_held().  None for a move that is not held: one that does
-        # not arrive on the centre, or with blending off.  The point is
-        # the start itself when the whole move is within blend_radius.
-        if not self.blending() or not at_centre(end) or at_centre(machine_xy):
+        # rest is held back to be planned with whatever follows.  None for
+        # a move that is not held: one that does not arrive on the centre,
+        # or with blending off.  The point is the start itself when the
+        # whole move is within blend_radius.
+        if not self.blending() or not at_centre(end) or at_centre(start):
             return None
-        length = math.sqrt(machine_xy[0]**2 + machine_xy[1]**2)
+        length = math.sqrt(start[0]**2 + start[1]**2)
         if length <= self.blend_radius:
             return list(start)
         centre = with_xy(end, 0., 0.)
         return bed_centre.interpolate(start, centre,
                                       1. - self.blend_radius / length)
 
-    def plan_held(self, held, end, speed, branch=1):
-        # Plan the held tail of an arrival, 'held' = (hold point, the
-        # target on the centre, its speed), together with the move from
-        # the centre to 'end'.  The tool is standing at the hold point.
-        hold, centre, held_speed = held
-        if not at_centre(end):
-            moves = self._blend(hold, centre, held_speed, end, speed, branch,
-                                self.policy(centre, end) == 'cross',
-                                self.blend_tolerance)
-            if moves is not None:
-                return moves
-        moves = self.release(held)
-        return moves + self.plan(moves[-1][0][:2], centre, end, speed,
-                                 branch)
+    def commit(self, machine_xy, branch, chain, final=False):
+        # Plan the commanded moves held back so far, 'chain' - a list of
+        # (start, end, speed), the first starting where the toolhead
+        # stands at 'machine_xy' on 'branch' - and decide how much of the
+        # plan to send.  Returns (moves, kept): the (position, speed)
+        # moves to send now, and the commanded moves to go on holding
+        # until the next one arrives.  With 'final' nothing is kept.
+        chain = [(list(s), list(e), v) for s, e, v in chain]
+        if not chain:
+            return [], []
+        planned = list(chain)
+        tail = None
+        if not final:
+            # Hold the end of a move onto the centre for the move after it
+            s, e, v = chain[-1]
+            hold = self.hold_point(s, e)
+            if hold is not None:
+                tail = (hold, e, v)
+                if hold[:2] == s[:2]:
+                    planned = chain[:-1]
+                else:
+                    planned = chain[:-1] + [(s, hold, v)]
+        steps = self._plan_chain(machine_xy, branch, planned, True)
+        first_far = None
+        if self.far_reach is not None:
+            for index, step in enumerate(steps):
+                if step.branch_after < 0:
+                    first_far = index
+                    break
+        kept = [tail] if tail is not None else []
+        if first_far is None:
+            return [m for step in steps for m in step.moves], kept
+        far = steps[first_far:]
+        ends_far = steps[-1].branch_after < 0
+        count = len(planned) - far[0].index
+        stranded = any(step.detour for step in far)
+        if stranded or (ends_far and (final or count > MAX_FAR_CHAIN)):
+            # The far side does not come back in time: plan the chain
+            # again from where it first crossed, on the near side
+            near = self._plan_chain(far[0].start_xy, far[0].start_branch,
+                                    planned[far[0].index:], False)
+            steps = steps[:first_far] + near
+            return [m for step in steps for m in step.moves], kept
+        if ends_far:
+            # Wait for a later move to bring it back through the centre
+            prefix = [m for step in steps[:first_far] for m in step.moves]
+            return prefix, chain[far[0].index:]
+        return [m for step in steps for m in step.moves], kept
 
-    def release(self, held):
-        # The held tail of an arrival on its own, when nothing follows it
-        # to plan it with: on to the park point
-        hold, centre, held_speed = held
-        return self._arrive(hold, centre, held_speed)
+    def _plan_chain(self, machine_xy, branch, chain, allow_far):
+        # Plan a chain of commanded moves in turn, following the branch
+        # the kinematics would put each planned move on.  A move onto the
+        # centre followed by one leaving it is planned as one blend.
+        steps = []
+        here, br = list(machine_xy[:2]), branch
+        i = 0
+        while i < len(chain):
+            s, e, v = chain[i]
+            moves, count, detour = None, 1, False
+            following = chain[i + 1] if i + 1 < len(chain) else None
+            if (self.blending() and at_centre(e) and not at_centre(here)
+                    and following is not None
+                    and not at_centre(following[1])):
+                cross = (self.policy(e, following[1]) == 'cross'
+                         and allow_far)
+                moves = self._blend(s, e, v, following[1], following[2], br,
+                                    cross, self.blend_tolerance)
+                if moves is not None:
+                    count = 2
+            if moves is None:
+                if br < 0 and self._stranded(here, s, e):
+                    moves = self._uncross(here, s, e, v)
+                    detour = is_extruding(s, e)
+                else:
+                    moves = self.plan(here, s, e, v, br, allow_far)
+            after = self._branch_after(here, br, moves)
+            steps.append(ChainStep(i, moves, here, br, after, detour))
+            if moves:
+                here = list(moves[-1][0][:2])
+            br = after
+            i += count
+        return steps
+
+    def _branch_after(self, here, branch, moves):
+        # The branch the kinematics leaves the tool on after these moves:
+        # corertheta flips a move that leaves the centre for the far side
+        # of the line the bed faces
+        for pos, speed in moves:
+            moving = pos[0] != here[0] or pos[1] != here[1]
+            if (self.can_cross and moving
+                    and bed_centre.flips_through_centre(here, pos, branch)):
+                branch = -branch
+            here = pos
+        return branch
+
+    def _stranded(self, here, start, end):
+        # Whether a move from the far side ends out of its reach without
+        # passing close enough to the centre to go back through it
+        if at_centre(here) or at_centre(end) or self.within_reach(end):
+            return False
+        offset, r_min, u_start, u_end = bed_centre.path_geometry(start, end)
+        return not (u_start * u_end < 0.
+                    and r_min <= max(self.blend_tolerance, SNAP_RADIUS))
+
+    def _uncross(self, machine_xy, start, end, speed):
+        # Back through the centre to the near side, off the commanded
+        # path: in along the line the bed faces, then out to 'end'
+        park = self._arrive(machine_xy, start, speed)[0][0]
+        centre = with_xy(start, 0., 0.)
+        return [(park, speed)] + self._depart(park, centre, end, speed, -1,
+                                              False)
 
     ######################################################################
     # Arriving and departing
@@ -363,7 +513,10 @@ class CentrePlanner:
                                       branch)
         ray = math.atan2(end[1], end[0])
         best = None
-        for new_branch in ((1, -1) if may_cross else (1,)):
+        branches = (1,)
+        if may_cross and self.within_reach(end):
+            branches = (1, -1)
+        for new_branch in branches:
             target = ray if new_branch > 0 else bed_centre.half_turn(ray)
             turn = wrap_angle(target - facing)
             if best is None or abs(turn) < abs(best[0]) - ANGLE_TOLERANCE:
@@ -528,7 +681,7 @@ class CentrePlanner:
     ######################################################################
     # Everything else
     ######################################################################
-    def _through(self, start, end, speed, branch=1):
+    def _through(self, start, end, speed, branch=1, allow_far=True):
         if start[0] == end[0] and start[1] == end[1]:
             return [(end, speed)]
         offset, r_min, u_start, u_end = bed_centre.path_geometry(start, end)
@@ -546,9 +699,11 @@ class CentrePlanner:
                 # Leave the refusal to the move check, which says why
                 return [(end, speed)]
             return self._via_centre(start, end, speed, branch,
-                                    policy == 'cross', u_start, u_end, r_min)
+                                    policy == 'cross' and allow_far,
+                                    u_start, u_end, r_min)
         if v_limit is not None and v_limit < speed and self.max_angular_v:
-            if (self.policy(start, end) == 'cross' and u_start * u_end < 0.
+            if (self.policy(start, end) == 'cross' and allow_far
+                    and u_start * u_end < 0.
                     and r_min < self.blend_tolerance):
                 # Close enough to go through the centre instead of
                 # crawling past it

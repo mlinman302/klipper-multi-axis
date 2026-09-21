@@ -72,7 +72,7 @@ def build_checker(max_angular_v=5., max_angular_a=0., min_velocity=0.5):
                                             min_velocity)
     chk.last_radius = chk.last_swept = chk.last_velocity_limit = 0.
     chk.toolhead = None
-    chk.held = chk.hold_timer = None
+    chk.pending, chk.hold_timer = [], None
     return chk
 
 
@@ -321,7 +321,7 @@ class TestConfigAtConnect(unittest.TestCase):
         chk.travel_policy, chk.print_policy = travel_policy, print_policy
         chk.reorient_radius = None
         chk.blend_tolerance, chk.blend_radius = .05, 2.
-        chk.held = chk.hold_timer = None
+        chk.pending, chk.hold_timer = [], None
         return chk
 
     def test_cross_needs_the_kinematics_to_allow_it(self):
@@ -345,6 +345,15 @@ class TestConfigAtConnect(unittest.TestCase):
         planner = chk._make_planner(True, CommandError)
         self.assertEqual((planner.travel_policy, planner.print_policy),
                          ('cross', 'error'))
+
+    def test_the_far_reach_reaches_the_planner(self):
+        chk = self.build(travel_policy='cross')
+        self.assertEqual(chk._make_planner(True, CommandError, 5.).far_reach,
+                         5.)
+        self.assertIsNone(chk._make_planner(True, CommandError).far_reach)
+        # Shorter than the arc the bed turns on: a config error
+        self.assertRaises(CommandError, chk._make_planner, True,
+                          CommandError, .05)
 
     def test_bad_blend_values_are_config_errors(self):
         chk = self.build()
@@ -426,7 +435,7 @@ class TestToolheadReleasesHeldMoves(unittest.TestCase):
     def test_releasing_with_nothing_held_does_nothing(self):
         chk = build_checker()
         chk.release()
-        self.assertIsNone(chk.held)
+        self.assertEqual(chk.pending, [])
 
 
 if __name__ == '__main__':

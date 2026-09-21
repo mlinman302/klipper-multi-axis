@@ -359,7 +359,10 @@ class RTCP:
                 # arm that can travel through the middle can reach.
                 radius = machine_branch * math.hypot(pos[0], pos[1])
                 r_max = axis_max[0]
-                r_min = -r_max if self._can_cross_centre() else 0.
+                r_min = 0.
+                if self._can_cross_centre():
+                    kin_range = getattr(kin, 'get_arm_range', None)
+                    r_min = kin_range()[0] if kin_range else -r_max
                 if radius < r_min - 0.000000001:
                     raise move.move_error(
                         "RTCP move at B=%.3f needs an arm radius of %.3f,"

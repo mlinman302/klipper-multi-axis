@@ -643,14 +643,15 @@ max_z_accel:
 #max_angular_velocity: 0
 #   These behave as they do for polar kinematics (see above).
 #arm_crosses_centre: False
-#   Set this to True if the arm carriage can travel straight through the
-#   centre of the bed and on to position_max on the far side. Every X/Y
-#   position then has a second solution - the arm at a negative radius
-#   with the bed turned the other half turn - and a move that carries on
-#   through the centre takes it, with the bed held still, instead of
-#   turning the bed half a turn. The far side must reach as far as the
-#   near one, since the tool stays on that side until it next passes the
-#   centre: position_min of [stepper_r] must be -position_max or less. It
+#   Set this to True if the arm carriage can travel through the centre
+#   of the bed and on to the far side, as far as position_min of
+#   [stepper_r] (which must then be negative). Every X/Y position then has
+#   a second solution - the arm at a negative radius with the bed turned
+#   the other half turn - and a move that carries on through the centre
+#   takes it, with the bed held still, instead of turning the bed half a
+#   turn. The tool can only change back where it next passes the centre,
+#   so where the far side reaches less far than position_max, only moves
+#   that come back through the centre within that reach use it. It
 #   is what the "cross" policy of [polar_singularity] needs. The default
 #   is False.
 
@@ -664,10 +665,10 @@ gear_ratio:
 
 # The stepper_r section describes the first gantry motor. It carries the
 # endstop and position_min/position_max of the R axis - the arm radius in
-# mm from the centre of the bed. A negative position_min is allowed; the
-# arm only travels there with arm_crosses_centre set, and otherwise the
-# far side of the bed is reached by turning the bed rather than by
-# driving the arm through the middle. position_endstop must not be
+# mm from the centre of the bed. A negative position_min is allowed; with
+# arm_crosses_centre set it is how far the carriage travels past the
+# centre, and otherwise the far side of the bed is reached by turning the
+# bed rather than by driving the arm through the middle. position_endstop must not be
 # negative. Homing R always sweeps from a radius of zero, since a homing
 # sweep across the centre would be a half turn of the bed at the instant
 # the sign of the radius flips.
@@ -2749,6 +2750,17 @@ except that under `cross`, one that passes within `blend_tolerance` of
 the centre is taken through it and blended, which turns the bed a
 fraction of a degree where passing by would have crawled for about
 `pi / max_angular_velocity` seconds.
+
+On an arm that reaches only a little way past the centre - a
+`position_min` of `[stepper_r]` above `-position_max` - the far side is
+used only for moves that come back through the centre within that
+reach: a line straight across the bed turns the bed half a turn on the
+centre as it would on an arm that cannot cross. A move that would take
+the tool onto the far side is held back until the moves after it show
+whether it comes back in time; if a printing move would be left out of
+reach first, or anything else needs the toolhead before then, the
+crossing is planned again with the half turn on the centre. A travel
+move left out of reach detours back through the centre instead.
 
 The head's tilt is never changed by any of this: `B` follows the G-Code
 along every planned move, interpolated like `Z` and `E`. Turning the bed

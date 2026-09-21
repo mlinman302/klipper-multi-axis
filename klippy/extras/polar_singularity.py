@@ -75,13 +75,17 @@
 # Blending a turn through the centre needs the move after it.  So the
 # transform sends a move onto the centre only as far as blend_radius
 # short of it, and holds the rest until the next g-code move arrives to
-# plan it with.  Nothing else may see the toolhead in between: the
-# toolhead calls release() before any operation that would - another
-# move, a dwell, M400, a timed callback such as a fan or heater change,
-# setting a position - and a timer releases it if no command follows at
-# all.  A release sends the tail on to the park point, exactly as if
-# there had been no hold.  While a tail is held no move is being emitted
-# anywhere, so a release is safe from any context.
+# plan it with.  On an arm that reaches only a little way past the
+# centre it also holds a chain of moves that has taken the tool onto the
+# far side, until a later move brings it back through the centre - see
+# "How far the far side reaches" in centre_path.py.  Nothing else may see
+# the toolhead in between: the toolhead calls release() before any
+# operation that would - another move, a dwell, M400, a timed callback
+# such as a fan or heater change, setting a position - and a timer
+# releases it if no command follows at all.  A release plans what is
+# held as if nothing followed: a tail on to the park point, a chain on
+# the far side again on the near side.  While moves are held no move is
+# being emitted anywhere, so a release is safe from any context.
 #
 # The transform is registered at connect time, after every transform that
 # insists on being first ([bed_mesh], [bed_tilt]) and before the ones that
@@ -116,8 +120,8 @@ from kinematics.bed_centre import (
     limits_for_angular_rates)
 from kinematics.polar import NO_ACCEL_LIMIT
 
-# How long (in seconds) a held tail may wait for the next command before
-# it is sent on its own
+# How long (in seconds) held moves may wait for the next command before
+# they are sent on their own
 HOLD_TIMEOUT = .1
 
 # The policies a machine gets when its config names none: 'cross' where
@@ -187,9 +191,9 @@ class PolarSingularity:
         self.planner = self._make_planner(can_cross=True, error=config.error)
         self.toolhead = self.next_transform = None
         self.last_position = [0., 0., 0., 0.]
-        # The tail of a move onto the centre, held for the next move (see
-        # "Holding a move back" above), and the timer that gives up on it
-        self.held = None
+        # Commanded moves held for the ones after them (see "Holding a move
+        # back" above), and the timer that gives up on them
+        self.pending = []
         self.reactor = self.hold_timer = None
         # Diagnostics for the last move that came near the centre.  Most
         # of the failures this replaces present as an "Internal error in
@@ -198,14 +202,15 @@ class PolarSingularity:
         self.last_swept = 0.
         self.last_velocity_limit = 0.
         self.printer.register_event_handler("klippy:connect", self._connect)
-    def _make_planner(self, can_cross, error):
+    def _make_planner(self, can_cross, error, far_reach=None):
         travel_policy, print_policy = resolve_policies(
             self.travel_policy, self.print_policy, can_cross)
         try:
             return centre_path.CentrePlanner(
                 self.max_angular_v, self.max_angular_a, self.min_velocity,
                 self.reorient_radius, travel_policy, print_policy,
-                can_cross, self.blend_tolerance, self.blend_radius)
+                can_cross, self.blend_tolerance, self.blend_radius,
+                far_reach)
         except ValueError as e:
             raise error("[%s] %s" % (self.name, e))
 
@@ -213,8 +218,12 @@ class PolarSingularity:
         self.toolhead = self.printer.lookup_object('toolhead')
         kin = self.toolhead.get_kinematics()
         can_cross = getattr(kin, 'can_cross_centre', lambda: False)()
+        far_reach = None
+        if can_cross:
+            far_reach = getattr(kin, 'get_centre_reach', lambda: None)()
         self.planner = self._make_planner(can_cross,
-                                          self.printer.config_error)
+                                          self.printer.config_error,
+                                          far_reach)
         self.toolhead.register_move_check(self._check_move)
         self.toolhead.register_held_moves(self.release)
         self.reactor = self.printer.get_reactor()
@@ -228,8 +237,8 @@ class PolarSingularity:
     def get_position(self):
         # A tool parked on the axis stands a tenth of a micron off it, on
         # the ray the bed faces; the caller asked for the centre itself.
-        # Anything asking where the toolhead is gets the answer with no
-        # tail held back.
+        # Anything asking where the toolhead is gets the answer with
+        # nothing held back.
         self.release()
         pos = self.next_transform.get_position()
         if centre_path.at_centre(pos):
@@ -237,42 +246,30 @@ class PolarSingularity:
         self.last_position[:] = pos
         return list(pos)
     def move(self, newpos, speed):
-        held, self.held = self.held, None
+        self.pending.append((list(self.last_position), list(newpos), speed))
+        self.last_position[:] = newpos
+        self._commit(False)
+    def release(self):
+        # Send whatever is held, planned as if nothing followed it.  The
+        # toolhead calls this before anything that must see every move
+        # made so far.
+        if self.pending:
+            self._commit(True)
+    def _commit(self, final):
+        chain, self.pending = self.pending, []
         self._set_hold_timer(None)
         # The toolhead's own x/y is what the bed angle follows, and on the
         # centre it is a park point rather than the position asked for
         machine_xy = self.toolhead.get_position()[:2]
-        branch = self.toolhead.get_branch()
-        hold = None
-        if held is not None:
-            moves = self.planner.plan_held(held, newpos, speed, branch)
-        else:
-            hold = self.planner.hold_point(machine_xy, self.last_position,
-                                           newpos)
-            if hold is not None:
-                moves = []
-                if hold[:2] != list(machine_xy):
-                    moves.append((hold, speed))
-            else:
-                moves = self.planner.plan(machine_xy, self.last_position,
-                                          newpos, speed, branch)
+        moves, kept = self.planner.commit(
+            machine_xy, self.toolhead.get_branch(), chain, final)
         for pos, move_speed in moves:
             self.next_transform.move(pos, move_speed)
-        self.last_position[:] = newpos
-        if hold is not None:
-            self.held = (hold, list(newpos), speed)
-            if self.reactor is not None:
-                self._set_hold_timer(self.reactor.monotonic() + HOLD_TIMEOUT)
-    def release(self):
-        # Send a held tail on to the park point, as if it had never been
-        # held.  The toolhead calls this before anything that must see
-        # every move made so far.
-        held, self.held = self.held, None
-        if held is None:
-            return
-        self._set_hold_timer(None)
-        for pos, move_speed in self.planner.release(held):
-            self.next_transform.move(pos, move_speed)
+        # Only once everything is sent: while held moves exist, nothing is
+        # being emitted
+        self.pending = kept
+        if kept and self.reactor is not None:
+            self._set_hold_timer(self.reactor.monotonic() + HOLD_TIMEOUT)
     def _set_hold_timer(self, waketime):
         if self.hold_timer is not None:
             self.reactor.update_timer(
@@ -377,9 +374,9 @@ class PolarSingularity:
             'blend_tolerance': self.planner.blend_tolerance,
             'blend_radius': self.planner.blend_radius,
             'can_cross': self.planner.can_cross,
-            # Whether the tail of a move onto the centre is waiting for
-            # the move after it
-            'holding': self.held is not None,
+            'far_reach': self.planner.far_reach,
+            # Whether moves are held back waiting for the ones after them
+            'holding': bool(self.pending),
         }
         if self.toolhead is not None:
             # Whether the tool is standing on the centre, and on which

@@ -300,6 +300,19 @@ static const struct branch_pt blend_plan_4[] = {
      0, -1, 0, 60},
 };
 
+static const struct branch_pt blend_plan_5[] = {
+    {40, 0,
+     0, 1, 0, 0},
+    {0.0001, 0,
+     0, 1, 0, 60},
+    {-3, 0,
+     0, 1, 1, 60},
+    {-0.0001, 0,
+     0, -1, 0, 60},
+    {40, 0,
+     0, -1, 1, 60},
+};
+
 static const struct {
     const char *what;
     const struct branch_pt *pts;
@@ -310,4 +323,5 @@ static const struct {
     {"back out 20 degrees off the way in", blend_plan_2, 35},
     {"out along a new line from rest", blend_plan_3, 8},
     {"a near miss taken through the centre", blend_plan_4, 40},
+    {"3mm past the centre and back", blend_plan_5, 4},
 };
