@@ -45,8 +45,10 @@ STEP = .01
 
 
 def make_planner(**kw):
+    # Blending is off unless a test asks for it, so the bed turns on the
+    # arc - the plans test_kin_6axis.c builds by hand
     args = dict(max_angular_v=MAX_V, max_angular_a=MAX_A,
-                min_velocity=MIN_V)
+                min_velocity=MIN_V, blend_tolerance=0.)
     args.update(kw)
     return centre_path.CentrePlanner(**args)
 
@@ -494,6 +496,7 @@ class TestTransform(unittest.TestCase):
         obj.planner = make_planner()
         obj.toolhead = obj.next_transform = FakeToolhead(position)
         obj.last_position = [0., 0., 0., 0.]
+        obj.held = obj.reactor = obj.hold_timer = None
         obj.get_position()
         return obj
 
@@ -688,63 +691,63 @@ def pos5(x, y, z=10., e=0., b=0.):
     return [x, y, z, e, b]
 
 
-class TestUprightTransit(unittest.TestCase):
+class TestTiltIsNeverTouched(unittest.TestCase):
+    # Nothing the planner does changes the head's tilt: B goes wherever
+    # the g-code sends it, interpolated along the way like z and e
     def plan(self, planner, start, end):
         return planner.plan(start[:2], start, end, 50.)
 
-    def test_a_tilted_travel_crossing_stands_up(self):
-        planner = make_planner(tilt_index=4)
-        start, end = pos5(-40., 0., b=10.), pos5(40., 0., b=-5.)
-        moves = self.plan(planner, start, end)
-        # Up where it starts, across upright, back down where it ends
-        self.assertEqual(moves[0][0], pos5(-40., 0., b=0.))
-        for p, speed in moves[1:-1]:
-            self.assertEqual(p[4], 0.)
-        self.assertEqual(moves[-2][0], pos5(40., 0., b=0.))
-        self.assertEqual(moves[-1][0], end)
-        trace = bed_trace(start[:2], [p for p, speed in moves])
-        self.assertLess(largest_step(trace), STEP)
-
-    def test_upright_needs_no_standing_up(self):
-        planner = make_planner(tilt_index=4)
-        moves = self.plan(planner, pos5(-40., 0.), pos5(40., 0.))
-        self.assertEqual(moves,
-                         self.plan(make_planner(), pos5(-40., 0.),
-                                   pos5(40., 0.)))
-
-    def test_a_tilted_print_crossing_is_refused(self):
-        planner = make_planner(tilt_index=4, print_policy='bypass')
-        with self.assertRaises(centre_path.CentrePlanError):
-            self.plan(planner, pos5(-40., 0., e=0., b=10.),
-                      pos5(40., 0., e=2., b=10.))
-        # ...upright, it is only a bypass
-        self.plan(planner, pos5(-40., 0., e=0.), pos5(40., 0., e=2.))
-
-    def test_it_can_be_turned_off(self):
-        planner = make_planner(tilt_index=4, upright_transit=False)
-        moves = self.plan(planner, pos5(-40., 0., b=10.),
+    def test_a_tilted_bypass_keeps_its_tilt(self):
+        moves = self.plan(make_planner(), pos5(-40., 0., b=10.),
                           pos5(40., 0., b=10.))
+        self.assertGreater(len(moves), 2)
         self.assertTrue(all(p[4] == 10. for p, speed in moves))
 
-    def test_crossing_on_an_arm_that_can_holds_the_tilt(self):
-        planner = cross_planner(tilt_index=4)
-        moves = self.plan(planner, pos5(-40., 0., e=0., b=10.),
+    def test_a_changing_tilt_is_interpolated_not_stood_up(self):
+        start, end = pos5(-40., 0., b=10.), pos5(40., 0., b=-6.)
+        moves = self.plan(make_planner(), start, end)
+        tilts = [p[4] for p, speed in moves]
+        # Halfway at the centre, held there while the bed turns, then on
+        self.assertAlmostEqual(tilts[0], 2.)
+        self.assertEqual(tilts, sorted(tilts, reverse=True))
+        self.assertEqual(moves[-1][0], end)
+        self.assertNotIn(0., tilts)
+
+    def test_a_tilted_print_bypass_is_planned_like_any_other(self):
+        planner = make_planner(print_policy='bypass')
+        tilted = self.plan(planner, pos5(-40., 0., e=0., b=10.),
+                           pos5(40., 0., e=2., b=10.))
+        upright = self.plan(planner, pos5(-40., 0., e=0.),
+                            pos5(40., 0., e=2.))
+        self.assertEqual(xy_of(tilted), xy_of(upright))
+        self.assertTrue(all(p[4] == 10. for p, speed in tilted))
+
+    def test_crossing_holds_the_tilt(self):
+        moves = self.plan(cross_planner(), pos5(-40., 0., e=0., b=10.),
                           pos5(40., 0., e=2., b=10.))
         self.assertEqual(len(moves), 2)
         self.assertTrue(all(p[4] == 10. for p, speed in moves))
 
 
 class FakeCrossingToolhead(FakeToolhead):
-    # corertheta's part: marking a move that carries on through the centre
-    def __init__(self, position):
+    # corertheta's part: marking a move that carries on through the centre.
+    # Records each move as (start, end, branch, flip, speed).
+    def __init__(self, position, can_cross=True):
         FakeToolhead.__init__(self, position)
         self.branch = 1
+        self.can_cross = can_cross
+        self.moves = []
     def get_branch(self):
         return self.branch
     def move(self, newpos, speed):
-        if bed_centre.flips_through_centre(self.position, newpos,
-                                           self.branch):
-            self.branch = -self.branch
+        moving = (newpos[0] != self.position[0]
+                  or newpos[1] != self.position[1])
+        flip = bool(self.can_cross and moving
+                    and bed_centre.flips_through_centre(
+                        self.position, newpos, self.branch))
+        self.moves.append((list(self.position), list(newpos), self.branch,
+                           flip, speed))
+        self.branch = bed_centre.end_branch(self.branch, flip)
         FakeToolhead.move(self, newpos, speed)
 
 
@@ -753,18 +756,21 @@ class FakePrinter:
         pass
 
 
-class TestCrossingTransform(unittest.TestCase):
-    def build(self, planner, position):
-        obj = ps.PolarSingularity.__new__(ps.PolarSingularity)
-        obj.printer = FakePrinter()
-        obj.planner = planner
-        obj.toolhead = obj.next_transform = FakeCrossingToolhead(position)
-        obj.last_position = [0., 0., 0., 0.]
-        obj.get_position()
-        return obj
+def build_transform(planner, position, can_cross=True):
+    obj = ps.PolarSingularity.__new__(ps.PolarSingularity)
+    obj.printer = FakePrinter()
+    obj.planner = planner
+    obj.toolhead = obj.next_transform = FakeCrossingToolhead(position,
+                                                             can_cross)
+    obj.last_position = [0., 0., 0., 0.]
+    obj.held = obj.reactor = obj.hold_timer = None
+    obj.get_position()
+    return obj
 
+
+class TestCrossingTransform(unittest.TestCase):
     def test_the_toolhead_branch_reaches_the_planner(self):
-        obj = self.build(cross_planner(), pos(40., 0.))
+        obj = build_transform(cross_planner(), pos(40., 0.))
         obj.move(pos(-40., 0.), 50.)
         self.assertEqual(obj.toolhead.branch, -1)
         # Back through the centre from the far side, still in a line
@@ -772,12 +778,387 @@ class TestCrossingTransform(unittest.TestCase):
         self.assertEqual(obj.toolhead.branch, 1)
         self.assertEqual(len(obj.toolhead.sent), 4)
 
-    def test_a_plan_that_cannot_be_made_is_a_g_code_error(self):
-        obj = self.build(make_planner(tilt_index=4, print_policy='bypass'),
-                         pos5(-40., 0., b=10.))
-        with self.assertRaises(FakePrinter.command_error):
-            obj.move(pos5(40., 0., e=2., b=10.), 50.)
+
+######################################################################
+# Turning the bed on the move, and looking ahead to do it
+######################################################################
+
+TOLERANCE = centre_path.DEFAULT_BLEND_TOLERANCE
+
+def blend_planner(**kw):
+    # With the bed's angular acceleration unchecked, as the example config
+    # ships it until it has been measured
+    args = dict(travel_policy='cross', print_policy='cross', can_cross=True,
+                blend_tolerance=TOLERANCE, max_angular_a=0.)
+    args.update(kw)
+    return make_planner(**args)
+
+def _segment_distance(p, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length2 = dx*dx + dy*dy
+    t = 0.
+    if length2:
+        t = min(max(((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length2,
+                    0.), 1.)
+    return math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy)
+
+def deviation(moves, commanded):
+    # The furthest the path the moves describe strays from the commanded
+    # polyline, sampled along each move
+    worst = 0.
+    for start, end, branch, flip, speed in moves:
+        for i in range(33):
+            t = i / 32.
+            p = (start[0] + t * (end[0] - start[0]),
+                 start[1] + t * (end[1] - start[1]))
+            worst = max(worst, min(_segment_distance(p, a, b) for a, b
+                                   in zip(commanded, commanded[1:])))
+    return worst
+
+def make_checker(max_a):
+    chk = ps.PolarSingularity.__new__(ps.PolarSingularity)
+    chk.max_angular_v, chk.max_angular_a = MAX_V, max_a
+    chk.min_velocity = MIN_V
+    chk.last_radius = chk.last_swept = chk.last_velocity_limit = 0.
+    return chk
+
+def check_all(test, moves, max_a=0., exact=True):
+    # Every move gets past the move check and never steps the bed.  With
+    # 'exact', every move already runs at the speed the check allows it:
+    # the plan held each chord to the bed's limits itself.
+    chk = make_checker(max_a)
+    for start, end, branch, flip, speed in moves:
+        move = FakeMove(start, end, speed)
+        move.branch, move.branch_flip = branch, flip
+        if move.axes_d[0] or move.axes_d[1]:
+            chk._check_move(move)
+            if exact:
+                test.assertAlmostEqual(move.cruise(), speed,
+                                       delta=1e-6 * speed, msg=(start, end))
+    test.assertLess(largest_step(branch_trace(moves)), STEP)
+
+def corner(deflection, reach=20.):
+    # In along -x onto the centre, out again turned 'deflection' radians
+    # from carrying straight on - so pi is straight back the way it came
+    out = math.pi - deflection
+    return (pos(reach, 0., 10., 0.), pos(0., 0., 10., 2.),
+            pos(reach * math.cos(out), reach * math.sin(out), 10., 4.))
+
+def run_corner(planner, deflection, can_cross=True, speed=60.):
+    start, middle, end = corner(deflection)
+    obj = build_transform(planner, start, can_cross)
+    obj.move(middle, speed)
+    obj.move(end, speed)
+    obj.release()
+    return obj, [start[:2], middle[:2], end[:2]]
+
+
+class TestBlend(unittest.TestCase):
+    def test_a_corner_through_the_centre_keeps_moving(self):
+        for degrees in (3., 10., 25., 45., 70., 85., 89.):
+            obj, commanded = run_corner(blend_planner(),
+                                        math.radians(degrees))
+            moves = obj.toolhead.moves
+            msg = '%g degrees' % (degrees,)
+            check_all(self, moves)
+            self.assertLessEqual(deviation(moves, commanded), TOLERANCE,
+                                 msg=msg)
+            # Onto the far branch, and extruding on every move - never
+            # standing still with e held, which is where a blob comes from
+            self.assertEqual(obj.toolhead.branch, -1, msg=msg)
+            for start, end, branch, flip, speed in moves:
+                self.assertGreater(end[3], start[3], msg=msg)
+                self.assertGreaterEqual(speed, MIN_V, msg=msg)
+            self.assertEqual(moves[-1][1], corner(math.radians(degrees))[2])
+
+    def test_a_shallow_corner_runs_at_full_speed(self):
+        obj, commanded = run_corner(blend_planner(), math.radians(10.))
+        self.assertEqual(set(m[4] for m in obj.toolhead.moves), {60.})
+
+    def test_sharper_corners_run_slower(self):
+        slowest = []
+        for degrees in (20., 40., 80.):
+            obj, commanded = run_corner(blend_planner(),
+                                        math.radians(degrees))
+            slowest.append(min(m[4] for m in obj.toolhead.moves))
+        self.assertEqual(slowest, sorted(slowest, reverse=True))
+
+    def test_the_tilt_is_what_was_commanded(self):
+        # b falls linearly with e along the commanded path, so wherever
+        # the blend puts the tool the two must still agree
+        start, middle, end = (pos5(20., 0., e=0., b=10.),
+                              pos5(0., 0., e=2., b=4.),
+                              pos5(-14.14, 14.14, e=4., b=-2.))
+        obj = build_transform(blend_planner(), start)
+        obj.move(middle, 60.)
+        obj.move(end, 60.)
+        for s, e, branch, flip, speed in obj.toolhead.moves:
+            self.assertAlmostEqual(e[4], 10. - 3. * e[3], places=9)
+
+    def test_a_reversal_blends_on_an_arm_that_cannot_cross(self):
+        # Back out 20 degrees off the way it came: the bed turns 20
+        # degrees and the tool never leaves the near branch
+        planner = blend_planner(travel_policy='bypass', print_policy='error',
+                                can_cross=False)
+        obj, commanded = run_corner(planner, math.radians(160.),
+                                    can_cross=False)
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        self.assertFalse(any(m[3] for m in moves))
+        self.assertLessEqual(deviation(moves, commanded), TOLERANCE)
+        for start, end, branch, flip, speed in moves:
+            self.assertGreater(end[3], start[3])
+
+    def test_too_sharp_to_blend_turns_on_the_arc(self):
+        planner = blend_planner(blend_tolerance=.002)
+        obj, commanded = run_corner(planner, math.radians(85.))
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        radius = planner.reorient_radius
+        arc = [m for m in moves
+               if abs(math.hypot(m[1][0], m[1][1]) - radius) < 1e-9]
+        self.assertGreater(len(arc), 5)
+        # The arc holds e, as it always has
+        self.assertEqual(len(set(m[1][3] for m in arc)), 1)
+
+
+class TestLookahead(unittest.TestCase):
+    def test_the_move_onto_the_centre_is_held_back(self):
+        obj = build_transform(blend_planner(), pos(20., 0.))
+        obj.move(pos(0., 0., 10., 2.), 60.)
+        # Sent as far as blend_radius short of the centre
+        here = obj.toolhead.position
+        self.assertAlmostEqual(here[0], centre_path.DEFAULT_BLEND_RADIUS)
+        self.assertAlmostEqual(here[3], 1.8)
+        self.assertIsNotNone(obj.held)
+        self.assertEqual(obj.last_position, pos(0., 0., 10., 2.))
+
+    def test_a_short_move_is_held_whole(self):
+        obj = build_transform(blend_planner(), pos(1., 0.))
+        obj.move(pos(0., 0.), 60.)
         self.assertEqual(obj.toolhead.sent, [])
+
+    def test_a_release_parks_the_held_tail(self):
+        obj = build_transform(blend_planner(), pos(20., 0.))
+        obj.move(pos(0., 0., 10., 2.), 60.)
+        obj.release()
+        self.assertIsNone(obj.held)
+        self.assertAlmostEqual(obj.toolhead.position[0],
+                               centre_path.PARK_RADIUS)
+        self.assertEqual(obj.toolhead.position[2:], [10., 2.])
+        # And a second release has nothing to send
+        count = len(obj.toolhead.sent)
+        obj.release()
+        self.assertEqual(len(obj.toolhead.sent), count)
+
+    def test_reading_the_position_releases_it(self):
+        obj = build_transform(blend_planner(), pos(20., 0.))
+        obj.move(pos(0., 0., 10., 2.), 60.)
+        self.assertEqual(obj.get_position(), pos(0., 0., 10., 2.))
+        self.assertIsNone(obj.held)
+
+    def test_the_timer_releases_it(self):
+        obj = build_transform(blend_planner(), pos(20., 0.))
+        obj.move(pos(0., 0.), 60.)
+        class Reactor:
+            NEVER = 9999999999999999.
+        obj.reactor = Reactor()
+        self.assertEqual(obj._hold_timeout(1.), Reactor.NEVER)
+        self.assertIsNone(obj.held)
+
+    def test_staying_on_the_centre_releases_then_stays(self):
+        obj = build_transform(blend_planner(), pos(20., 0.))
+        obj.move(pos(0., 0., 10., 2.), 60.)
+        obj.move(pos(0., 0., 12., 2.), 5.)
+        self.assertIsNone(obj.held)
+        self.assertAlmostEqual(obj.toolhead.position[0],
+                               centre_path.PARK_RADIUS)
+        self.assertEqual(obj.toolhead.position[2], 12.)
+
+    def test_after_a_release_the_way_out_blends_alone(self):
+        # Stopped on the centre - a layer change, say - then out along a
+        # new line: the bed turns as the tool leaves, still extruding
+        planner = blend_planner()
+        obj = build_transform(planner, pos(20., 0., 10., 0.))
+        obj.move(pos(0., 0., 10., 2.), 60.)
+        obj.move(pos(0., 0., 10.2, 2.), 5.)
+        mark = len(obj.toolhead.moves)
+        out = math.radians(30.)
+        end = pos(20. * math.cos(out), 20. * math.sin(out), 10.2, 4.)
+        obj.move(end, 60.)
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        leaving = moves[mark:]
+        self.assertGreater(len(leaving), 3)
+        for start, stop, branch, flip, speed in leaving:
+            self.assertGreater(stop[3], start[3])
+        self.assertLessEqual(
+            deviation(leaving, [(0., 0.), (end[0], end[1])]), TOLERANCE)
+
+    def test_blending_off_holds_nothing(self):
+        planner = blend_planner(blend_tolerance=0.)
+        self.assertIsNone(planner.hold_point((20., 0.), pos(20., 0.),
+                                             pos(0., 0.)))
+        obj = build_transform(planner, pos(20., 0.))
+        obj.move(pos(0., 0.), 60.)
+        self.assertIsNone(obj.held)
+        self.assertAlmostEqual(obj.toolhead.position[0],
+                               centre_path.PARK_RADIUS)
+
+
+class TestNearMissThroughTheCentre(unittest.TestCase):
+    def test_a_close_print_move_goes_through_instead_of_crawling(self):
+        start, end = pos(-20., .02, 10., 0.), pos(20., .02, 10., 4.)
+        obj = build_transform(blend_planner(), start)
+        obj.move(end, 60.)
+        moves = obj.toolhead.moves
+        check_all(self, moves)
+        # Onto the far branch at full speed, with the bed barely turning,
+        # where passing by would have crawled at 5 * 0.02 = 0.1 mm/s
+        self.assertEqual(obj.toolhead.branch, -1)
+        self.assertEqual(set(m[4] for m in moves), {60.})
+        self.assertLessEqual(deviation(moves, [start[:2], end[:2]]),
+                             TOLERANCE)
+        self.assertEqual(moves[-1][1], end)
+
+    def test_further_out_it_is_only_slowed(self):
+        start, end = pos(-20., .2, 10., 0.), pos(20., .2, 10., 4.)
+        obj = build_transform(blend_planner(), start)
+        obj.move(end, 60.)
+        self.assertEqual(obj.toolhead.branch, 1)
+        for s, e, branch, flip, speed in obj.toolhead.moves:
+            self.assertAlmostEqual(e[1], .2)
+
+    def test_not_without_cross(self):
+        planner = blend_planner(travel_policy='bypass', print_policy='error')
+        moves = planner.plan((-20., .02), pos(-20., .02, 10., 0.),
+                             pos(20., .02, 10., 4.), 60.)
+        for p, speed in moves:
+            self.assertAlmostEqual(p[1], .02)
+
+
+class TestNoBedStepsBlending(unittest.TestCase):
+    # TestNoBedSteps again, through the transform, with the lookahead -
+    # and with an angular acceleration limit, which the plans do not
+    # predict exactly but must still get past
+    def test_every_sequence(self):
+        for can_cross in (True, False):
+            for max_a in (0., MAX_A):
+                self.run_sequences(can_cross, max_a)
+
+    def run_sequences(self, can_cross, max_a):
+        kw = dict(max_angular_a=max_a)
+        if not can_cross:
+            kw.update(travel_policy='bypass', print_policy='error',
+                      can_cross=False)
+        planner = blend_planner(**kw)
+        for targets in TestNoBedSteps().sequences():
+            obj = build_transform(planner, targets[0], can_cross)
+            for target in targets[1:]:
+                obj.move(target, 100.)
+            obj.release()
+            check_all(self, obj.toolhead.moves, max_a, exact=not max_a)
+            final = targets[-1]
+            if centre_path.at_centre(final):
+                self.assertTrue(centre_path.at_centre(
+                    obj.toolhead.position))
+            else:
+                self.assertEqual(obj.toolhead.position, final)
+
+
+class TestBlendConfig(unittest.TestCase):
+    def test_bad_values_are_refused(self):
+        with self.assertRaises(ValueError):
+            blend_planner(blend_tolerance=-1.)
+        with self.assertRaises(ValueError):
+            blend_planner(blend_radius=.05)
+
+######################################################################
+# The plans test_kin_6axis.c runs through the real step compressor
+######################################################################
+
+C_TABLES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'centre_blend_plans.h')
+
+def blend_plans():
+    # (what, the moves a plan sends) for each case the C test runs
+    plans = []
+    obj, commanded = run_corner(blend_planner(), math.radians(30.))
+    plans.append(("30 degree print corner onto the far branch",
+                  obj.toolhead.moves))
+    obj, commanded = run_corner(blend_planner(), math.radians(80.))
+    plans.append(("80 degree print corner onto the far branch",
+                  obj.toolhead.moves))
+    obj, commanded = run_corner(
+        blend_planner(travel_policy='bypass', print_policy='error',
+                      can_cross=False), math.radians(160.), can_cross=False)
+    plans.append(("back out 20 degrees off the way in", obj.toolhead.moves))
+    obj = build_transform(blend_planner(), pos(20., 0., 10., 0.))
+    obj.move(pos(0., 0., 10., 2.), 60.)
+    obj.release()
+    mark = len(obj.toolhead.moves)
+    out = math.radians(60.)
+    obj.move(pos(20. * math.cos(out), 20. * math.sin(out), 10., 4.), 60.)
+    plans.append(("out along a new line from rest",
+                  obj.toolhead.moves[mark:]))
+    obj = build_transform(blend_planner(), pos(-20., .02, 10., 0.))
+    obj.move(pos(20., .02, 10., 4.), 60.)
+    plans.append(("a near miss taken through the centre",
+                  obj.toolhead.moves))
+    return plans
+
+def render_c_tables():
+    def num(value):
+        return '%.17g' % (value,)
+    lines = [
+        "// The plans test_centre_blend_step_generation() in",
+        "// test_kin_6axis.c runs through the real step compressor.",
+        "// Generated by TestTheCTables in test_centre_path.py - do not",
+        "// edit.  Regenerate with CENTRE_BLEND_REGENERATE=1.",
+        ""]
+    plans = blend_plans()
+    longest = max(len(moves) for what, moves in plans) + 1
+    lines.append("#define BLEND_PLAN_MAX %d" % (longest,))
+    for i, (what, moves) in enumerate(plans):
+        first = moves[0]
+        lines.append("")
+        lines.append("static const struct branch_pt blend_plan_%d[] = {"
+                     % (i,))
+        lines.append("    {%s, %s," % (num(first[0][0]), num(first[0][1])))
+        lines.append("     0, %d, 0, 0}," % (first[2],))
+        for start, end, branch, flip, speed in moves:
+            lines.append("    {%s, %s," % (num(end[0]), num(end[1])))
+            lines.append("     0, %d, %d, %s}," % (branch, int(flip),
+                                                 num(speed)))
+        lines.append("};")
+    lines += ["",
+              "static const struct {",
+              "    const char *what;",
+              "    const struct branch_pt *pts;",
+              "    int n;",
+              "} blend_plans[] = {"]
+    for i, (what, moves) in enumerate(plans):
+        lines.append('    {"%s", blend_plan_%d, %d},' % (what, i, len(moves)))
+    lines.append("};")
+    return "\n".join(lines) + "\n"
+
+
+class TestTheCTables(unittest.TestCase):
+    def test_the_c_tables_are_what_the_planner_emits(self):
+        text = render_c_tables()
+        if os.environ.get('CENTRE_BLEND_REGENERATE'):
+            with open(C_TABLES, 'w') as f:
+                f.write(text)
+        with open(C_TABLES) as f:
+            current = f.read().replace('\r\n', '\n')
+        self.assertEqual(current, text,
+                         msg="centre_blend_plans.h is stale - run with"
+                         " CENTRE_BLEND_REGENERATE=1")
+
+    def test_every_plan_turns_the_bed(self):
+        for what, moves in blend_plans():
+            self.assertGreater(len(moves), 5, msg=what)
+            check_all(self, moves)
 
 
 if __name__ == '__main__':

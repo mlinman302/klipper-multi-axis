@@ -60,13 +60,28 @@
 #
 # A g-code move transform, which plans the path around the centre before
 # the moves are made: it parks the tool on the ray it arrived along, turns
-# the bed on a small arc before leaving along a new one, routes a crossing
-# move through the centre instead of refusing it - with the head stood up
-# if the bed has to turn - and splits a near miss so only its close part
-# runs slowly.  The planning itself lives in
-# klippy/kinematics/centre_path.py, which explains each of those.  The
-# transform only schedules what the move check would allow; anything it
-# passes through unchanged still has to get past the check.
+# the bed on the way through the centre - blended into the moves either
+# side while the tool keeps moving, or on a small arc where that cannot
+# stay within blend_tolerance - routes a crossing move through the centre
+# instead of refusing it, and splits a near miss so only its close part
+# runs slowly.  The head's tilt is never changed to make any of that
+# easier.  The planning itself lives in klippy/kinematics/centre_path.py,
+# which explains each of those.  The transform only schedules what the
+# move check would allow; anything it passes through unchanged still has
+# to get past the check.
+#
+# HOLDING A MOVE BACK
+#
+# Blending a turn through the centre needs the move after it.  So the
+# transform sends a move onto the centre only as far as blend_radius
+# short of it, and holds the rest until the next g-code move arrives to
+# plan it with.  Nothing else may see the toolhead in between: the
+# toolhead calls release() before any operation that would - another
+# move, a dwell, M400, a timed callback such as a fan or heater change,
+# setting a position - and a timer releases it if no command follows at
+# all.  A release sends the tail on to the park point, exactly as if
+# there had been no hold.  While a tail is held no move is being emitted
+# anywhere, so a release is safe from any context.
 #
 # The transform is registered at connect time, after every transform that
 # insists on being first ([bed_mesh], [bed_tilt]) and before the ones that
@@ -94,7 +109,6 @@
 # the scale of the park point and the reorientation arc; the plans here
 # assume the path the moves describe.
 import math
-import stepper
 from kinematics import centre_path
 from kinematics.bed_centre import (
     CENTRE_RADIUS, ANGLE_TOLERANCE, path_geometry, swept_angle,
@@ -102,8 +116,9 @@ from kinematics.bed_centre import (
     limits_for_angular_rates)
 from kinematics.polar import NO_ACCEL_LIMIT
 
-# Index of the head's tilt (B) within a toolhead position vector
-B_POS_INDEX = stepper.KIN_AXIS_INDEXES[4]
+# How long (in seconds) a held tail may wait for the next command before
+# it is sent on its own
+HOLD_TIMEOUT = .1
 
 
 class PolarSingularity:
@@ -134,9 +149,9 @@ class PolarSingularity:
                                              minval=0.)
         # Below this feedrate, slowing down has stopped being an answer
         self.min_velocity = config.getfloat('min_velocity', 0.5, above=0.)
-        # What to do with a move that crosses the centre: refuse it, stop
-        # on the centre and turn the bed there, or - on an arm that can -
-        # carry straight on through it.  Stopping is harmless on a travel
+        # What to do with a move that crosses the centre: refuse it, turn
+        # the bed half a turn on the centre, or - on an arm that can -
+        # carry straight on through it.  Turning is harmless on a travel
         # move and leaves a blob on a print move.
         self.travel_policy = config.getchoice(
             'travel_policy', list(centre_path.POLICIES), 'bypass')
@@ -145,16 +160,24 @@ class PolarSingularity:
         # The circle the tool follows while the bed turns at the centre
         self.reorient_radius = config.getfloat('reorient_radius', None,
                                                above=0.)
-        # Stand a tilted head up for a crossing that turns the bed
-        self.upright_transit = config.getboolean('upright_transit', True)
+        # How far a turn blended through the centre may take the tool off
+        # its path, and how far from the centre the blend may reach.  A
+        # blend_tolerance of zero turns the bed on the arc alone.
+        self.blend_tolerance = config.getfloat(
+            'blend_tolerance', centre_path.DEFAULT_BLEND_TOLERANCE, minval=0.)
+        self.blend_radius = config.getfloat(
+            'blend_radius', centre_path.DEFAULT_BLEND_RADIUS, above=0.)
         self.name = config.get_name()
         # Whether 'cross' is possible depends on the kinematics, which is
         # not there to ask until connect time - so check everything else
         # now, and build the planner for real then
-        self.planner = self._make_planner(can_cross=True, tilt_index=None,
-                                          error=config.error)
+        self.planner = self._make_planner(can_cross=True, error=config.error)
         self.toolhead = self.next_transform = None
         self.last_position = [0., 0., 0., 0.]
+        # The tail of a move onto the centre, held for the next move (see
+        # "Holding a move back" above), and the timer that gives up on it
+        self.held = None
+        self.reactor = self.hold_timer = None
         # Diagnostics for the last move that came near the centre.  Most
         # of the failures this replaces present as an "Internal error in
         # stepcompress" with no indication of where the machine was.
@@ -162,12 +185,12 @@ class PolarSingularity:
         self.last_swept = 0.
         self.last_velocity_limit = 0.
         self.printer.register_event_handler("klippy:connect", self._connect)
-    def _make_planner(self, can_cross, tilt_index, error):
+    def _make_planner(self, can_cross, error):
         try:
             return centre_path.CentrePlanner(
                 self.max_angular_v, self.max_angular_a, self.min_velocity,
                 self.reorient_radius, self.travel_policy, self.print_policy,
-                can_cross, tilt_index, self.upright_transit)
+                can_cross, self.blend_tolerance, self.blend_radius)
         except ValueError as e:
             raise error("[%s] %s" % (self.name, e))
 
@@ -175,12 +198,12 @@ class PolarSingularity:
         self.toolhead = self.printer.lookup_object('toolhead')
         kin = self.toolhead.get_kinematics()
         can_cross = getattr(kin, 'can_cross_centre', lambda: False)()
-        have_b = any(ea is not None and ea.get_axis_gcode_id() == 'B'
-                     for ea in self.toolhead.get_extra_axes())
-        self.planner = self._make_planner(
-            can_cross, B_POS_INDEX if have_b else None,
-            self.printer.config_error)
+        self.planner = self._make_planner(can_cross,
+                                          self.printer.config_error)
         self.toolhead.register_move_check(self._check_move)
+        self.toolhead.register_held_moves(self.release)
+        self.reactor = self.printer.get_reactor()
+        self.hold_timer = self.reactor.register_timer(self._hold_timeout)
         gcode_move = self.printer.lookup_object('gcode_move')
         self.next_transform = gcode_move.set_move_transform(self, force=True)
 
@@ -189,24 +212,61 @@ class PolarSingularity:
     ######################################################################
     def get_position(self):
         # A tool parked on the axis stands a tenth of a micron off it, on
-        # the ray the bed faces; the caller asked for the centre itself
+        # the ray the bed faces; the caller asked for the centre itself.
+        # Anything asking where the toolhead is gets the answer with no
+        # tail held back.
+        self.release()
         pos = self.next_transform.get_position()
         if centre_path.at_centre(pos):
             pos[0] = pos[1] = 0.
         self.last_position[:] = pos
         return list(pos)
     def move(self, newpos, speed):
+        held, self.held = self.held, None
+        self._set_hold_timer(None)
         # The toolhead's own x/y is what the bed angle follows, and on the
         # centre it is a park point rather than the position asked for
         machine_xy = self.toolhead.get_position()[:2]
-        try:
-            moves = self.planner.plan(machine_xy, self.last_position, newpos,
-                                      speed, self.toolhead.get_branch())
-        except centre_path.CentrePlanError as e:
-            raise self.printer.command_error(str(e))
+        branch = self.toolhead.get_branch()
+        hold = None
+        if held is not None:
+            moves = self.planner.plan_held(held, newpos, speed, branch)
+        else:
+            hold = self.planner.hold_point(machine_xy, self.last_position,
+                                           newpos)
+            if hold is not None:
+                moves = []
+                if hold[:2] != list(machine_xy):
+                    moves.append((hold, speed))
+            else:
+                moves = self.planner.plan(machine_xy, self.last_position,
+                                          newpos, speed, branch)
         for pos, move_speed in moves:
             self.next_transform.move(pos, move_speed)
         self.last_position[:] = newpos
+        if hold is not None:
+            self.held = (hold, list(newpos), speed)
+            if self.reactor is not None:
+                self._set_hold_timer(self.reactor.monotonic() + HOLD_TIMEOUT)
+    def release(self):
+        # Send a held tail on to the park point, as if it had never been
+        # held.  The toolhead calls this before anything that must see
+        # every move made so far.
+        held, self.held = self.held, None
+        if held is None:
+            return
+        self._set_hold_timer(None)
+        for pos, move_speed in self.planner.release(held):
+            self.next_transform.move(pos, move_speed)
+    def _set_hold_timer(self, waketime):
+        if self.hold_timer is not None:
+            self.reactor.update_timer(
+                self.hold_timer,
+                self.reactor.NEVER if waketime is None else waketime)
+    def _hold_timeout(self, eventtime):
+        # No command followed the move onto the centre
+        self.release()
+        return self.reactor.NEVER
 
     ######################################################################
     # Move checking
@@ -299,8 +359,12 @@ class PolarSingularity:
             'reorient_radius': self.planner.reorient_radius,
             'travel_policy': self.planner.travel_policy,
             'print_policy': self.planner.print_policy,
-            'upright_transit': self.planner.upright_transit,
+            'blend_tolerance': self.planner.blend_tolerance,
+            'blend_radius': self.planner.blend_radius,
             'can_cross': self.planner.can_cross,
+            # Whether the tail of a move onto the centre is waiting for
+            # the move after it
+            'holding': self.held is not None,
         }
         if self.toolhead is not None:
             # Whether the tool is standing on the centre, and on which

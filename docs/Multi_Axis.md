@@ -273,8 +273,8 @@ alongside the linear axes.
 | `test/multi_axis/test_gcode_pipeline.py` | any host with Python + cffi | Real `gcode.py`, `gcode_move.py`, `Move`, `LookAheadQueue`, `RotaryAxis`; the branch through the toolhead, corertheta, RTCP and the projection |
 | `test/multi_axis/test_rtcp_probe.py` | any host with Python + cffi | Tilting-head probe geometry, the radial probe transform, its config checks |
 | `test/multi_axis/test_bed_centre.py` | any host with Python | Bed centre geometry, the dead zone rule and the branch rule and their C mirror, where a move may come to rest at the centre |
-| `test/multi_axis/test_polar_singularity.py` | any host with Python | The bed centre move check: what is slowed, what is refused, what is legal on the axis, crossing onto the other branch |
-| `test/multi_axis/test_centre_path.py` | any host with Python | Planning at the bed centre: parking, turning the bed on an arc, bypassing or crossing, standing the head up, splitting a near miss, and a replay proving the bed never steps |
+| `test/multi_axis/test_polar_singularity.py` | any host with Python | The bed centre move check: what is slowed, what is refused, what is legal on the axis, crossing onto the other branch; every toolhead operation giving up a held move first |
+| `test/multi_axis/test_centre_path.py` | any host with Python | Planning at the bed centre: parking, turning the bed on the move or on an arc, bypassing or crossing, holding a move back for the next one, the tilt never touched, splitting a near miss, and a replay proving the bed never steps; generates `centre_blend_plans.h` |
 | `test/klippy/multi_axis.test` | Linux (`scripts/test_klippy.py`) | Uncoupled A/C axes: config load, homing, step generation |
 | `test/klippy/multi_axis_rtheta.test` | Linux (`scripts/test_klippy.py`) | Coupled core r-theta stage |
 | `test/klippy/multi_axis_rtcp.test` | Linux (`scripts/test_klippy.py`) | RTCP on a B axis tilting head |
@@ -883,30 +883,114 @@ side.  `klippy/kinematics/centre_path.py` plans each G-Code move, and
   ray the tool arrived along.  The bed keeps facing that ray, and the
   toolhead position says so (see "The position names the bed angle"
   below).  The reported position is still the centre.
-* **Departing** along a different ray steps out to `reorient_radius`
-  along the ray the bed already faces, follows that circle round to the
-  new ray in 10° chords at the bed's angular velocity limit, and carries
-  on radially.  Z, E and rotary axes are held for the turn, which is the
-  only place the tool leaves the commanded path.  Under the `cross`
-  policy it may leave along the far half of that line instead, onto the
-  other branch, so the bed never turns more than a quarter turn.
+* **Departing** along a different ray turns the bed on the way out,
+  blended into the move while the tool keeps moving (see "Turning the
+  bed on the move" below).  A turn too sharp to blend steps out to
+  `reorient_radius` along the ray the bed already faces, follows that
+  circle round to the new ray in 10° chords at the bed's angular
+  velocity limit, and carries on radially, with Z, E and rotary axes
+  held for the turn.  Under the `cross` policy it may leave along the
+  far half of that line instead, onto the other branch, so the bed never
+  turns more than a quarter turn.
 * **Crossing** — through the dead zone, or so close that holding the
   limits would take the move below `min_velocity` — is refused
   (`error`), routed through the centre as an arrival and a departure
   that turns the bed (`bypass`), or carried straight on through it with
-  the bed held still (`cross`).  Bypass stops on the axis while the bed
-  turns, so travel defaults to `bypass` and printing to `error`; `cross`
+  the bed held still (`cross`).  Bypass turns the bed half a turn at the
+  centre, so travel defaults to `bypass` and printing to `error`; `cross`
   keeps a move dead through the centre on its path and at its speed.
-* **Upright transit.**  With the head tilted, a `bypass` that turns the
-  bed stands the head up (`B` to zero) where the move starts and tilts it
-  back where it ends: turning the bed under a tilted head swings the head
-  with `[b_projection]` and the arm with `[rtcp]` — through the middle,
-  on an arm that cannot go there.  A printing move cannot stand the head
-  up without changing the bead, so it is refused instead
-  (`upright_transit`).  `cross` holds the bed still and needs neither.
 * **A near miss that is only slowed** is split where the radius doubles,
   so each piece is held to the limit at its own inner end and only the
-  part of the move that really is close runs slowly.
+  part of the move that really is close runs slowly.  Under `cross`, one
+  that passes within `blend_tolerance` of the centre is taken through it
+  instead and blended there.
+* **The head's tilt is never touched.**  `B` is carried along every
+  planned move exactly as the G-Code commands it, interpolated like Z
+  and E.  Turning the bed under a tilted head swings the machine's B with
+  `[b_projection]` and the arm with `[rtcp]`; on an arm that cannot
+  travel through the middle that puts the carriage where it cannot go,
+  and `[rtcp]`'s reach check refuses the move rather than have the
+  planner print a different angle.  `cross` holds the bed still and
+  keeps the tilt for nothing.
+
+### Turning the bed on the move
+
+The simplest way to turn the bed on the axis is to stop there and walk
+the tool round a tiny circle while the bed turns under it.  On a travel
+move that costs nothing; on a printing move it is a blob — the nozzle
+decelerates to a stop on the part and dwells there, under pressure and
+with E held, for as long as the bed takes to turn.  So wherever it can,
+the planner turns the bed *while the tool keeps moving*.
+
+Write a position as `(rho, phi)`: an arm radius, negative on the far
+branch, and the angle the bed faces.  Measure `lambda` along the
+commanded path from the centre, negative on the way in.  The blend walks
+`rho = ±lambda` through the centre at the tool's own speed while `phi`
+ramps from the angle the bed faces on the way in to the one it must face
+on the way out, over `R_in` before the centre and `R_out` after it.  The
+ramp is flat across a small core either side of the centre, so the tool
+passes straight through the park point along the line the bed faces —
+onto the other branch there if it carries on to the far side.  Every
+other axis takes the value the commanded path has at the same `lambda`,
+so extrusion carries on at the commanded rate per millimetre and B is
+exactly what was commanded.
+
+The path strays from the commanded one by `lambda` times the angle still
+to turn, which peaks near `|turn| * R / 8`, and the bed turns at
+`v * |turn| / (R_in + R_out)`.  So a blend within `blend_tolerance` has
+`R` at most `8 * blend_tolerance / |turn|` and runs at the bed's
+angular limit times `(R_in + R_out) / |turn|`.  With the defaults
+(0.05 mm, 2 mm) and a 5 rad/s bed, a corner through the centre of 10° or
+less runs at full print speed, 45° at about 4 mm/s, and 89° at about
+0.7 mm/s — moving and extruding the whole time.  A turn that cannot be
+blended at `min_velocity` or better falls back to the circle.
+
+The blend is drawn as chords whose radii grow outward from the core by
+at most 1.25 each, since a chord turns the bed fastest at its inner end,
+and the planner holds each chord to the bed's limits itself — at exactly
+the speed the move check would allow it.  An angular acceleration limit
+(`max_angular_accel`) binds on those chords near the core, so setting
+one slows blends and sends sharp ones back to the circle; it ships unset.
+
+A near miss uses the same machinery.  Passing the centre at a small
+offset is a half turn of the bed however close it passes, so the move
+check holds it to `max_angular_velocity * r_min` and it crawls for about
+`pi / max_angular_velocity` seconds.  Under `cross`, one within
+`blend_tolerance` of the centre is routed through it as a dogleg and
+blended: the bed turns a fraction of a degree, at full speed.
+
+### Looking ahead across the centre
+
+A symmetric blend needs the move after the centre before the move onto
+it has finished.  So `[polar_singularity]` sends a move onto the centre
+only as far as `blend_radius` short of it, and holds the rest back until
+the next G-Code move arrives, then plans the two together: a blend
+through the centre if the next move leaves it, the park point if it does
+not.  Starting from rest on the centre — after a Z move there, say —
+only the departing half is left, which blends too, over a distance four
+times shorter for the same tolerance.
+
+Nothing else may see the toolhead while a tail is held, because it would
+see a position the G-Code has already moved past.  So the toolhead calls
+every `register_held_moves()` callback before any operation that must
+see all the moves made so far — another toolhead move from anywhere,
+`dwell`, `wait_moves`, `get_last_move_time`, `register_lookahead_callback`
+(fans, heaters, output pins), `set_position`, `manual_move`,
+`drip_move`, `flush_step_generation` — and the transform releases its
+tail the same way when its own position is read, or when a tenth of a
+second passes with no command at all.  A released tail goes on to the
+park point exactly as if it had never been held.  While one is held no
+move is being emitted anywhere, so releasing is safe from any context.
+`TestToolheadReleasesHeldMoves` in `test_polar_singularity.py` fails if
+any of those operations stops releasing first.
+
+`test_centre_blend_step_generation()` in `test_kin_6axis.c` runs blended
+plans — corners through the centre onto the far branch, a reversal on an
+arm that cannot cross, a departure from rest and a near miss taken
+through the centre — through the real step compressor on the bed and
+both gantry motors, and again at B10 under RTCP and the projection.  The
+plans are generated from the planner into `centre_blend_plans.h`, and
+`test_centre_path.py` fails if the header no longer matches.
 
 `test/multi_axis/test_centre_path.py` replays every plan through the
 Python mirror of the dead zone rule and checks that the commanded bed angle
@@ -982,6 +1066,11 @@ mirror of the branch rule.
 
 ### What it does not do
 
+* **It looks one move ahead, not further.**  The blend plans a move
+  onto the centre with the move after it; nothing plans the branch for
+  moves beyond that.  The branch changes only at the centre, and the far
+  side reaches exactly as far as the near one, so there is nothing a
+  longer look ahead would need to prepare for.
 * **Only G-Code moves are planned.**  Anything that moves the toolhead
   directly is only limited and refused by the move check.  Code that does
   so near the centre is expected to plan its moves with
@@ -1047,6 +1136,11 @@ faces, which is defined everywhere, the bare centre included.
   it — see "Scope" above.
 * **Bed meshing through the centre**, built on `CentrePlanner.plan()`
   by the layer that makes the probing moves.
+* **A smoother bed ramp through the centre.**  The blend ramps the bed
+  angle linearly, so the bed's angular velocity steps at each end of the
+  ramp.  That is inside the move check's limits, but with an angular
+  acceleration limit measured, an S-shaped ramp would let sharper turns
+  blend.
 * **Measure the bed's angular acceleration limit** and set
   `max_angular_accel`, and confirm on the machine whether its arm can
   travel through the centre (`arm_crosses_centre`).

@@ -28,6 +28,7 @@ sys.modules.setdefault('mcu', types.ModuleType('mcu'))
 
 from kinematics import bed_centre, centre_path, polar
 from extras import polar_singularity as ps
+import toolhead as toolhead_mod
 
 
 ######################################################################
@@ -71,6 +72,7 @@ def build_checker(max_angular_v=5., max_angular_a=0., min_velocity=0.5):
                                             min_velocity)
     chk.last_radius = chk.last_swept = chk.last_velocity_limit = 0.
     chk.toolhead = None
+    chk.held = chk.hold_timer = None
     return chk
 
 
@@ -318,16 +320,23 @@ class TestConfigAtConnect(unittest.TestCase):
         chk.name = 'polar_singularity'
         chk.travel_policy, chk.print_policy = travel_policy, print_policy
         chk.reorient_radius = None
-        chk.upright_transit = True
+        chk.blend_tolerance, chk.blend_radius = .05, 2.
+        chk.held = chk.hold_timer = None
         return chk
 
     def test_cross_needs_the_kinematics_to_allow_it(self):
         chk = self.build(travel_policy='cross')
-        self.assertRaises(CommandError, chk._make_planner, False, None,
+        self.assertRaises(CommandError, chk._make_planner, False,
                           CommandError)
-        planner = chk._make_planner(True, 5, CommandError)
+        planner = chk._make_planner(True, CommandError)
         self.assertEqual(planner.travel_policy, 'cross')
-        self.assertEqual(planner.tilt_index, 5)
+        self.assertEqual(planner.blend_tolerance, .05)
+
+    def test_bad_blend_values_are_config_errors(self):
+        chk = self.build()
+        chk.blend_radius = .05
+        self.assertRaises(CommandError, chk._make_planner, True,
+                          CommandError)
 
     def test_status_reports_where_the_tool_stands(self):
         chk = self.build()
@@ -335,8 +344,75 @@ class TestConfigAtConnect(unittest.TestCase):
         status = chk.get_status(0.)
         self.assertTrue(status['at_centre'])
         self.assertEqual(status['branch'], -1)
+        self.assertFalse(status['holding'])
+        self.assertEqual(status['blend_tolerance'], .05)
         chk.toolhead.position = [40., 0., 0., 0.]
         self.assertFalse(chk.get_status(0.)['at_centre'])
+
+
+
+######################################################################
+# The toolhead gives up a held move before anything else sees it
+######################################################################
+
+class TestToolheadReleasesHeldMoves(unittest.TestCase):
+    # [polar_singularity] holds the tail of a move onto the centre back
+    # for the next move.  Every toolhead operation that must see all the
+    # moves made so far has to release it first - before it reads the
+    # position, the queue or the time.
+    def build(self):
+        th = toolhead_mod.ToolHead.__new__(toolhead_mod.ToolHead)
+        th.held_move_releases = []
+        calls = []
+        th.register_held_moves(lambda: calls.append('release'))
+        def internal(name, result=None):
+            def f(*args, **kw):
+                calls.append(name)
+                return result
+            return f
+        for name in ('_flush_lookahead', '_process_lookahead',
+                     '_calc_print_time', '_advance_move_time',
+                     '_check_pause', 'set_branch'):
+            setattr(th, name, internal(name))
+        th.special_queuing_state = 'NeedPrime'
+        th.print_time = 0.
+        th.motion_queuing = types.SimpleNamespace(
+            flush_all_steps=internal('flush_all_steps'),
+            get_kin_flush_delay=internal('get_kin_flush_delay', 0.))
+        th.lookahead = types.SimpleNamespace(
+            get_last=internal('get_last'))
+        th.commanded_pos = [0.] * 7
+        return th, calls
+
+    def assert_released_first(self, call):
+        th, calls = self.build()
+        try:
+            call(th)
+        except Exception:
+            # What follows the release is not what is under test
+            pass
+        self.assertTrue(calls, msg=calls)
+        self.assertEqual(calls[0], 'release', msg=calls)
+
+    def test_every_operation_releases_first(self):
+        operations = [
+            lambda th: th.move([1., 0., 0., 0., 0., 0., 0.], 10.),
+            lambda th: th.manual_move([1., None], 10.),
+            lambda th: th.dwell(1.),
+            lambda th: th.wait_moves(),
+            lambda th: th.get_last_move_time(),
+            lambda th: th.flush_step_generation(),
+            lambda th: th.set_position([0.] * 7),
+            lambda th: th.drip_move([1., 0., 0.], 10., None),
+            lambda th: th.register_lookahead_callback(lambda t: None),
+        ]
+        for call in operations:
+            self.assert_released_first(call)
+
+    def test_releasing_with_nothing_held_does_nothing(self):
+        chk = build_checker()
+        chk.release()
+        self.assertIsNone(chk.held)
 
 
 if __name__ == '__main__':

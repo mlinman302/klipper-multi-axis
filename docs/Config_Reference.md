@@ -2714,11 +2714,21 @@ On the axis itself the bed angle is not determined by the position at
 all, so G-Code moves that start or end there are planned: a move onto
 the centre stops a tenth of a micron short, on the ray it arrived along,
 so the bed keeps facing that way; and a move off the centre along a
-different ray first turns the bed, by carrying the tool round a small
-circle of `reorient_radius` at the bed's angular velocity limit. `Z`,
-`E` and rotary axes are held during that turn. A pure `Z` move along
-the axis, and a move that leaves along the ray the bed already faces,
-are unaffected.
+different ray turns the bed on the way. Where it can, the turn is
+blended into the moves either side of the centre: the tool keeps moving
+and extruding along a path that stays within `blend_tolerance` of the
+commanded one, and the bed turns as it goes. To see the move after the
+centre in time, a move onto the centre is sent only as far as
+`blend_radius` short of it and the rest is held back until the next
+move arrives - or until anything else touches the toolhead (a wait, a
+dwell, a fan or heater change, setting a position), or a tenth of a
+second passes with no command, when it is sent on its own. A turn too
+sharp to blend at `min_velocity` or better is made the old way, by
+carrying the tool round a small circle of `reorient_radius` at the bed's
+angular velocity limit with `Z`, `E` and rotary axes held - which on a
+printing move leaves a blob, and is what the blend exists to avoid. A
+pure `Z` move along the axis, and a move that leaves along the ray the
+bed already faces, are unaffected.
 
 A move that crosses the axis - or passes so close that it would have to
 run below `min_velocity` - is handled according to `travel_policy` or
@@ -2733,14 +2743,18 @@ keeps a move dead through the centre on its path and at its speed, and
 is the only policy fit for printing. With `cross` a move leaving the
 centre may also leave along the far half of the line the bed faces, so
 the bed never turns more than a quarter turn. A move that is merely
-slowed is split so that only its part close to the centre runs slowly.
+slowed is split so that only its part close to the centre runs slowly -
+except that under `cross`, one that passes within `blend_tolerance` of
+the centre is taken through it instead, which turns the bed a fraction
+of a degree where passing by would have crawled for about
+`pi / max_angular_velocity` seconds.
 
-With the head tilted, a `bypass` that turns the bed first stands the head
-up (`B` to zero) where the move starts and tilts it back where it ends
-(`upright_transit`), since turning the bed under a tilted head swings
-the head with `[b_projection]` and the arm with `[rtcp]`. A printing move
-cannot do that without changing the bead, so it is refused instead.
-`cross` holds the bed still and needs neither.
+The head's tilt is never changed by any of this: `B` follows the G-Code
+along every planned move, interpolated like `Z` and `E`. Turning the bed
+under a tilted head swings the machine's `B` with `[b_projection]` and
+the arm with `[rtcp]`; on an arm that cannot travel through the centre
+that is refused by the `[rtcp]` reach check, and the G-Code has to stand
+the head up itself. `cross` holds the bed still and keeps the tilt.
 
 Every move, planned or not, is checked so that the toolhead position
 always names the angle the bed faces: a move may only come to rest near
@@ -2780,15 +2794,18 @@ See [Multi_Axis.md](Multi_Axis.md).
 #   it. The default is bypass.
 #print_policy: error
 #   The same for a move that extrudes. The default is error.
-#upright_transit: True
-#   Whether a bypass that turns the bed stands a tilted head up while it
-#   does, on a travel move, and refuses a printing move that would need
-#   to. With this False such moves run tilted, and are refused by the
-#   [rtcp] reach check wherever the arm cannot follow. The default is
-#   True.
+#blend_tolerance: 0.05
+#   How far (in mm) a turn blended through the centre may take the tool
+#   off its commanded path. Larger values let sharper turns through the
+#   centre run faster. 0 turns the bed on the reorient_radius circle
+#   alone and never holds a move back. The default is 0.05.
+#blend_radius: 2.0
+#   How far from the centre (in mm) a blend may reach, and so how much
+#   of a move onto the centre is held back for the move after it. It
+#   must be at least 0.1. The default is 2.0.
 #reorient_radius:
 #   The radius (in mm) of the circle the tool follows while the bed turns
-#   on the axis. It must be at least 0.04, and large enough that the
+#   on the axis, for a turn too sharp to blend. It must be at least 0.04, and large enough that the
 #   bed's angular velocity limit does not hold the circle below
 #   min_velocity. The default is the smallest radius that satisfies
 #   both - 0.125 for a 5 rad/s bed and a 0.5 mm/s floor.

@@ -10,7 +10,8 @@
 # test_kin_6axis.c runs the same crossings through the real step
 # compressor on the bed and both gantry motors.  This runs them end to
 # end through klippy, which is the one place the toolhead hands the
-# branch to the motion queue.
+# branch to the motion queue, and the one place a move onto the centre
+# is held back for the move after it.
 DICTIONARY atmega2560.dict
 CONFIG polar_singularity_cross.cfg
 
@@ -53,6 +54,36 @@ G1 X0 Y0 F3000
 G1 X-40 Y0 F3000
 G1 X0 Y0 F3000
 G1 X0 Y-40 F3000
+
+# Printing through the centre round a corner: the move onto the centre is
+# held back until the next one arrives, and the bed turns on the way
+# through while the tool keeps moving and extruding - 30 degrees, then
+# 80, then back out 20 degrees off the way in
+G1 X40 Y0 Z0.3 F3000
+G1 X0 Y0 E12 F1500
+G1 X-34.64 Y20 E14 F1500
+G1 X0 Y0 E16 F1500
+G1 X-13.68 Y-37.59 E18 F1500
+G1 X0 Y0 E20 F1500
+G1 X0 Y-20 E22 F1500
+
+# Held moves are given up before anything else touches the toolhead: a
+# wait, a dwell, reading the position - and then the way out blends alone
+G1 X0 Y0 E24 F1500
+M400
+G1 X30 Y30 E26 F1500
+G1 X0 Y0 E28 F1500
+G4 P10
+G1 X0 Y30 E30 F1500
+G1 X0 Y0 E32 F1500
+GET_POSITION
+G1 X30 Y-30 E34 F1500
+
+# A near miss while printing, close enough to go through the centre
+# instead of crawling past it
+G1 X-40 Y0.02 E36 F1500
+G1 X40 Y0.02 E40 F1500
+G1 Z10 F600
 
 # Homing R again from the far side puts the arm back on the usual branch
 G1 X-60 Y0 F3000

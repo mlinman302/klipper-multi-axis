@@ -238,6 +238,9 @@ class ToolHead:
         # the one last stamped onto the motion queue
         self.branch = 1
         self.trapq_branch = (0, False)
+        # Move transforms holding a move back to plan it with the next one
+        # (see register_held_moves())
+        self.held_move_releases = []
         # Velocity and acceleration control
         self.max_velocity = config.getfloat('max_velocity', above=0.)
         self.max_accel = config.getfloat('max_accel', above=0.)
@@ -367,9 +370,11 @@ class ToolHead:
         if step_gen_time >= self.print_time - kin_flush_delay - 0.001:
             self._flush_lookahead(is_runout=True)
     def flush_step_generation(self):
+        self.release_held_moves()
         self._flush_lookahead()
         self.motion_queuing.flush_all_steps()
     def get_last_move_time(self):
+        self.release_held_moves()
         if self.special_queuing_state:
             self._flush_lookahead()
             self._calc_print_time()
@@ -444,6 +449,7 @@ class ToolHead:
         # 'branch' is for a caller that knows the new position lies on
         # the other branch; otherwise it stays on the current one, unless
         # the kinematics decides otherwise in its set_position()
+        self.release_held_moves()
         self.flush_step_generation()
         self.set_branch(self.branch if branch is None else branch)
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -461,6 +467,7 @@ class ToolHead:
         if last_move is not None:
             last_move.limit_next_junction_speed(speed)
     def move(self, newpos, speed):
+        self.release_held_moves()
         move = Move(self, self.commanded_pos, newpos, speed)
         if not move.move_d:
             return
@@ -482,6 +489,7 @@ class ToolHead:
         if self.print_time > self.need_check_pause:
             self._check_pause()
     def manual_move(self, coord, speed):
+        self.release_held_moves()
         curpos = list(self.commanded_pos)
         for i in range(len(coord)):
             if coord[i] is not None:
@@ -489,11 +497,13 @@ class ToolHead:
         self.move(curpos, speed)
         self.printer.send_event("toolhead:manual_move")
     def dwell(self, delay):
+        self.release_held_moves()
         self._flush_lookahead()
         next_print_time = self.get_last_move_time() + max(0., delay)
         self._advance_move_time(next_print_time)
         self._check_pause()
     def wait_moves(self):
+        self.release_held_moves()
         self._flush_lookahead()
         eventtime = self.reactor.monotonic()
         while (not self.special_queuing_state
@@ -575,6 +585,7 @@ class ToolHead:
         # like x/y/z), so they must be carried over from newpos;
         # dropping them made a rotation-only homing move zero length,
         # which generated no steps at all.
+        self.release_held_moves()
         dripmove = list(self.commanded_pos)
         for i in stepper.KIN_AXIS_INDEXES:
             if i < len(newpos):
@@ -628,9 +639,22 @@ class ToolHead:
         # kinematics' own check_move().  Should raise command_error to
         # reject the move.
         self.move_checks.append(callback)
+    def register_held_moves(self, release):
+        # For a move transform that holds part of a move back, to plan it
+        # together with the move that follows ([polar_singularity] does
+        # this at the bed centre).  'release' sends whatever is held on to
+        # the toolhead, and is called before anything that must see every
+        # move made so far: another move, a dwell, a wait, a timed
+        # callback, setting a position.  It must do nothing when nothing
+        # is held, and must not hold anything back while it runs.
+        self.held_move_releases.append(release)
+    def release_held_moves(self):
+        for release in self.held_move_releases:
+            release()
     def get_trapq(self):
         return self.trapq
     def register_lookahead_callback(self, callback):
+        self.release_held_moves()
         last_move = self.lookahead.get_last()
         if last_move is None:
             callback(self.get_last_move_time())
