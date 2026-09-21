@@ -2738,7 +2738,8 @@ turns the bed there; `cross` carries it straight on through the centre
 with the bed held still and the arm travelling through zero radius, which
 needs `arm_crosses_centre` in `[printer]`. Bypass stops on the axis for
 up to half a turn of the bed, which is harmless on a travel move and
-leaves a blob on a printed one, hence the different defaults; `cross`
+leaves a blob on a printed one, hence the different defaults on an arm
+that cannot cross; `cross`
 keeps a move dead through the centre on its path and at its speed, and
 is the only policy fit for printing. With `cross` a move leaving the
 centre may also leave along the far half of the line the bed faces, so
@@ -2786,14 +2787,16 @@ See [Multi_Axis.md](Multi_Axis.md).
 #   answer. A move that would have to run slower than this to hold the
 #   limits above is handled as if it crossed the centre. The default is
 #   0.5.
-#travel_policy: bypass
+#travel_policy:
 #   What to do with a move that crosses the centre and does not extrude:
 #   "bypass" to route it through the centre and turn the bed there,
 #   "cross" to carry it straight on through the centre with the bed held
 #   still (needs arm_crosses_centre in [printer]), or "error" to refuse
-#   it. The default is bypass.
-#print_policy: error
-#   The same for a move that extrudes. The default is error.
+#   it. The default is cross where arm_crosses_centre is set, and bypass
+#   otherwise.
+#print_policy:
+#   The same for a move that extrudes. The default is cross where
+#   arm_crosses_centre is set, and error otherwise.
 #blend_tolerance: 0.05
 #   How far (in mm) a turn blended through the centre may take the tool
 #   off its commanded path. Larger values let sharper turns through the

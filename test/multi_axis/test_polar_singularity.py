@@ -332,6 +332,20 @@ class TestConfigAtConnect(unittest.TestCase):
         self.assertEqual(planner.travel_policy, 'cross')
         self.assertEqual(planner.blend_tolerance, .05)
 
+    def test_the_defaults_follow_what_the_arm_can_do(self):
+        chk = self.build(travel_policy=None, print_policy=None)
+        planner = chk._make_planner(True, CommandError)
+        self.assertEqual((planner.travel_policy, planner.print_policy),
+                         ('cross', 'cross'))
+        planner = chk._make_planner(False, CommandError)
+        self.assertEqual((planner.travel_policy, planner.print_policy),
+                         ('bypass', 'error'))
+        # One set, the other defaulted
+        chk.print_policy = 'error'
+        planner = chk._make_planner(True, CommandError)
+        self.assertEqual((planner.travel_policy, planner.print_policy),
+                         ('cross', 'error'))
+
     def test_bad_blend_values_are_config_errors(self):
         chk = self.build()
         chk.blend_radius = .05

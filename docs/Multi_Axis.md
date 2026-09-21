@@ -896,9 +896,10 @@ side.  `klippy/kinematics/centre_path.py` plans each G-Code move, and
   limits would take the move below `min_velocity` — is refused
   (`error`), routed through the centre as an arrival and a departure
   that turns the bed (`bypass`), or carried straight on through it with
-  the bed held still (`cross`).  Bypass turns the bed half a turn at the
-  centre, so travel defaults to `bypass` and printing to `error`; `cross`
-  keeps a move dead through the centre on its path and at its speed.
+  the bed held still (`cross`).  `cross` keeps a move dead through the
+  centre on its path and at its speed, so both default to it on an arm
+  that can cross.  Otherwise bypass turns the bed half a turn at the
+  centre, so travel defaults to `bypass` and printing to `error`.
 * **A near miss that is only slowed** is split where the radius doubles,
   so each piece is held to the limit at its own inner end and only the
   part of the move that really is close runs slowly.  Under `cross`, one

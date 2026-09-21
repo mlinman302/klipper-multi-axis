@@ -120,6 +120,17 @@ from kinematics.polar import NO_ACCEL_LIMIT
 # it is sent on its own
 HOLD_TIMEOUT = .1
 
+# The policies a machine gets when its config names none: 'cross' where
+# the arm can travel through the centre, since it is the only one that
+# prints through it without stopping, and otherwise a half turn for
+# travel and a refusal for printing
+DEFAULT_POLICIES = {True: ('cross', 'cross'), False: ('bypass', 'error')}
+
+def resolve_policies(travel_policy, print_policy, can_cross):
+    # Fill in whichever of the two the config left unset (None)
+    default_travel, default_print = DEFAULT_POLICIES[bool(can_cross)]
+    return (travel_policy or default_travel, print_policy or default_print)
+
 
 class PolarSingularity:
     def __init__(self, config):
@@ -152,11 +163,13 @@ class PolarSingularity:
         # What to do with a move that crosses the centre: refuse it, turn
         # the bed half a turn on the centre, or - on an arm that can -
         # carry straight on through it.  Turning is harmless on a travel
-        # move and leaves a blob on a print move.
-        self.travel_policy = config.getchoice(
-            'travel_policy', list(centre_path.POLICIES), 'bypass')
-        self.print_policy = config.getchoice(
-            'print_policy', list(centre_path.POLICIES), 'error')
+        # move and leaves a blob on a print move.  Left unset, each
+        # follows what the arm can do (see DEFAULT_POLICIES), which is not
+        # known until connect time.
+        choices = {p: p for p in centre_path.POLICIES}
+        choices[None] = None
+        self.travel_policy = config.getchoice('travel_policy', choices, None)
+        self.print_policy = config.getchoice('print_policy', choices, None)
         # The circle the tool follows while the bed turns at the centre
         self.reorient_radius = config.getfloat('reorient_radius', None,
                                                above=0.)
@@ -186,10 +199,12 @@ class PolarSingularity:
         self.last_velocity_limit = 0.
         self.printer.register_event_handler("klippy:connect", self._connect)
     def _make_planner(self, can_cross, error):
+        travel_policy, print_policy = resolve_policies(
+            self.travel_policy, self.print_policy, can_cross)
         try:
             return centre_path.CentrePlanner(
                 self.max_angular_v, self.max_angular_a, self.min_velocity,
-                self.reorient_radius, self.travel_policy, self.print_policy,
+                self.reorient_radius, travel_policy, print_policy,
                 can_cross, self.blend_tolerance, self.blend_radius)
         except ValueError as e:
             raise error("[%s] %s" % (self.name, e))
