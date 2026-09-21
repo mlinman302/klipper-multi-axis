@@ -1066,6 +1066,14 @@ come back through the centre before the tool is further out than that,
 which no line straight across the bed does: such a line turns the bed
 half a turn on the centre exactly as on an arm that cannot cross.
 
+That half turn — and any turn too sharp to blend — is the one place a
+printing move still waits on the part, for up to about 0.6 s at 5 rad/s.
+`retract_length` in `[polar_singularity]` draws the filament back as the
+tool stops on the centre, at `retract_speed`, and pushes it back just
+before it sets off, so the nozzle waits without pressure behind it.  Only
+E changes, the line after the turn extrudes what the G-Code asked for,
+and travel and blended turns are left alone.  It is off by default.
+
 The planner takes the far side only where a move's end is within reach
 (`CentrePlanner.far_reach`), and whether the tool then gets back in time
 is a question about the moves after it.  So `[polar_singularity]` holds a

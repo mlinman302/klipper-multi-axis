@@ -321,6 +321,7 @@ class TestConfigAtConnect(unittest.TestCase):
         chk.travel_policy, chk.print_policy = travel_policy, print_policy
         chk.reorient_radius = None
         chk.blend_tolerance, chk.blend_radius = .05, 2.
+        chk.retract_length, chk.retract_speed = 0., 30.
         chk.pending, chk.hold_timer = [], None
         return chk
 
@@ -354,6 +355,13 @@ class TestConfigAtConnect(unittest.TestCase):
         # Shorter than the arc the bed turns on: a config error
         self.assertRaises(CommandError, chk._make_planner, True,
                           CommandError, .05)
+
+    def test_the_retraction_reaches_the_planner(self):
+        chk = self.build()
+        chk.retract_length, chk.retract_speed = .8, 25.
+        planner = chk._make_planner(True, CommandError)
+        self.assertEqual((planner.retract_length, planner.retract_speed),
+                         (.8, 25.))
 
     def test_bad_blend_values_are_config_errors(self):
         chk = self.build()

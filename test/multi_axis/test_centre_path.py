@@ -1241,6 +1241,71 @@ class TestShortReach(unittest.TestCase):
             reach_planner(far_reach=.1)
 
 ######################################################################
+# Retracting while the bed turns on the circle
+######################################################################
+
+class TestRetractForTheTurn(unittest.TestCase):
+    def across(self, **kw):
+        # A printed line straight across the bed on the 5 mm arm: the bed
+        # turns half a turn on the centre
+        obj = run_moves(reach_planner(**kw), pos(40., 0., 10., 0.),
+                        [(pos(-40., 0., 10., 4.), 60.)])
+        return obj.toolhead.moves
+
+    def test_the_filament_is_drawn_back_for_the_turn(self):
+        moves = self.across(retract_length=.8, retract_speed=25.)
+        check_all(self, moves, exact=False)
+        check_reach(self, moves)
+        # Arrive extruding, retract standing still, turn with the filament
+        # held back, push it back standing still, then print the rest
+        e_only = [m for m in moves
+                  if m[0][:2] == m[1][:2] and m[0][3] != m[1][3]]
+        self.assertEqual(len(e_only), 2)
+        retract, unretract = e_only
+        self.assertAlmostEqual(retract[1][3] - retract[0][3], -.8)
+        self.assertAlmostEqual(unretract[1][3] - unretract[0][3], .8)
+        self.assertEqual(retract[4], 25.)
+        self.assertEqual(unretract[4], 25.)
+        first, last = moves.index(retract), moves.index(unretract)
+        turn = moves[first + 1:last]
+        self.assertGreater(len(turn), 5)
+        for start, end, branch, flip, speed in turn:
+            self.assertAlmostEqual(end[3], retract[1][3])
+        # The line after the turn extrudes what the g-code asked for
+        self.assertAlmostEqual(unretract[1][3], 2.)
+        self.assertEqual(moves[-1][1], pos(-40., 0., 10., 4.))
+        self.assertEqual(moves[last + 1:], moves[-1:])
+
+    def test_the_rest_of_the_plan_is_unchanged(self):
+        plain = self.across()
+        retracted = self.across(retract_length=.8)
+        def xy_moves(moves):
+            return [(tuple(m[1][:3]), m[4]) for m in moves
+                    if m[0][:2] != m[1][:2]]
+        self.assertEqual(xy_moves(plain), xy_moves(retracted))
+
+    def test_travel_is_not_retracted(self):
+        obj = run_moves(reach_planner(retract_length=.8), pos(40., 0.),
+                        [(pos(-40., 0.), 100.)])
+        self.assertTrue(all(m[1][3] == 0. for m in obj.toolhead.moves))
+
+    def test_a_blend_is_not_retracted(self):
+        # The tool keeps moving and extruding through a blend: there is
+        # nothing to wait out
+        obj, commanded = run_corner(reach_planner(retract_length=.8),
+                                    math.radians(160.))
+        es = [m[1][3] for m in obj.toolhead.moves]
+        self.assertEqual(es, sorted(es))
+
+    def test_off_by_default(self):
+        self.assertEqual(reach_planner().retract_length, 0.)
+        self.assertEqual(e_held(self.across()) != [], True)
+        with self.assertRaises(ValueError):
+            reach_planner(retract_length=-1.)
+        with self.assertRaises(ValueError):
+            reach_planner(retract_speed=0.)
+
+######################################################################
 # The plans test_kin_6axis.c runs through the real step compressor
 ######################################################################
 

@@ -18,7 +18,8 @@ G90
 G1 X40 Y0 Z0.3 F6000
 
 # A line across the bed: too long for the far side, so the bed turns
-# half a turn on the centre
+# half a turn on the centre - with the filament drawn back 0.8mm while it
+# does (retract_length)
 G1 X-40 Y0 E4 F1500
 
 # Across to 3mm past the centre and straight back: the far side carries

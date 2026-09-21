@@ -2818,6 +2818,18 @@ See [Multi_Axis.md](Multi_Axis.md).
 #   How far from the centre (in mm) a blend may reach, and so how much
 #   of a move onto the centre is held back for the move after it. It
 #   must be at least 0.1. The default is 2.0.
+#retract_length: 0
+#   Where a printing move still has to stop on the centre while the bed
+#   turns on the reorient_radius circle - a line straight across the
+#   centre that the arm cannot follow onto the far side, or a turn too
+#   sharp to blend - draw the filament back by this many mm as it stops,
+#   and push it back just before it sets off, so the nozzle does not wait
+#   under pressure. The line after the turn extrudes exactly what the
+#   G-Code asked for. Travel moves and blended turns are never retracted.
+#   The default is 0, which does not retract.
+#retract_speed: 30
+#   The speed (in mm/s of filament) of that retraction and of pushing it
+#   back. The default is 30.
 #reorient_radius:
 #   The radius (in mm) of the circle the tool follows while the bed turns
 #   on the axis, for a turn too sharp to blend. It must be at least 0.04, and large enough that the

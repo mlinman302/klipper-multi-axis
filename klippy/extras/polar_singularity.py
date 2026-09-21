@@ -184,6 +184,12 @@ class PolarSingularity:
             'blend_tolerance', centre_path.DEFAULT_BLEND_TOLERANCE, minval=0.)
         self.blend_radius = config.getfloat(
             'blend_radius', centre_path.DEFAULT_BLEND_RADIUS, above=0.)
+        # Filament drawn back while a printing move waits on the centre
+        # for the bed to turn - see "Retracting for the turn that remains"
+        # in centre_path.py.  Zero for none.
+        self.retract_length = config.getfloat('retract_length', 0., minval=0.)
+        self.retract_speed = config.getfloat(
+            'retract_speed', centre_path.DEFAULT_RETRACT_SPEED, above=0.)
         self.name = config.get_name()
         # Whether 'cross' is possible depends on the kinematics, which is
         # not there to ask until connect time - so check everything else
@@ -210,7 +216,7 @@ class PolarSingularity:
                 self.max_angular_v, self.max_angular_a, self.min_velocity,
                 self.reorient_radius, travel_policy, print_policy,
                 can_cross, self.blend_tolerance, self.blend_radius,
-                far_reach)
+                far_reach, self.retract_length, self.retract_speed)
         except ValueError as e:
             raise error("[%s] %s" % (self.name, e))
 
@@ -375,6 +381,7 @@ class PolarSingularity:
             'blend_radius': self.planner.blend_radius,
             'can_cross': self.planner.can_cross,
             'far_reach': self.planner.far_reach,
+            'retract_length': self.planner.retract_length,
             # Whether moves are held back waiting for the ones after them
             'holding': bool(self.pending),
         }

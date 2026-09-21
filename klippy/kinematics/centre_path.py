@@ -130,6 +130,18 @@
 # move there, say - only the departing half is left, which blends too,
 # over a distance four times shorter for the same tolerance.
 #
+# RETRACTING FOR THE TURN THAT REMAINS
+#
+# Where the bed still has to turn on the circle during a printing move -
+# a line straight across the centre on an arm that cannot hold it on the
+# far side, a bend too sharp to blend - the nozzle waits on the part for
+# as long as the turn takes.  With retract_length set, the filament is
+# drawn back by that much, at retract_speed, as the tool stops on the
+# centre, and pushed back just before it sets off again, so the nozzle
+# waits without pressure behind it.  The line it sets off on extrudes
+# exactly what the g-code asked for.  Only e changes; nothing else about
+# the plan does.  Off by default.
+#
 # HOW FAR THE FAR SIDE REACHES
 #
 # The arm may reach less far past the centre than it does on the near
@@ -214,6 +226,9 @@ DEFAULT_BLEND_RADIUS = 2.
 # The most commanded moves held back while a chain on the far side waits
 # to come back through the centre
 MAX_FAR_CHAIN = 32
+# The speed (mm/s of filament) of a retraction for a turn on the circle,
+# when nothing configures one
+DEFAULT_RETRACT_SPEED = 30.
 
 
 def default_reorient_radius(max_angular_v, min_velocity):
@@ -275,12 +290,15 @@ class CentrePlanner:
                  reorient_radius=None, travel_policy='bypass',
                  print_policy='error', can_cross=False,
                  blend_tolerance=DEFAULT_BLEND_TOLERANCE,
-                 blend_radius=DEFAULT_BLEND_RADIUS, far_reach=None):
+                 blend_radius=DEFAULT_BLEND_RADIUS, far_reach=None,
+                 retract_length=0., retract_speed=DEFAULT_RETRACT_SPEED):
         # 'can_cross' says the arm can travel through the centre to a
         # negative radius, and 'far_reach' how far (mm) - None when it
         # reaches as far on the far side as on the near one.  A
         # blend_tolerance of zero turns the bed on the arc alone and never
-        # holds a move back.
+        # holds a move back.  'retract_length' (mm of filament, zero for
+        # none) is drawn back while a printing move turns the bed on the
+        # arc.
         for policy in (travel_policy, print_policy):
             if policy not in POLICIES:
                 raise ValueError("Unknown centre policy '%s'" % (policy,))
@@ -312,6 +330,10 @@ class CentrePlanner:
                 "blend_radius must be at least %.3f mm - room for the"
                 " straight core of a blend and a chord either side of it"
                 % (min_blend,))
+        if retract_length < 0.:
+            raise ValueError("retract_length must not be negative")
+        if retract_speed <= 0.:
+            raise ValueError("retract_speed must be above zero")
         if can_cross and far_reach is not None and far_reach < reorient_radius:
             raise ValueError(
                 "The arm reaches only %.3f mm past the centre, less than"
@@ -321,6 +343,8 @@ class CentrePlanner:
         self.min_velocity = min_velocity
         self.reorient_radius = reorient_radius
         self.far_reach = far_reach if can_cross else None
+        self.retract_length = retract_length
+        self.retract_speed = retract_speed
         self.reorient_v = max_angular_v or DEFAULT_REORIENT_VELOCITY
         self.travel_policy = travel_policy
         self.print_policy = print_policy
@@ -543,13 +567,22 @@ class CentrePlanner:
         # The arc runs at this arm radius: on the far side of the centre,
         # negative, when the tool leaves on the other branch
         radius = new_branch * self.reorient_radius
+        # Everything but x/y is held for the turn - with the filament drawn
+        # back, while printing, if retract_length asks for it
+        held = list(start)
+        moves = []
+        retract = self.retract_length if is_extruding(start, end) else 0.
+        if retract:
+            held[3] -= retract
+            moves.append((with_xy(held, machine_xy[0], machine_xy[1]),
+                          self.retract_speed))
         def on_arc(angle):
-            return with_xy(start, radius * math.cos(angle),
+            return with_xy(held, radius * math.cos(angle),
                            radius * math.sin(angle))
         # Out along the line the bed already faces.  It starts inside the
         # dead zone heading straight along that line, so the bed holds its
         # angle - on the far side, by carrying on through the centre.
-        moves = [(on_arc(angle_from), speed)]
+        moves.append((on_arc(angle_from), speed))
         # Round to the new ray, outside the dead zone the whole way
         # A quarter turn is nine chords, not ten because of rounding
         count = int(math.ceil(abs(turn) / MAX_ARC_CHORD - 1e-9))
@@ -557,6 +590,11 @@ class CentrePlanner:
                         self.reorient_v * self.reorient_radius * ARC_CHORD_DIP)
         for i in range(1, count + 1):
             moves.append((on_arc(angle_from + turn * i / count), arc_speed))
+        if retract:
+            # Push the filament back before setting off
+            unretracted = list(moves[-1][0])
+            unretracted[3] = start[3]
+            moves.append((unretracted, self.retract_speed))
         # And radially on to the target, carrying everything else with it
         moves.append((end, speed))
         return moves
