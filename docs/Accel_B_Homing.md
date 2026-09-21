@@ -86,9 +86,11 @@ near +/-90 degrees. The third axis is the rotation axis, by elimination;
 it should barely change as B turns, and it is reported as a health check.
 
 `positive_vector` also fixes the rotation sense the sensor believes in.
-It must agree with the direction the *motors* call +B, or `G28 B` stops
-on its first move (see below). `invert_b_direction` in `[printer]` stays
-the one place the machine's own rotation sense is set.
+It must agree with the direction the *motors* call +B: `G28 B` takes the
+two of them as the homing direction rather than working it out, and
+refuses on its first move if the head turned the other way (see below).
+`invert_b_direction` in `[printer]` stays the one place the machine's own
+rotation sense is set.
 
 ## The measurement
 
@@ -194,14 +196,10 @@ G28 B
      report it, and say so if it is outside the soft limits
   4. while |B| > zero_tolerance:
        refuse after max_homing_moves moves ("not converging")
-       until the direction is confirmed:
-           target = B moved toward 0 by at most direction_check_move,
-                    clamped into [position_min, position_max]
-       afterwards:
-           target = 0
-       move to target; B' = measure_vertical()
-       on the first move of at least 1 deg, check (B' - B) / (target - B):
-           <= -0.5     refuse: positive_vector and the motors disagree
+       move to B = 0, ramping at homing_accel
+       B' = measure_vertical()
+       on a move of at least 1 deg, check (B' - B) / (0 - B):
+           <= -0.5     refuse: the homing direction is inverted
            < 0.5       refuse: the head is not following the motors
            > 2         refuse: b_coupling_ratio is far off
        B = B'; book it as B
@@ -210,17 +208,60 @@ G28 B
 
 Booking the measurement as B is exact whatever the drive ratio, so the
 loop tolerates a wrong `b_coupling_ratio`: a 10 % error converges from
-60 degrees out in three moves after the check move. A loop that does not
-converge means the ratio is badly wrong, and the error says so.
+60 degrees out in three moves. A loop that does not converge means the
+ratio is badly wrong, and the error says so.
 
-The capped first move is the safety half. Until the head has been seen
-to follow the motors, "toward zero" is an assumption: with
-`positive_vector` or `invert_b_direction` wrong, a straight move to zero
-from B = 80 drives the head to 160, far past the soft limit. Capping the
-first move bounds that mistake to `direction_check_move` degrees and turns
-it into an error. Soft limits apply to commanded angles only, so a head
-measured beyond one has its first move end *on* the limit - a move longer
-than the cap, still checked.
+### The direction is declared, not discovered
+
+Which way zero lies is not something this loop works out. Two config
+options between them settle it: `invert_b_direction` in `[printer]` says
+which way the gantry motors turn B, and `positive_vector` says which way
+the sensor reads it. Given both, a commanded move from the measured angle
+toward zero *is* a move toward zero, so `G28 B` commands it outright.
+
+What the loop does is check that it was right. Every move long enough to
+have a direction - at least a degree, below which sensor noise is the
+size of the answer - is measured against what was commanded, and a head
+that turned the other way is refused with *the homing direction is
+inverted*, naming `positive_vector` and `invert_b_direction`. It is an
+error, not something to correct for: a home that quietly turned around
+would be homing against a sign convention the rest of the machine does
+not share.
+
+The cost is that the mistake is no longer bounded. With either option
+wrong, a move to zero from B = 80 drives the head to 160, far past the
+soft limit, before the measurement catches it - soft limits apply to
+commanded angles, and the commanded angle is heading the right way the
+whole time. So verify both vectors before the first home, with
+`SET_ROTARY_AXIS AXIS=B SET_POSITION=0`, a small `G1 B` move and
+`B_MEASURE`, and do it with the head somewhere it can afford to turn away
+from.
+
+### The moves have a trapezoid
+
+A move that only turns B has no linear travel, which means Klipper does
+not treat it as a kinematic move and it carries no acceleration limit at
+all: the head is stepped straight to the commanded speed and stopped just
+as abruptly. On a belt-driven head that rings, and the ringing is exactly
+what `settle_time` then has to wait out before each measurement.
+
+Two ceilings (deg/s^2, both 100 by default) give those moves a trapezoid
+instead:
+
+| Option | The moves it bounds |
+| --- | --- |
+| `homing_accel` | `G28 B`, and the move to vertical after an endstop home |
+| `calibration_accel` | every station of a `B_SENSOR_CALIBRATE` or `B_STEP_CALIBRATE` sweep, and the parks that end one - including on an error path |
+
+They are separate because the sweeps are the long, patient moves: they
+stop to be measured dozens of times, so `calibration_accel` is the one to
+lower first if stations do not settle. The re-home a sensor calibration
+ends with is a home, and uses `homing_accel`.
+
+Either is applied by tightening the B axis' own acceleration limit for
+the move, so an `axis_max_accel` on the axis still wins where it is
+tighter, and `0` restores the unramped behaviour. The endstop homing
+sweep is a drip move and gets neither.
 
 On any error `G28` turns the motors off and leaves B unhomed.
 `[stepper_tilt]`'s `position_min` and `position_max` are soft limits, and
@@ -232,16 +273,16 @@ sensor's zero, not gravity's. Run `B_SENSOR_CALIBRATE` once.
 ### With an endstop
 
 A `[stepper_tilt]` that has an `endstop_pin` sweeps into it as usual, and
-the measurement steers and checks the sweep. With `homing_positive_dir`
-unset the head is measured first: below `position_endstop` it homes
-positive, above it negative, and the sweep is the measured distance plus
+the measurement steers and checks the sweep. The rail has no
+`homing_positive_dir` - it is refused in `[stepper_tilt]` - so the head is
+measured first: below `position_endstop` it homes positive, above it
+negative, and the sweep is the measured distance plus
 `homing_tolerance`. Within `homing_tolerance` of the endstop the side
 cannot be told; an endstop at a range limit is then homed toward that
 limit, and one inside the range is refused. After the home the head is
 measured again (`verify_home`), and B is left unhomed if it is not within
 `homing_tolerance` of `position_endstop` - which catches a sensorless home
-that triggered without moving. Setting `homing_positive_dir` bypasses the
-direction measurement.
+that triggered without moving.
 
 ### How the home is wired in
 
@@ -249,8 +290,9 @@ direction measurement.
 `[accel_b_homing]` registers itself on the B axis at connect with
 `BaseRotaryAxis.set_homing_source()`; a rail without an endstop then
 calls `source.home_axis(axis)`. The source drives the axis through
-`get_range()`, `set_measured_position(angle)`, `move_axis(angle)` and
-`get_drive_steppers()` (both gantry motors on corertheta). The rail is
+`get_range()`, `set_measured_position(angle)`,
+`move_axis(angle, accel=...)` and `get_drive_steppers()` (both gantry
+motors on corertheta). The rail is
 built with `need_endstop=False`, so `[stepper_tilt]` without an
 `endstop_pin` refuses `position_endstop` and the other endstop-only
 options rather than ignoring them. Without `[accel_b_homing]`, such an
@@ -415,7 +457,9 @@ In order, with the head clear of the bed at every angle it will visit:
 2. **Zero the gyroscope:** `BMI160_CALIBRATE GYRO=1` with the head still.
    Repeat after every power cycle.
 3. **Declare the vectors** by looking, as above.
-4. **Check them without homing.** With RTCP and the B projection off,
+4. **Check them without homing.** Do this before the first `G28 B`, not
+   after: the home takes these two options as the direction and drives
+   the head the whole way on them. With RTCP and the B projection off,
    park the head near vertical, `SET_ROTARY_AXIS AXIS=B SET_POSITION=0`,
    then `B_MEASURE`: the angle is within a few degrees of zero
    and the out-of-plane component is small. A small `G1 B` move toward
@@ -426,8 +470,14 @@ In order, with the head clear of the bed at every angle it will visit:
 5. **Set the gate.** `B_MEASURE` on a parked head reports the rotation
    rate - that is the noise floor; `max_rotation_rate` belongs just above
    it.
-6. **`G28 B`** from several resting angles on both sides of zero. Each
-   should finish within `zero_tolerance` in a similar number of moves.
+6. **`G28 B`** from a small resting angle first - a few degrees, so an
+   inverted direction that slipped through step 4 turns the head only a
+   few degrees the wrong way before it is refused. Then from several
+   resting angles on both sides of zero. Each should finish within
+   `zero_tolerance` in a similar number of moves. If the head jerks at
+   the start or end of a homing move, lower `homing_accel`; if a
+   calibration sweep's stations will not settle, lower
+   `calibration_accel`.
 7. **`B_SENSOR_CALIBRATE`** over the full range, then `SAVE_CONFIG`. The
    in-plane radius should be within a few percent of 1 g.
 8. **`B_MEASURE` ten times without moving** - the spread should be well
@@ -446,14 +496,23 @@ In order, with the head clear of the bed at every angle it will visit:
 
 Turning B swings a tool hanging ~69 mm below the pivot through up to 145
 degrees. `G28 B` runs before Z is homed, so it cannot lift: the head must
-clear the bed at every angle between where it rests and B = 0. Its soft
-limits and capped first move bound a wrong direction, and it finishes on
-a commanded B = 0; on error the motors are turned off and B is unhomed.
+clear the bed at every angle between where it rests and B = 0. It
+finishes on a commanded B = 0, and on error the motors are turned off and
+B is unhomed.
+
+Nothing bounds a wrong direction. `G28 B` trusts `positive_vector` and
+`invert_b_direction` and commands the move to zero outright, so if either
+is wrong the head turns as far the wrong way as it was asked to turn the
+right way - from B = 80, to B = 160 - before the measurement refuses. The
+soft limits do not help: they bound commanded angles, and the commanded
+angle is heading the right way throughout. Confirm both options by hand
+before the first home, from a B the head can afford to turn away from.
 
 `B_SENSOR_CALIBRATE` and `B_STEP_CALIBRATE` swing the head through the
 whole range and do not lift Z first. They range-check `START` and `END`
 (and the over-travel) before the first move, and leave the head at B = 0,
-including on the error path. Raise the carriage before running them.
+including on the error path - that park is ramped at `calibration_accel`
+like every other move of theirs. Raise the carriage before running them.
 
 `B_MEASURE` moves nothing.
 
@@ -470,7 +529,7 @@ including on the error path. Raise the carriage before running them.
 | `measured N mm/s^2 where gravity is 9807` | The head is accelerating, or the chip is misreporting. |
 | `the capture is shorter than 3 x fusion_tau` | Raise `settle_time` or `sample_time`, or lower `fusion_tau`. |
 | `the fused angle is ... where the accelerometer alone reads ...` | The head was moving, or the gyroscope is inverted or on the wrong axis - check the vectors and `axes_map`. |
-| `B was commanded to turn +X deg and the head turned -Y` | `positive_vector` and the motors disagree about +B. |
+| `the homing direction is inverted` | `positive_vector` and the motors disagree about +B - the head has turned that far the wrong way. |
 | `the head is not following the motors` | The motors are not driving the head, or the sensor is not on its rotating part. |
 | `still at B = X after N moves` | `b_coupling_ratio` is badly wrong - `B_STEP_CALIBRATE`. |
 | `B homed, but the head measures X where the endstop is at Y` | Endstop rails: a sensorless home triggered without moving (`G4 P2000` first), or `positive_vector` is wrong. |

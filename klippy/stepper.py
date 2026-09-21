@@ -397,14 +397,22 @@ class GenericPrinterRail:
             'homing_retract_speed', self.homing_speed, above=0.)
         self.homing_retract_dist = config.getfloat(
             'homing_retract_dist', 5., minval=0.)
+        if not infer_homing_dir:
+            # No homing_positive_dir at all, declared or guessed from where
+            # position_endstop sits in the range: the owner of this rail
+            # picks the direction each time it homes (the corertheta B axis
+            # asks its IMU), and get_homing_info() reports positive_dir as
+            # None
+            if config.get('homing_positive_dir', None) is not None:
+                raise config.error(
+                    "Option 'homing_positive_dir' is not accepted in"
+                    " section '%s' - the homing direction is measured by"
+                    " [accel_b_homing] each time the axis homes"
+                    % (config.get_name(),))
+            self.homing_positive_dir = None
+            return
         self.homing_positive_dir = config.getboolean(
             'homing_positive_dir', None)
-        if self.homing_positive_dir is None and not infer_homing_dir:
-            # No guess from where position_endstop sits in the range: the
-            # owner of this rail picks the direction each time it homes
-            # (the corertheta B axis asks its IMU), and get_homing_info()
-            # reports positive_dir as None until then
-            return
         if self.homing_positive_dir is None:
             axis_len = self.position_max - self.position_min
             if self.position_endstop <= self.position_min + axis_len / 4.:
